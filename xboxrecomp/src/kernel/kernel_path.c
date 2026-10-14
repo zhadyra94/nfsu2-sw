@@ -152,6 +152,42 @@ static int resolve_symlink(const char* xbox_path, char* out, size_t out_size)
     return 0;
 }
 
+/*
+ * Is this guest path on the DVD, and where?
+ *
+ * The prefixes are the disc rows of s_rules (CdRom0, D:, \??\D:), checked
+ * after the same symbolic-link rewrite xbox_translate_path applies, so a title
+ * that mounts the disc under its own letter still lands here. When a disc
+ * image is mounted (xbox_xiso.h) kernel_file.c serves these paths from it
+ * instead of translating them into the game folder. Y:, C: and the partition
+ * devices are NOT the disc: they stay host paths whatever the image says.
+ *
+ * `rel` gets the part after the prefix, backslashes untouched. The bare device
+ * ("\Device\CdRom0" with no separator) is not matched; the bridge answers that
+ * one itself. Returns 1 for a disc path.
+ */
+int xbox_path_disc_rel(const char* xbox_path, char* rel, size_t rel_size)
+{
+    static const char* const disc_prefixes[] = {
+        "\\Device\\CdRom0\\", "D:\\", "\\??\\D:\\",
+    };
+    char linked[512];
+    size_t i;
+
+    if (!xbox_path || !rel || rel_size == 0)
+        return 0;
+    if (resolve_symlink(xbox_path, linked, sizeof(linked)))
+        xbox_path = linked;
+    for (i = 0; i < sizeof(disc_prefixes) / sizeof(disc_prefixes[0]); i++) {
+        int skip = match_prefix(xbox_path, disc_prefixes[i]);
+        if (skip) {
+            snprintf(rel, rel_size, "%s", xbox_path + skip);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* ======================================================================== */
 /* Shared by both backends, for the same reason as xbox_LastFileError: the
  * bridge calls it unconditionally, and a _WIN32-only definition breaks every

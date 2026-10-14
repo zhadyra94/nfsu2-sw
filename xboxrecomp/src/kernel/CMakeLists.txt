@@ -10,6 +10,7 @@ set(KERNEL_SOURCES
     kernel_rtl.c
     kernel_memory.c
     kernel_file.c
+    xbox_xiso.c
     kernel_thread.c
     kernel_sync.c
     kernel_hal.c
