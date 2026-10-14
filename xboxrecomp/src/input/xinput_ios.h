@@ -41,7 +41,8 @@
  * the window (0..1, origin top left). The radii describe an ellipse in
  * normalized space, which is round on screen only when rx / ry matches the
  * window aspect -- the table in xinput_ios.c is laid out for a landscape
- * phone. */
+ * phone (set_aspect re-shapes the round controls on other aspects). x is in
+ * the safe band when set_safe_area is in force. */
 typedef struct XBOX_IOS_TOUCH_ZONE {
     int   id;      /* stable id, for a future overlay to key on */
     float cx, cy;  /* centre */
@@ -76,6 +77,55 @@ int  xbox_ios_touch_enabled(void);
  * clear all fingers. Main thread. */
 void xbox_ios_touch_set_layout(int drive);
 void xbox_ios_touch_set_scale(float k);
+
+/* Screen adaptation. The zone tables are laid out for an 852x393 phone; these
+ * calls (the overlay feeds them from the window, never SDL events) adapt the
+ * ACTIVE table. All default to nothing: a layer that is not told builds exactly
+ * the preset x override x size table. A setter whose value in force does not
+ * change does nothing (no rebuild, no generation bump) and none clears fingers.
+ * Table order: preset -> override -> Size -> aspect shape -> tablet factor ->
+ * keep on screen (overrides) -> safe-area shift (rigid per half).
+ *
+ *   safe area   set_safe_area(left, right): the unsafe bands as fractions of the
+ *               window width, each clamped 0..0.25 (NaN = 0). The table is moved
+ *               RIGIDLY per half of the screen, so spacing and sizes are kept:
+ *               zones with cx < 0.5 (after override / Size / aspect / tablet)
+ *               are the left group, the others the right group (the strip goes
+ *               with its centre). With the edges taken after those stages,
+ *                   shift_left  = max(0, left - min over LEFT of (cx - rx))
+ *                   shift_right = max(0, max over RIGHT of (cx + rx) - (1 - right))
+ *               and cx' = cx + shift_left for the left group, cx - shift_right
+ *               for the right one; radii, cy and the strip's half-width (so its
+ *               steering gain) are unchanged. A zone wider than the band is
+ *               centred in it (the strip's half-width is cut to the band first).
+ *               set_safe_enabled(0) (NFSU2_TOUCH_SAFE=0) shifts nothing.
+ *               get_safe_area returns the insets IN FORCE (0 while disabled).
+ *               zone_geom keeps returning BASE values; the layout editor, which
+ *               works in screen space, converts a zone's x with
+ *               base_to_screen_x(idx, bx) / screen_to_base_x(idx, sx) (the zone's
+ *               current group shift added / removed) before zone_set_geom.
+ *   aspect      set_aspect(w / h), <= 0 or NaN = unknown. Only a landscape
+ *               aspect (1..3) more than 10 % away from 852/393 matters:
+ *                 round shape    round-style zones (BACK / START, D-pad, A B X Y,
+ *                                Black / White) get ry' = ry * (w/h) / (852/393),
+ *                                so they keep the phone's shape in points (a
+ *                                circle stays a circle). set_round(0)
+ *                                (NFSU2_TOUCH_ROUND=0) turns this off.
+ *                 tablet factor  set_tablet_scale(k), 0.6..1.2 (NFSU2_TOUCH_TABLET_SCALE),
+ *                                multiplies rx and ry of every zone on top of
+ *                                the Size setting; the strip only its height.
+ *                                Default 1.0 here: the overlay passes the
+ *                                setting (default 0.80) on an iPad and 1.0 on a
+ *                                phone.
+ *               Pedals, LT / RT and the strip keep their normalized shape. */
+void  xbox_ios_touch_set_safe_area(float left, float right);
+void  xbox_ios_touch_set_safe_enabled(int on);
+void  xbox_ios_touch_get_safe_area(float *left, float *right);
+float xbox_ios_touch_base_to_screen_x(int idx, float bx);
+float xbox_ios_touch_screen_to_base_x(int idx, float sx);
+void  xbox_ios_touch_set_aspect(float w_over_h);
+void  xbox_ios_touch_set_round(int on);
+void  xbox_ios_touch_set_tablet_scale(float k);
 
 /* Drive feel switches (each also an env key read at the first use; the
  * setters are for the settings panel and the harness):

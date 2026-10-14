@@ -155,7 +155,8 @@ static void lift_all(void)
 
 /* Back to a known state: touch on, PAD layout, scale 1, no tilt, no hooks,
  * analog pedals on, steering strip on at sensitivity 1, new DRIVE table, no
- * geometry overrides, no fingers, 16:9 window. The setters clear all fingers by contract; the
+ * geometry overrides, no safe area, aspect unknown, round shape on, tablet
+ * factor 1.0, no fingers, 16:9 window. The setters clear all fingers by contract; the
  * explicit lift keeps reset() sound even if that contract breaks. */
 static void reset(void)
 {
@@ -170,6 +171,11 @@ static void reset(void)
     xbox_ios_touch_layout_reset(0);
     xbox_ios_touch_set_layout(0);
     xbox_ios_touch_set_scale(1.0f);
+    xbox_ios_touch_set_safe_enabled(1);
+    xbox_ios_touch_set_safe_area(0.0f, 0.0f);
+    xbox_ios_touch_set_aspect(0.0f);
+    xbox_ios_touch_set_round(1);
+    xbox_ios_touch_set_tablet_scale(1.0f);
     xbox_ios_touch_set_tilt(0.0f, 0);
     lift_all();
     wsize(1280, 720);
@@ -2853,6 +2859,600 @@ static void t_geom_on_screen(void)
     reset();
 }
 
+
+/* ------------------------------------------------------------------ */
+/* Screen adaptation: safe area, aspect, tablet size                    */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    int n;
+    XBOX_IOS_TOUCH_ZONE z[16];
+} Snap;
+
+static void snap_take(Snap *sn)
+{
+    int n = zcount(), i;
+    sn->n = n > 16 ? 16 : n;
+    for (i = 0; i < sn->n; i++)
+        sn->z[i] = *zone(i);
+}
+
+static int snap_same(const Snap *sn)
+{
+    int n = zcount(), i;
+    if (n != sn->n)
+        return 0;
+    for (i = 0; i < n; i++)
+        if (memcmp(zone(i), &sn->z[i], sizeof sn->z[i]) != 0)
+            return 0;
+    return 1;
+}
+
+#define PHONE_A (852.0f / 393.0f)
+
+/* The rigid per-half shift, worked out here from a snapshot of the table
+ * without insets: left group cx < 0.5, right group the rest (zones wider than
+ * the band excluded). Checks every zone of the active table against it, plus
+ * radii / cy unchanged and rigidity (pairwise centre distances inside a group
+ * equal those of the no-inset table). Returns the shifts via *shl / *shr. */
+static void expect_shifted(const Snap *base, float L, float R, const char *what, float *shl, float *shr)
+{
+    float minl = 2.0f, maxr = -1.0f, sl = 0.0f, sr = 0.0f;
+    int i, j;
+
+    for (i = 0; i < base->n; i++) {
+        const XBOX_IOS_TOUCH_ZONE *b = &base->z[i];
+        if (b->cx < 0.5f) {
+            if (b->cx - b->rx < minl) minl = b->cx - b->rx;
+        } else if (b->cx + b->rx > maxr) {
+            maxr = b->cx + b->rx;
+        }
+    }
+    if (minl < L) sl = L - minl;
+    if (maxr > 1.0f - R) sr = maxr - (1.0f - R);
+    CHECK(zcount() == base->n, "%s: zone count %d vs %d", what, zcount(), base->n);
+    for (i = 0; i < base->n && i < zcount(); i++) {
+        const XBOX_IOS_TOUCH_ZONE *z = zone(i), *b = &base->z[i];
+        float want = b->cx + (b->cx < 0.5f ? sl : -sr);
+        CHECK(z->id == b->id, "%s: order changed at %d", what, i);
+        CHECK(near4(z->cx, want), "%s zone %d: cx %.4f, want %.4f", what, b->id, z->cx, want);
+        CHECK(z->rx == b->rx && z->ry == b->ry && z->cy == b->cy,
+              "%s zone %d: radii or y changed (rx %.4f vs %.4f)", what, b->id, z->rx, b->rx);
+        CHECK(z->cx - z->rx >= L - 1e-5f && z->cx + z->rx <= 1.0f - R + 1e-5f,
+              "%s zone %d: leaves the safe band", what, b->id);
+        for (j = i + 1; j < base->n && j < zcount(); j++) {
+            const XBOX_IOS_TOUCH_ZONE *y = zone(j), *c = &base->z[j];
+            if ((b->cx < 0.5f) == (c->cx < 0.5f))
+                CHECK(fabsf((y->cx - z->cx) - (c->cx - b->cx)) < 1e-5f,
+                      "%s: zones %d and %d moved relative to each other", what, b->id, c->id);
+        }
+    }
+    if (shl) *shl = sl;
+    if (shr) *shr = sr;
+}
+
+/* 22. Safe area: a rigid shift per half (left group right, right group left)
+ * until its outermost edge is inside the inset; radii, y and spacing unchanged;
+ * both layouts; clamps; disabled and zero insets give today's table. */
+static void t_safe_map(void)
+{
+    static const float L = 0.07f, R = 0.03f;
+    Snap base;
+    int lay;
+    float l, r;
+
+    for (lay = 0; lay < 2; lay++) {
+        reset();
+        xbox_ios_touch_set_layout(lay);
+        snap_take(&base);
+        CHECK(base.n > 0, "layout %d: no zones", lay);
+        xbox_ios_touch_set_safe_area(L, R);
+        expect_shifted(&base, L, R, lay ? "DRIVE" : "PAD", NULL, NULL);
+        xbox_ios_touch_get_safe_area(&l, &r);
+        CHECK(near4(l, L) && near4(r, R), "get_safe_area %.4f %.4f", l, r);
+
+        /* The setting off: today's table, insets reported as zero. */
+        xbox_ios_touch_set_safe_enabled(0);
+        CHECK(snap_same(&base), "layout %d: safe area off does not give today's table", lay);
+        xbox_ios_touch_get_safe_area(&l, &r);
+        CHECK(l == 0.0f && r == 0.0f, "get_safe_area %.4f %.4f while off", l, r);
+        xbox_ios_touch_set_safe_enabled(1);
+        CHECK(!snap_same(&base), "layout %d: back on does not shift again", lay);
+        /* Zero insets: bit-identical to today. */
+        xbox_ios_touch_set_safe_area(0.0f, 0.0f);
+        CHECK(snap_same(&base), "layout %d: 0 insets differ from today's table", lay);
+    }
+
+    /* Clamps: each side 0..0.25, NaN = 0. */
+    reset();
+    xbox_ios_touch_set_safe_area(0.9f, -3.0f);
+    xbox_ios_touch_get_safe_area(&l, &r);
+    CHECK(near4(l, 0.25f) && r == 0.0f, "clamp: %.4f %.4f, want 0.25 0", l, r);
+    xbox_ios_touch_set_safe_area(NAN, 0.4f);
+    xbox_ios_touch_get_safe_area(&l, &r);
+    CHECK(l == 0.0f && near4(r, 0.25f), "clamp NaN: %.4f %.4f, want 0 0.25", l, r);
+
+    /* Order with the other stages: override, size, aspect, tablet, then the shift. */
+    reset();
+    {
+        int a = zone_by_label("A");
+        float g[4];
+        if (a >= 0) {
+            geom_of(a, g);
+            xbox_ios_touch_zone_set_geom(a, 0.50f, 0.50f, g[2], g[3]);
+            xbox_ios_touch_set_scale(1.2f);
+            xbox_ios_touch_set_aspect(1024.0f / 768.0f);
+            xbox_ios_touch_set_tablet_scale(0.8f);
+            snap_take(&base);                           /* everything but the insets */
+            CHECK(near4(zone(zone_by_label("A"))->cx, 0.50f), "combined: override moved");
+            xbox_ios_touch_set_safe_area(0.06f, 0.04f);
+            expect_shifted(&base, 0.06f, 0.04f, "combined", NULL, NULL);
+            geom_of(zone_by_label("A"), g);
+            CHECK(near4(g[0], 0.50f) && near4(g[1], 0.50f), "zone_geom is not the base value");
+        }
+    }
+    reset();
+}
+
+/* 22b. Hit-test and drawing use the shifted table; the strip keeps its width and gain. */
+static void t_safe_hit(void)
+{
+    XBOX_INPUT_STATE s;
+    int a, d, st;
+    const XBOX_IOS_TOUCH_ZONE *z;
+    float bx, by;
+
+    reset();
+    a = zone_by_label("A");
+    if (a < 0)
+        return;
+    bx = zone(a)->cx;
+    by = zone(a)->cy;
+    xbox_ios_touch_set_safe_area(0.20f, 0.20f);
+    z = zone(zone_by_label("A"));
+    CHECK(z && z->cx < bx - 0.05f, "A centre %.4f did not move left of %.4f", z ? z->cx : -1.0f, bx);
+    /* The old spot is bare now (a stick touch), the new centre presses A. */
+    CHECK(zone_hit(bx, by) != zone_by_label("A"), "the unshifted centre still hits A");
+    fdown(1, bx, by);
+    s = rd();
+    CHECK(s.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 0, "A pressed at its unshifted spot");
+    fup(1);
+    fdown(2, z ? z->cx : 0.0f, z ? z->cy : 0.0f);
+    s = rd();
+    CHECK(s.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 255, "A not pressed at its shifted centre");
+    CHECK(xbox_ios_touch_zone_pressed(zone_by_label("A")), "zone_pressed false at the shifted centre");
+    fup(2);
+
+    /* D-pad quadrants follow the shifted centre. */
+    d = zone_by_kind(XBOX_IOS_ZONE_DPAD);
+    if (d >= 0) {
+        z = zone(d);
+        fdown(3, z->cx + 0.6f * z->rx, z->cy);
+        s = rd();
+        CHECK(s.Gamepad.wButtons == XBOX_GAMEPAD_DPAD_RIGHT, "shifted d-pad right: 0x%x", s.Gamepad.wButtons);
+        fup(3);
+    }
+
+    /* The strip: rx unchanged, moves with its half (same shift as BACK), same gain. */
+    xbox_ios_touch_set_layout(1);
+    xbox_ios_touch_set_safe_area(0.0f, 0.0f);
+    st = zone_by_kind(XBOX_IOS_ZONE_STEER);
+    if (st >= 0) {
+        float rx0 = zone(st)->rx, cx0 = zone(st)->cx, back0 = zone(zone_by_flag(XBOX_GAMEPAD_BACK))->cx;
+        float shift;
+        xbox_ios_touch_set_safe_area(0.10f, 0.10f);
+        z = zone(zone_by_kind(XBOX_IOS_ZONE_STEER));
+        shift = zone(zone_by_flag(XBOX_GAMEPAD_BACK))->cx - back0;
+        CHECK(shift > 0.05f, "BACK did not shift right (%.4f)", shift);
+        CHECK(z && near4(z->rx, rx0) && near4(z->cx, cx0 + shift),
+              "strip: c %.4f r %.4f (rx must stay %.4f, cx %.4f)", z ? z->cx : -1.0f, z ? z->rx : -1.0f, rx0, cx0 + shift);
+        fdown(4, z->cx + z->rx, z->cy);
+        s = rd();
+        CHECK(s.Gamepad.sThumbLX > 30000, "strip edge: LX=%d, want full lock", s.Gamepad.sThumbLX);
+        fup(4);
+        /* Gain unchanged: the same finger offset gives the same value. */
+        z = zone(zone_by_kind(XBOX_IOS_ZONE_STEER));
+        fdown(5, z->cx + 0.5f * z->rx, z->cy);
+        s = rd();
+        xbox_ios_touch_set_safe_area(0.0f, 0.0f);
+        z = zone(zone_by_kind(XBOX_IOS_ZONE_STEER));
+        fup(5);
+        fdown(6, z->cx + 0.5f * z->rx, z->cy);
+        {
+            XBOX_INPUT_STATE s0 = rd();
+            CHECK(s.Gamepad.sThumbLX == s0.Gamepad.sThumbLX, "strip gain changed with the insets (%d vs %d)",
+                  s.Gamepad.sThumbLX, s0.Gamepad.sThumbLX);
+        }
+        fup(6);
+    }
+    /* A zone against the right edge: the right half moves in until it is inside. */
+    reset();
+    {
+        int ia = zone_by_label("A");
+        if (ia >= 0) {
+            float g[4];
+            geom_of(ia, g);
+            xbox_ios_touch_zone_set_geom(ia, 1.0f, 0.5f, g[2], g[3]);   /* base: against the right edge */
+            xbox_ios_touch_set_safe_area(0.0f, 0.20f);
+            z = zone(zone_by_label("A"));
+            CHECK(z && near4(z->cx, 0.80f - g[2]) && near4(z->rx, g[2]), "edge zone: cx %.4f rx %.4f, want %.4f %.4f",
+                  z ? z->cx : -1.0f, z ? z->rx : -1.0f, 0.80f - g[2], g[2]);
+        }
+    }
+    /* A strip wider than the band shrinks to it and is centred. */
+    reset();
+    xbox_ios_touch_set_layout(1);
+    st = zone_by_kind(XBOX_IOS_ZONE_STEER);
+    if (st >= 0) {
+        xbox_ios_touch_zone_set_geom(st, 0.5f, 0.79f, 0.40f, 0.15f);
+        xbox_ios_touch_set_safe_area(0.25f, 0.25f);                      /* band half-width 0.25 */
+        z = zone(zone_by_kind(XBOX_IOS_ZONE_STEER));
+        CHECK(z && near4(z->rx, 0.25f) && near4(z->cx, 0.50f), "wide strip: c %.4f r %.4f, want 0.5 0.25",
+              z ? z->cx : -1.0f, z ? z->rx : -1.0f);
+    }
+    reset();
+}
+
+/* Signed gap in points between zones i and j on a W x H screen: > 0 the
+ * distance between the shapes, <= 0 minus the deepest sampled penetration.
+ * Ellipses and the strip's rectangle are sampled; good to about a point. */
+static void shape_pt(const XBOX_IOS_TOUCH_ZONE *z, float t, float *x, float *y, float W, float H)
+{
+    float a = t * 6.2831853f;
+    if (z->kind == XBOX_IOS_ZONE_STEER) {            /* rectangle boundary, t in 0..1 */
+        float u = t * 4.0f;
+        float cx = z->cx * W, cy = z->cy * H, hx = z->rx * W, hy = z->ry * H;
+        int side = (int)u > 3 ? 3 : (int)u;
+        float f = u - (float)side;
+        *x = side == 0 ? cx - hx + 2 * hx * f : side == 2 ? cx + hx - 2 * hx * f : side == 1 ? cx + hx : cx - hx;
+        *y = side == 1 ? cy - hy + 2 * hy * f : side == 3 ? cy + hy - 2 * hy * f : side == 0 ? cy - hy : cy + hy;
+    } else {
+        *x = z->cx * W + z->rx * W * cosf(a);
+        *y = z->cy * H + z->ry * H * sinf(a);
+    }
+}
+
+static float zone_gap_pt(int i, int j, float W, float H)
+{
+    const XBOX_IOS_TOUCH_ZONE *zi = zone(i), *zj = zone(j);
+    int a, b, steps = 720, hit = 0;
+    float best = 1e9f, depth = 0.0f;
+
+    for (a = 0; a < steps; a++) {
+        float xa, ya;
+        shape_pt(zi, (float)a / (float)steps, &xa, &ya, W, H);
+        for (b = 0; b < steps; b += 2) {
+            float xb, yb, d;
+            shape_pt(zj, (float)b / (float)steps, &xb, &yb, W, H);
+            d = sqrtf((xa - xb) * (xa - xb) + (ya - yb) * (ya - yb));
+            if (d < best)
+                best = d;
+        }
+    }
+    for (a = -30; a <= 30; a++)
+        for (b = -30; b <= 30; b++) {
+            float x = zi->cx + zi->rx * (float)a / 30.0f, y = zi->cy + zi->ry * (float)b / 30.0f;
+            if (in_shape(zi, x, y) && in_shape(zj, x, y)) {
+                int c;
+                float dmin = 1e9f;
+                hit = 1;
+                for (c = 0; c < steps; c += 2) {
+                    float xb, yb, d;
+                    shape_pt(zj, (float)c / (float)steps, &xb, &yb, W, H);
+                    d = sqrtf((x * W - xb) * (x * W - xb) + (y * H - yb) * (y * H - yb));
+                    if (d < dmin)
+                        dmin = d;
+                }
+                if (dmin > depth)
+                    depth = dmin;
+            }
+        }
+    return hit ? -depth : best;
+}
+
+/* 22d. With the Face ID insets (59 pt each side of 852) and Size 1.0 no two
+ * zones of PAD, DRIVE or classic DRIVE overlap. Reports the smallest gap
+ * (TOUCHTEST_GEOMETRY=1 prints it and every pair under 8 pt). */
+static void t_safe_overlap(void)
+{
+    const float W = 852.0f, H = 393.0f, inset = 59.0f / 852.0f;
+    static const char *names[3] = { "PAD", "DRIVE", "DRIVE classic" };
+    int print = getenv("TOUCHTEST_GEOMETRY") != NULL;
+    int lay;
+
+    for (lay = 0; lay < 3; lay++) {
+        int n, i, j, wi = -1, wj = -1;
+        float worst = 1e9f, w0 = 1e9f, shl, shr;
+        Snap snap;
+
+        reset();
+        xbox_ios_touch_set_layout(lay > 0);
+        xbox_ios_touch_set_drive_classic(lay == 2);
+        xbox_ios_touch_set_scale(1.0f);
+        snap_take(&snap);                                /* reference: today's table, no insets */
+        n = zcount();
+        for (i = 0; i < n; i++)
+            for (j = i + 1; j < n; j++) {
+                float g = zone_gap_pt(i, j, W, H);
+                if (g < w0)
+                    w0 = g;
+            }
+        xbox_ios_touch_set_safe_area(inset, inset);
+        expect_shifted(&snap, inset, inset, names[lay], &shl, &shr);   /* rigid, in the band */
+        n = zcount();
+        for (i = 0; i < n; i++)
+            for (j = i + 1; j < n; j++) {
+                float g = zone_gap_pt(i, j, W, H);
+                if (g < worst) {
+                    worst = g;
+                    wi = i;
+                    wj = j;
+                }
+                if (print && g < 8.0f)
+                    printf("   gap  %-13s id %2d (%s) / id %2d (%s): %.1f pt\n", names[lay], zone(i)->id,
+                           xbox_ios_touch_zone_label(i) ? xbox_ios_touch_zone_label(i) : "-", zone(j)->id,
+                           xbox_ios_touch_zone_label(j) ? xbox_ios_touch_zone_label(j) : "-", g);
+                CHECK(g > 0.0f, "%s: zones id %d (%s) and id %d (%s) overlap by %.1f pt", names[lay],
+                      zone(i)->id, xbox_ios_touch_zone_label(i) ? xbox_ios_touch_zone_label(i) : "-",
+                      zone(j)->id, xbox_ios_touch_zone_label(j) ? xbox_ios_touch_zone_label(j) : "-", -g);
+            }
+        if (print && wi >= 0)
+            printf("   %-13s shift left +%.1f pt, right -%.1f pt; smallest gap %.1f pt (id %d / id %d), %.1f pt without insets\n",
+                   names[lay], shl * W, shr * W, worst, zone(wi)->id, zone(wj)->id, w0);
+        for (i = 0; i < n; i++) {
+            const XBOX_IOS_TOUCH_ZONE *z = zone(i);
+            CHECK(z->cx - z->rx >= inset - 1e-5f && z->cx + z->rx <= 1.0f - inset + 1e-5f,
+                  "%s: zone id %d leaves the safe band", names[lay], z->id);
+        }
+        (void)wj;
+    }
+    reset();
+}
+
+/* 22c. Layout editor in screen space: the per-zone shift and its inverse
+ * round-trip, and zone_geom keeps returning base values. */
+static void t_safe_editor(void)
+{
+    static const float L = 0.08f, R = 0.05f;
+    int a, a2, i;
+    float g[4], g2[4], sx, nsx, back;
+    const XBOX_IOS_TOUCH_ZONE *z;
+
+    reset();
+    a = zone_by_label("A");
+    if (a < 0)
+        return;
+    geom_of(a, g);
+    xbox_ios_touch_set_safe_area(L, R);
+    geom_of(zone_by_label("A"), g2);
+    CHECK(near4(g[0], g2[0]) && near4(g[1], g2[1]) && near4(g[2], g2[2]) && near4(g[3], g2[3]),
+          "zone_geom changed with the insets");
+    for (i = 0; i < zcount(); i++) {
+        float bx, by, br, bq;
+        float s2;
+        (void)xbox_ios_touch_zone_geom(i, &bx, &by, &br, &bq);
+        s2 = xbox_ios_touch_base_to_screen_x(i, bx);
+        CHECK(near4(s2, zone(i)->cx), "zone %d: base_to_screen %.4f, table cx %.4f", zone(i)->id, s2, zone(i)->cx);
+        CHECK(near4(xbox_ios_touch_screen_to_base_x(i, s2), bx), "zone %d: round trip gives %.5f, base %.5f",
+              zone(i)->id, xbox_ios_touch_screen_to_base_x(i, s2), bx);
+    }
+    CHECK(xbox_ios_touch_base_to_screen_x(-1, 0.3f) == 0.3f && xbox_ios_touch_screen_to_base_x(99, 0.3f) == 0.3f,
+          "a bad index must return the value unchanged");
+    a2 = zone_by_label("A");
+    z = zone(a2);
+    sx = z->cx;
+    /* A drag of -0.10 of the width on screen moves the zone by exactly that. */
+    nsx = sx - 0.10f;
+    back = xbox_ios_touch_screen_to_base_x(a2, nsx);
+    xbox_ios_touch_zone_set_geom(a2, back, g[1], g[2], g[3]);
+    z = zone(zone_by_label("A"));
+    CHECK(z && near4(z->cx, nsx), "after the drag the zone is at %.4f, want %.4f", z ? z->cx : -1.0f, nsx);
+    geom_of(zone_by_label("A"), g2);
+    CHECK(near4(g2[0], back), "stored base cx %.4f, want %.4f", g2[0], back);
+    /* The override survives a change of the insets. */
+    xbox_ios_touch_set_safe_area(0.0f, 0.0f);
+    z = zone(zone_by_label("A"));
+    CHECK(z && near4(z->cx, back), "without insets the zone is at %.4f, want base %.4f", z ? z->cx : -1.0f, back);
+    /* Format text carries base values. */
+    {
+        char buf[512], want[64];
+        (void)xbox_ios_touch_layout_format(buf, sizeof buf);
+        snprintf(want, sizeof want, " 8 %.4f", back);
+        CHECK(strstr(buf, want) != NULL, "layout text lacks the base value (%s)", want);
+    }
+    reset();
+}
+
+/* 23. Aspect: the phone's table is untouched, other aspects make the round
+ * controls round in pixels, pedals and the strip keep their shapes. */
+static void t_aspect_round(void)
+{
+    static const float A43 = 1024.0f / 768.0f;
+    Snap base;
+    int i, lay;
+
+    reset();
+    snap_take(&base);
+    /* Within 10 % of 852/393 (1.95 .. 2.385), unknown, portrait: nothing. */
+    xbox_ios_touch_set_aspect(PHONE_A);
+    CHECK(snap_same(&base), "phone aspect changed the table");
+    xbox_ios_touch_set_aspect(2.0f);
+    CHECK(snap_same(&base), "aspect 2.0 changed the table");
+    xbox_ios_touch_set_aspect(2.35f);
+    CHECK(snap_same(&base), "aspect 2.35 changed the table");
+    xbox_ios_touch_set_aspect(0.5f);
+    CHECK(snap_same(&base), "a portrait aspect changed the table");
+    xbox_ios_touch_set_aspect(NAN);
+    CHECK(snap_same(&base), "NaN aspect changed the table");
+    xbox_ios_touch_set_tablet_scale(0.8f);               /* only with a different aspect */
+    CHECK(snap_same(&base), "the tablet factor applied on the phone aspect");
+    xbox_ios_touch_set_tablet_scale(1.0f);
+
+    for (lay = 0; lay < 2; lay++) {
+        reset();
+        xbox_ios_touch_set_layout(lay);
+        snap_take(&base);
+        xbox_ios_touch_set_aspect(A43);
+        CHECK(!snap_same(&base), "layout %d: 4:3 left the table as is", lay);
+        for (i = 0; i < base.n && i < zcount(); i++) {
+            const XBOX_IOS_TOUCH_ZONE *z = zone(i), *b = &base.z[i];
+            float px = z->rx * 1024.0f, py = z->ry * 768.0f;         /* radii in pixels */
+            float phone = (b->ry * 393.0f) / (b->rx * 852.0f);       /* h/w of the phone's shape */
+            int round = (b->kind == XBOX_IOS_ZONE_FLAG || b->kind == XBOX_IOS_ZONE_DPAD ||
+                         (b->kind == XBOX_IOS_ZONE_ANALOG && b->value != XBOX_BUTTON_LTRIGGER &&
+                          b->value != XBOX_BUTTON_RTRIGGER));
+            CHECK(z->id == b->id && z->cx == b->cx && z->cy == b->cy, "layout %d zone %d: moved", lay, b->id);
+            if (round) {
+                CHECK(z->rx == b->rx, "layout %d zone %d: rx changed", lay, b->id);
+                CHECK(fabsf(py / px - phone) < 1e-3f, "layout %d zone %d: shape %.4f, phone %.4f",
+                      lay, b->id, py / px, phone);
+                if (fabsf(phone - 1.0f) < 0.03f && b->kind != XBOX_IOS_ZONE_STEER)
+                    CHECK(fabsf(py / px - 1.0f) < 0.03f, "layout %d zone %d: not round in pixels (%.3f)",
+                          lay, b->id, py / px);
+            } else {
+                CHECK(z->rx == b->rx && z->ry == b->ry, "layout %d zone %d (pedal/trigger/strip): shape changed",
+                      lay, b->id);
+            }
+        }
+        xbox_ios_touch_set_round(0);
+        CHECK(snap_same(&base), "layout %d: round off does not give today's table", lay);
+        xbox_ios_touch_set_round(1);
+        xbox_ios_touch_set_aspect(PHONE_A);
+        CHECK(snap_same(&base), "layout %d: back to the phone aspect does not restore the table", lay);
+    }
+
+    /* Hit test in pixels on 4:3: 0.9 R presses A, 1.1 R does not. */
+    reset();
+    xbox_ios_touch_set_aspect(A43);
+    {
+        int a = zone_by_label("A");
+        if (a >= 0) {
+            const XBOX_IOS_TOUCH_ZONE *z = zone(a);
+            float R = z->rx * 1024.0f, cx = z->cx, cy = z->cy;
+            float dirs[4][2] = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
+            int k;
+            for (k = 0; k < 4; k++) {
+                float xi = cx + dirs[k][0] * 0.9f * R / 1024.0f, yi = cy + dirs[k][1] * 0.9f * R / 768.0f;
+                float xo = cx + dirs[k][0] * 1.1f * R / 1024.0f, yo = cy + dirs[k][1] * 1.1f * R / 768.0f;
+                CHECK(zone_hit(xi, yi) == a, "dir %d: 0.9 R misses A (hit %d)", k, zone_hit(xi, yi));
+                CHECK(zone_hit(xo, yo) != a, "dir %d: 1.1 R still hits A", k);
+            }
+        }
+    }
+    reset();
+}
+
+/* 23b. Tablet size factor: on top of Size, only with a different aspect, clamped. */
+static void t_tablet_scale(void)
+{
+    static const float A43 = 1024.0f / 768.0f;
+    Snap base, ar;
+    int i, lay;
+
+    for (lay = 0; lay < 2; lay++) {
+        reset();
+        xbox_ios_touch_set_layout(lay);
+        xbox_ios_touch_set_aspect(A43);
+        snap_take(&ar);                                  /* aspect shape, factor 1.0 */
+        xbox_ios_touch_set_aspect(0.0f);
+        snap_take(&base);
+        xbox_ios_touch_set_aspect(A43);
+        xbox_ios_touch_set_tablet_scale(0.8f);
+        for (i = 0; i < ar.n && i < zcount(); i++) {
+            const XBOX_IOS_TOUCH_ZONE *z = zone(i), *b = &ar.z[i];
+            if (b->kind == XBOX_IOS_ZONE_STEER) {
+                CHECK(z->rx == b->rx && near4(z->ry, b->ry * 0.8f),
+                      "strip: r %.4f,%.4f want %.4f,%.4f", z->rx, z->ry, b->rx, b->ry * 0.8f);
+            } else {
+                CHECK(near4(z->rx, b->rx * 0.8f) && near4(z->ry, b->ry * 0.8f),
+                      "layout %d zone %d: r %.4f,%.4f want %.4f,%.4f", lay, b->id, z->rx, z->ry,
+                      b->rx * 0.8f, b->ry * 0.8f);
+            }
+        }
+        /* With the Size setting: multiplied, not replaced. */
+        xbox_ios_touch_set_scale(1.25f);
+        {
+            int a = zone_by_id(7);
+            const XBOX_IOS_TOUCH_ZONE *z = a >= 0 ? zone(a) : NULL;
+            if (z && z->kind != XBOX_IOS_ZONE_STEER) {
+                int j = -1, m;
+                for (m = 0; m < ar.n; m++)
+                    if (ar.z[m].id == 7)
+                        j = m;
+                CHECK(j >= 0 && near4(z->rx, ar.z[j].rx * 1.25f * 0.8f),
+                      "size x tablet: rx %.4f want %.4f", z->rx, j >= 0 ? ar.z[j].rx * 1.25f * 0.8f : -1.0f);
+            }
+        }
+        xbox_ios_touch_set_scale(1.0f);
+        xbox_ios_touch_set_aspect(0.0f);
+        CHECK(snap_same(&base), "layout %d: unknown aspect does not restore the table", lay);
+    }
+
+    /* Clamps 0.6 .. 1.2, NaN = 1.0. */
+    reset();
+    xbox_ios_touch_set_aspect(A43);
+    snap_take(&base);
+    xbox_ios_touch_set_tablet_scale(0.1f);
+    CHECK(near4(zone(zone_by_label("A"))->rx, base.z[zone_by_label("A")].rx * 0.6f), "tablet 0.1 not clamped to 0.6");
+    xbox_ios_touch_set_tablet_scale(9.0f);
+    CHECK(near4(zone(zone_by_label("A"))->rx, base.z[zone_by_label("A")].rx * 1.2f), "tablet 9 not clamped to 1.2");
+    xbox_ios_touch_set_tablet_scale(NAN);
+    CHECK(snap_same(&base), "tablet NaN is not 1.0");
+    reset();
+}
+
+/* 23c. Every adaptation setter is a no-op for a value already in force: no
+ * rebuild, no generation bump, no finger dropped. A real change bumps once and
+ * still keeps the finger. */
+static void t_adapt_noop(void)
+{
+    static const float A43 = 1024.0f / 768.0f;
+    int a;
+    unsigned g0, g1;
+    XBOX_INPUT_STATE s;
+
+    reset();
+    a = zone_by_label("A");
+    if (a < 0)
+        return;
+    fdown(1, zone(a)->cx, zone(a)->cy);
+    g0 = xbox_ios_touch_layout_gen();
+    xbox_ios_touch_set_safe_area(0.0f, 0.0f);
+    xbox_ios_touch_set_safe_enabled(1);
+    xbox_ios_touch_set_aspect(0.0f);
+    xbox_ios_touch_set_aspect(PHONE_A);                  /* both inactive */
+    xbox_ios_touch_set_aspect(2.2f);
+    xbox_ios_touch_set_round(1);
+    xbox_ios_touch_set_round(0);                         /* nothing to re-shape on a phone aspect */
+    xbox_ios_touch_set_round(1);
+    xbox_ios_touch_set_tablet_scale(1.0f);
+    xbox_ios_touch_set_tablet_scale(0.8f);               /* inactive aspect: no table change */
+    xbox_ios_touch_set_tablet_scale(1.0f);
+    xbox_ios_touch_set_safe_enabled(0);                  /* no insets: nothing to map */
+    xbox_ios_touch_set_safe_enabled(1);
+    CHECK(xbox_ios_touch_layout_gen() == g0, "a no-op setter bumped the generation");
+    CHECK(xbox_ios_touch_zone_pressed(a), "a no-op setter dropped the held finger");
+
+    xbox_ios_touch_set_safe_area(0.1f, 0.05f);
+    g1 = xbox_ios_touch_layout_gen();
+    CHECK(g1 != g0, "set_safe_area did not bump the generation");
+    xbox_ios_touch_set_safe_area(0.1f, 0.05f);
+    CHECK(xbox_ios_touch_layout_gen() == g1, "repeating set_safe_area bumped again");
+    xbox_ios_touch_set_aspect(A43);
+    g0 = xbox_ios_touch_layout_gen();
+    CHECK(g0 != g1, "set_aspect(4:3) did not bump the generation");
+    xbox_ios_touch_set_aspect(A43);
+    xbox_ios_touch_set_aspect(A43 + 0.00001f);
+    CHECK(xbox_ios_touch_layout_gen() == g0, "repeating set_aspect bumped again");
+    xbox_ios_touch_set_tablet_scale(0.8f);
+    CHECK(xbox_ios_touch_layout_gen() != g0, "set_tablet_scale did not bump the generation");
+    CHECK(xbox_ios_touch_zone_pressed(a), "a real change dropped the held finger");
+    s = rd();
+    CHECK(s.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 255, "A not held after the adaptation changes");
+    fup(1);
+    reset();
+}
+
 /* ------------------------------------------------------------------ */
 
 int main(void)
@@ -2932,6 +3532,13 @@ int main(void)
     run_case("21e  Layout editor: format -> parse round trip, replace, small buffers", t_geom_roundtrip, NULL);
     run_case("21f  Layout editor: parse tolerates garbage, CRLF, NULL, empty", t_geom_parse, NULL);
     run_case("21g  Layout editor: on screen at 1.5x, strip width, classic DRIVE", t_geom_on_screen, NULL);
+    run_case("22   Safe area: rigid shift per half, off / zero = today, clamps, order", t_safe_map, NULL);
+    run_case("22b  Safe area: hit test and d-pad use the shifted table, strip gain kept, edge cases", t_safe_hit, NULL);
+    run_case("22d  Safe area 59/852 each side at 852x393, Size 1.0: no overlaps, groups rigid (PAD, DRIVE, classic)", t_safe_overlap, NULL);
+    run_case("22c  Safe area: editor per-zone shift round-trips, zone_geom stays base", t_safe_editor, NULL);
+    run_case("23   Aspect: phone unchanged, 4:3 round in pixels, pedals / strip keep shape", t_aspect_round, NULL);
+    run_case("23b  Tablet factor: on top of Size, strip height only, clamped", t_tablet_scale, NULL);
+    run_case("23c  Adaptation setters: no-op leaves gen and fingers alone", t_adapt_noop, NULL);
 
     reset();
     SDL_Quit();

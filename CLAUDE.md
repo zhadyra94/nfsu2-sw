@@ -839,7 +839,8 @@ only, never files): `../IOS_IMPROVEMENT_MAP.md`.
   avg/max ms, suboptimal/rebuilds, present mode, MVK sync; `[ios-vk2]`
   passes/frame, upload-split and layout-split passes/frame, uploads and
   KB/frame, `mem left` (os_proc_available_memory). Thermal state logged on
-  change; FPS label adds "· HOT" at serious.
+  change; FPS label `30.0 fps · 33.3 ms` + WARM/HOT/CRIT (thermal fair/
+  serious/critical) + LPM (Low Power Mode), each logged once per change.
 - **Tile-GPU passes (v23):** a pass that opens with a full clear begins
   with LOAD_OP_CLEAR instead of LOAD + `vkCmdClearAttachments` (MoltenVK
   draws a quad for that) -- `RECOMP_VK_CLEAR_LOAD` (iOS default on, else
@@ -864,6 +865,40 @@ only, never files): `../IOS_IMPROVEMENT_MAP.md`.
   run keeps the layout, 6 in a row (~3 s, e.g. results screen) fall back to
   Pad (flyby stays Pad), never writes `NFSU2_TOUCH_LAYOUT`. Free roam and quit-to-menu are
   not validated. Test: `tools/tests/run_state_test.sh`.
+- **NFSU2 controls (Options > Controls, Control Type 1, read from the game
+  on lavapipe):** RT Accelerate, LT Brake/Reverse, left stick Steer, A
+  Handbrake, B Nitrous, X Shift Up, Y Shift Down, Black Look Back, White
+  Change Camera, right stick unused, Start pause; Back/D-pad = free-roam
+  shop/map/stats/SMS. Menu path from boot (pad script): Start 15 s, Start
+  40 s, A 60 s, A 75 s = Main Menu (Quick Race); right x6 Options; right x4
+  Controls.
+- **Touch UI (v24 series):** one CALayer subtree per zone built from the
+  runtime zone table (hit-testing and drawing share it); display link runs
+  only while touched/animating, woken by an activity hook on every finger
+  down (`NFSU2_OVERLAY_WATCH=1` = old 20 Hz timer). DRIVE layout by
+  function (GAS/BRAKE analog pedals `NFSU2_ANALOG_PEDALS`, fixed steering
+  strip `NFSU2_STEER`/`NFSU2_STEER_SENS`, NOS, E-BRAKE, SHIFT, LOOK, CAM;
+  `NFSU2_DRIVE_CLASSIC=1` = old table). Captions/icons per zone
+  (`NFSU2_TOUCH_CAPTIONS`). Layout editor: per-zone overrides in C
+  (`xbox_ios_touch_zone_set_geom`, text format `v1 <pad|drive> <id> cx cy
+  rx ry`), saved to `Documents/nfsu2_touch_layout_<phone|pad>.txt`.
+  Pre-launch screen `src/ios_launcher.m` runs after cfg_load and before any
+  thread / SDL_CreateWindow, exports only the keys it changed
+  (`nfsu2_cfg_export_changed`); `NFSU2_LAUNCHER=0` skips it.
+- **Layout geometry order** (`zones_rebuild_locked`): preset -> editor
+  override -> Size -> aspect shape (round zones keep their phone shape in
+  points when the window aspect is >10% off 852/393; `NFSU2_TOUCH_ROUND=0`)
+  -> tablet factor (iPad only, `NFSU2_TOUCH_TABLET_SCALE`, default 0.80) ->
+  safe-area shift: each half of the screen (zone centre < 0.5 / >= 0.5)
+  moves rigidly inward just enough to clear `safeAreaInsets` left/right
+  (spacing and sizes unchanged; ~41 pt per side at 59 pt insets;
+  `NFSU2_TOUCH_SAFE=0` off). Haptics strength `NFSU2_HAPTICS_STRENGTH`
+  light|medium|heavy.
+- **Local UI checks (no Mac):** `tools/tests/run_touch_test.sh` (touch layer
+  behaviour with synthetic SDL finger events), `run_state_test.sh` (race
+  state reader + debounce), `tools/tests/objc_mock/check.sh FILE.m` (ObjC
+  syntax/type check against mock headers; does not prove Apple API names --
+  CI's xcrun fail-fast step does).
 - **Input:** touch layer `xinput_ios.c` (PAD preset unchanged, DRIVE preset
   with GAS/BRAKE pedals, size 0.7-1.5, layout switch clears fingers),
   overlay `ios_touch_overlay.m` draws from the same table; touch off really

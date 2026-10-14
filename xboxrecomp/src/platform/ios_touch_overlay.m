@@ -55,6 +55,14 @@ extern void xbox_ios_touch_set_analog_pedals(int on);
 extern void xbox_ios_touch_set_steer(int on);
 extern void xbox_ios_touch_set_steer_sens(float k);
 extern void xbox_ios_touch_set_tilt(float x, int active);
+/* Screen adaptation (xinput_ios.c): the overlay feeds them from the window. */
+extern void  xbox_ios_touch_set_safe_area(float left, float right);   /* fractions of the width */
+extern void  xbox_ios_touch_set_safe_enabled(int on);                 /* NFSU2_TOUCH_SAFE */
+extern float xbox_ios_touch_base_to_screen_x(int idx, float bx);     /* editor: base <-> screen, per zone */
+extern float xbox_ios_touch_screen_to_base_x(int idx, float sx);
+extern void  xbox_ios_touch_set_aspect(float w_over_h);
+extern void  xbox_ios_touch_set_round(int on);                        /* NFSU2_TOUCH_ROUND */
+extern void  xbox_ios_touch_set_tablet_scale(float k);                /* NFSU2_TOUCH_TABLET_SCALE */
 extern int nv2a_vk_fps_x10(void);
 
 /* Layout editor (xinput_ios.c). Geometry is normalized, base = before the size
@@ -95,10 +103,14 @@ static void overlay_wake(void);
 static UIWindow *s_win;              /* the SDL window the overlay lives on */
 static UIButton *s_gear;             /* hidden while the layout editor runs */
 static void panel_hide(void);
+static void panel_fit(void);         /* re-fit an open panel to the window */
 static void touch_hook_main(void);   /* haptic tick if the Haptics switch is on */
 static NSString *ns(const char *c);
 static int s_auto_on = 0;            /* the panel's Auto Pad/Drive switch (main thread) */
 static int s_auto_state = 0;         /* debounce state of nfsu2_auto_layout_step */
+static int s_is_pad = 0;             /* iPad idiom (set at install) */
+static void adapt_feed(void);        /* window insets + aspect -> the touch layer */
+static void fps_reposition(void);    /* FPS label clear of the top controls */
 
 /* ── Look: colours, text and icon images, path helpers ─────────── */
 
@@ -1207,9 +1219,22 @@ static void path_add_rect(UIBezierPath *p, CGRect r)
 - (void)layoutSubviews
 {
     [super layoutSubviews];
+    adapt_feed();                       /* insets and aspect first: syncControls relays on a new table */
     (void)[self syncControls];          /* rebuilds when the bounds changed */
     if (_editing)
         [self updateEditUI];
+    panel_fit();
+}
+
+/* Rotation (island left <-> right) and the first layout land here. */
+- (void)safeAreaInsetsDidChange
+{
+    [super safeAreaInsetsDidChange];
+    adapt_feed();
+    (void)[self syncControls];
+    if (_editing)
+        [self updateEditUI];
+    panel_fit();
 }
 
 /* Rebuild every control and stick layer from the zone table. Main thread. */
@@ -1292,6 +1317,7 @@ static void path_add_rect(UIBezierPath *p, CGRect r)
     _built = YES;
     _builtSize = self.bounds.size;
     [CATransaction commit];
+    fps_reposition();                    /* the top row may have moved */
     if (_editing)
         [self updateEditUI];             /* the outline follows the new table */
 }
@@ -1789,8 +1815,13 @@ static void path_add_rect(UIBezierPath *p, CGRect r)
             return;
         before = xbox_ios_touch_layout_gen();
         inSync = (_built && before == _gen) ? YES : NO;
-        (void)xbox_ios_touch_zone_set_geom(idx, _g0[0] + (float)(t.x / W),
-                                           _g0[1] + (float)(t.y / H), _g0[2], _g0[3]);
+        /* The finger moves on the screen; the stored geometry is base (before
+         * the safe-area shift of the zone's half): go through the shift and
+         * its inverse. */
+        (void)xbox_ios_touch_zone_set_geom(idx,
+            xbox_ios_touch_screen_to_base_x(idx, xbox_ios_touch_base_to_screen_x(idx, _g0[0])
+                                            + (float)(t.x / W)),
+            _g0[1] + (float)(t.y / H), _g0[2], _g0[3]);
         [self relayoutZone:idx fast:inSync];
         [self updateEditUI];
     } else {
@@ -1876,6 +1907,24 @@ static void overlay_wake(void)
 
 static UIImpactFeedbackGenerator *s_haptic_gen;
 static int s_haptics_on = 1;          /* __atomic: panel (main) vs hook (any) */
+
+/* NFSU2_HAPTICS_STRENGTH: light (default) | medium | heavy ("strong" too). */
+static UIImpactFeedbackStyle haptic_style_from(const char *v)
+{
+    if (v && strcasecmp(v, "medium") == 0)
+        return UIImpactFeedbackStyleMedium;
+    if (v && (strcasecmp(v, "heavy") == 0 || strcasecmp(v, "strong") == 0))
+        return UIImpactFeedbackStyleHeavy;
+    return UIImpactFeedbackStyleLight;
+}
+
+/* Main thread: a new generator of the chosen style, prepared. The old one is
+ * dropped; haptic_fire_main (main thread too) only ever sees one or the other. */
+static void haptic_set_strength(const char *v)
+{
+    s_haptic_gen = [[UIImpactFeedbackGenerator alloc] initWithStyle:haptic_style_from(v)];
+    [s_haptic_gen prepare];
+}
 
 static void haptic_fire_main(void)
 {
@@ -2015,11 +2064,11 @@ static void tilt_start(void)
 
 /* ── Settings table ── */
 
-enum { IK_HEAD, IK_SWITCH, IK_SLIDER, IK_SEG, IK_BUTTON };
+enum { IK_HEAD, IK_SWITCH, IK_SLIDER, IK_SEG, IK_BUTTON, IK_SUB };
 enum { ACT_NONE, ACT_FPS, ACT_TOUCH, ACT_LAYOUT, ACT_SCALE, ACT_ALPHA,
        ACT_HAPTICS, ACT_TILT, ACT_TILTSENS, ACT_KEYBOARD, ACT_RUMBLE,
        ACT_ANALOG, ACT_STEER, ACT_STEERSENS, ACT_TILTCENTRE, ACT_EDITLAYOUT,
-       ACT_CAPTIONS, ACT_AUTOLAYOUT };
+       ACT_CAPTIONS, ACT_AUTOLAYOUT, ACT_SAFE, ACT_TABLET, ACT_HAPSTRENGTH };
 
 typedef struct {
     int         kind;
@@ -2033,10 +2082,13 @@ typedef struct {
     const char *def_val;             /* segmented: value when unset */
     int         act;                 /* live effect, ACT_* */
     const char *note;                /* switch: small grey line under the row, or NULL */
+    int         pad_only;            /* shown on an iPad only */
 } PanelItem;
 
 static const PanelItem s_items[] = {
     { .kind = IK_HEAD, .title = "Controls" },
+
+    { .kind = IK_SUB, .title = "Touch" },
     { .kind = IK_SWITCH, .title = "Touch controls", .key = "RECOMP_TOUCH",
       .on = "1", .off = "0", .def_on = 1, .act = ACT_TOUCH },
     { .kind = IK_SEG, .title = "Layout", .key = "NFSU2_TOUCH_LAYOUT",
@@ -2049,23 +2101,30 @@ static const PanelItem s_items[] = {
       .note = "Drive while racing, Pad in menus; may misread free roam" },
     { .kind = IK_SLIDER, .title = "Size", .key = "NFSU2_TOUCH_SCALE",
       .lo = 0.7f, .hi = 1.5f, .def = 1.0f, .decimals = 2, .act = ACT_SCALE },
+    /* On top of Size, only while the screen is not phone-shaped (xinput_ios.c);
+     * the overlay passes 1.0 on an iPhone whatever the file says. */
+    { .kind = IK_SLIDER, .title = "Tablet control size", .key = "NFSU2_TOUCH_TABLET_SCALE",
+      .lo = 0.6f, .hi = 1.2f, .def = 0.80f, .decimals = 2, .act = ACT_TABLET, .pad_only = 1 },
     { .kind = IK_SLIDER, .title = "Opacity", .key = "NFSU2_OVERLAY_ALPHA",
       .lo = 0.2f, .hi = 0.8f, .def = 0.55f, .decimals = 2, .act = ACT_ALPHA },
     /* Function text under the buttons (E-BRAKE, NOS, LOOK ...). */
     { .kind = IK_SWITCH, .title = "Button captions", .key = "NFSU2_TOUCH_CAPTIONS",
       .on = "1", .off = "0", .def_on = 1, .act = ACT_CAPTIONS },
+    /* Controls are mapped into the band between the notch / Dynamic Island insets. */
+    { .kind = IK_SWITCH, .title = "Keep controls in safe area", .key = "NFSU2_TOUCH_SAFE",
+      .on = "1", .off = "0", .def_on = 1, .act = ACT_SAFE },
     /* Closes the panel and moves / resizes the controls of the current layout. */
     { .kind = IK_BUTTON, .title = "Edit layout…", .act = ACT_EDITLAYOUT },
+
     /* Drive layout: pedal value from the finger's height; the steering strip
-     * (a switch back to the dynamic stick) and its gain. */
+     * (a switch back to the dynamic stick) and its gain; tilt as a wheel. */
+    { .kind = IK_SUB, .title = "Driving" },
     { .kind = IK_SWITCH, .title = "Analog pedals", .key = "NFSU2_ANALOG_PEDALS",
       .on = "1", .off = "0", .def_on = 1, .act = ACT_ANALOG },
     { .kind = IK_SWITCH, .title = "Steering strip (Drive layout)", .key = "NFSU2_STEER",
       .on = "1", .off = "0", .def_on = 1, .act = ACT_STEER },
     { .kind = IK_SLIDER, .title = "Steering sensitivity", .key = "NFSU2_STEER_SENS",
       .lo = 0.5f, .hi = 2.0f, .def = 1.0f, .decimals = 2, .act = ACT_STEERSENS },
-    { .kind = IK_SWITCH, .title = "Haptics", .key = "NFSU2_HAPTICS",
-      .on = "1", .off = "0", .def_on = 1, .act = ACT_HAPTICS },
     { .kind = IK_SWITCH, .title = "Tilt steering", .key = "NFSU2_TILT",
       .on = "1", .off = "0", .def_on = 0, .act = ACT_TILT },
     { .kind = IK_SLIDER, .title = "Tilt sensitivity", .key = "NFSU2_TILT_SENS",
@@ -2073,10 +2132,19 @@ static const PanelItem s_items[] = {
     /* Needs Tilt steering on: stores the current angle as straight ahead. */
     { .kind = IK_BUTTON, .title = "Centre tilt now", .key = "NFSU2_TILT_CENTRE",
       .act = ACT_TILTCENTRE },
-    { .kind = IK_SWITCH, .title = "Keyboard", .key = "NFSU2_KEYBOARD",
-      .on = "1", .off = "0", .def_on = 1, .act = ACT_KEYBOARD },
+
+    { .kind = IK_SUB, .title = "Feedback" },
+    { .kind = IK_SWITCH, .title = "Haptics", .key = "NFSU2_HAPTICS",
+      .on = "1", .off = "0", .def_on = 1, .act = ACT_HAPTICS },
+    { .kind = IK_SEG, .title = "Haptics strength", .key = "NFSU2_HAPTICS_STRENGTH",
+      .labels = "Light|Medium|Strong", .values = "light|medium|heavy", .def_val = "light",
+      .act = ACT_HAPSTRENGTH },
     { .kind = IK_SWITCH, .title = "Rumble", .key = "RECOMP_RUMBLE",
       .on = "1", .off = "0", .def_on = 1, .act = ACT_RUMBLE },
+
+    { .kind = IK_SUB, .title = "Other" },
+    { .kind = IK_SWITCH, .title = "Keyboard", .key = "NFSU2_KEYBOARD",
+      .on = "1", .off = "0", .def_on = 1, .act = ACT_KEYBOARD },
     { .kind = IK_SWITCH, .title = "Show FPS", .key = "NFSU2_SHOW_FPS",
       .on = "1", .off = "0", .def_on = 1, .act = ACT_FPS },
 
@@ -2200,6 +2268,21 @@ static void apply_live(int act, int on, float fv, const char *sv)
         xbox_ios_touch_set_scale(fv);
         (void)[s_ov syncControls];
         break;
+    case ACT_TABLET:
+        if (s_is_pad) {                    /* a phone always passes 1.0 */
+            xbox_ios_touch_set_tablet_scale(fv);
+            (void)[s_ov syncControls];
+        }
+        break;
+    case ACT_SAFE:
+        xbox_ios_touch_set_safe_enabled(on);
+        (void)[s_ov syncControls];
+        break;
+    case ACT_HAPSTRENGTH:
+        haptic_set_strength(sv);
+        if (__atomic_load_n(&s_haptics_on, __ATOMIC_RELAXED))
+            haptic_fire_main();            /* feel the new strength */
+        break;
     case ACT_ALPHA:
         s_ov.alpha = fv < 0.2f ? 0.2f : fv > 0.8f ? 0.8f : fv;
         break;
@@ -2280,6 +2363,17 @@ static CGFloat panel_add_item(int idx, CGFloat y, CGFloat w)
     const PanelItem *it = &s_items[idx];
     UIColor *white = UIColor.whiteColor;
 
+    if (it->pad_only && !s_is_pad)
+        return y;                        /* not shown on this device */
+    if (it->kind == IK_SUB) {
+        /* A group inside a section: a hairline and a lighter, smaller title. */
+        UIView *rule = [[UIView alloc] initWithFrame:CGRectMake(12, y + 6, w - 24, 1)];
+        rule.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.14];
+        [s_panel addSubview:rule];
+        [s_panel addSubview:panel_label(ns(it->title), CGRectMake(12, y + 10, w - 24, 18), 12,
+                                        [UIColor colorWithWhite:1.0 alpha:0.72], YES)];
+        return y + 32;
+    }
     if (it->kind == IK_HEAD) {
         y += 8;
         [s_panel addSubview:panel_label(ns(it->title), CGRectMake(12, y, w - 24, 20), 12,
@@ -2417,24 +2511,47 @@ static void panel_rebuild(CGFloat w)
     s_panel.contentOffset = CGPointZero;
 }
 
-/* Size and place the panel inside the safe area, below the gear, then fill it. */
-static void panel_show(void)
-{
-    CGRect wb = s_win.bounds;
-    UIEdgeInsets sa = s_win.safeAreaInsets;
-    CGFloat pw = floor(wb.size.width * 0.7);
-    CGFloat top = sa.top + 52;
-    CGFloat maxh = wb.size.height * 0.85;
-    CGFloat room = wb.size.height - top - sa.bottom - 8;
-    CGFloat ph;
+static CGFloat s_panel_w;                 /* width the rows were laid out for */
 
-    panel_rebuild(pw);                  /* sets contentSize */
+/* Place the panel inside the safe area, below the gear: at most 85 % of the
+ * window height and never past the bottom inset, and no taller than its
+ * content. The content scrolls when it is taller (a 667 x 375 landscape
+ * iPhone SE gets a 315 pt panel). The rows are laid out again when the window
+ * width changed since they were built. */
+static void panel_fit(void)
+{
+    CGRect wb;
+    UIEdgeInsets sa;
+    CGFloat pw, top, maxh, room, ph;
+
+    if (!s_panel || !s_win || s_panel.hidden)
+        return;
+    wb = s_win.bounds;
+    sa = s_win.safeAreaInsets;
+    pw = floor(wb.size.width * 0.7);
+    if (fabs(pw - s_panel_w) > 0.5) {
+        panel_rebuild(pw);              /* sets contentSize */
+        s_panel_w = pw;
+    }
+    top = sa.top + 52;
+    maxh = wb.size.height * 0.85;
+    room = wb.size.height - top - sa.bottom - 8;
     ph = maxh < room ? maxh : room;
+    if (ph < 120.0)
+        ph = 120.0;
     if (s_panel.contentSize.height < ph)
         ph = s_panel.contentSize.height;
     s_panel.frame = CGRectMake(floor((wb.size.width - pw) / 2), top, pw, ph);
+}
+
+/* Fill the panel from the stored values and show it. */
+static void panel_show(void)
+{
+    s_panel.hidden = NO;                /* panel_fit skips a hidden panel */
+    s_panel_w = -1.0;                   /* force a fresh build */
+    panel_fit();
     [s_win bringSubviewToFront:s_panel];
-    s_panel.hidden = NO;
+    [s_panel flashScrollIndicators];
 }
 
 static void panel_hide(void)
@@ -2554,21 +2671,45 @@ static void auto_layout_poll(void);
 
 - (void)fpsTick
 {
-    /* The thermal state is logged even with the FPS label hidden. */
+    /* Thermal state and Low Power Mode are logged (once per change) even with
+     * the FPS label hidden. */
     static NSInteger s_last_thermal = -1;
-    NSInteger ts = (NSInteger)[NSProcessInfo processInfo].thermalState;
+    static NSInteger s_last_lpm = -1;
+    NSProcessInfo *pi = [NSProcessInfo processInfo];
+    NSInteger ts = (NSInteger)pi.thermalState;
+    NSInteger lpm = pi.lowPowerModeEnabled ? 1 : 0;
     if (ts != s_last_thermal) {
         s_last_thermal = ts;
         fprintf(stderr, "nfsu2: thermal state %ld\n", (long)ts);
     }
+    if (lpm != s_last_lpm) {
+        s_last_lpm = lpm;
+        fprintf(stderr, "nfsu2: low power mode %s\n", lpm ? "on" : "off");
+    }
     auto_layout_poll();
     if (!s_fps || s_fps.hidden)
         return;
-    int x10 = nv2a_vk_fps_x10();
-    if (ts >= (NSInteger)NSProcessInfoThermalStateSerious)
-        s_fps.text = [NSString stringWithFormat:@"%d.%d fps · HOT", x10 / 10, x10 % 10];
-    else
-        s_fps.text = [NSString stringWithFormat:@"%d.%d fps", x10 / 10, x10 % 10];
+    {
+        /* "30.0 fps · 33.3 ms", then · WARM (fair) / · HOT (serious) / · CRIT
+         * (critical), then · LPM. The frame time comes from the same guest
+         * flip rate; no flips yet = no time. */
+        int x10 = nv2a_vk_fps_x10();
+        NSMutableString *t = [NSMutableString stringWithCapacity:48];
+        [t appendFormat:@"%d.%d fps", x10 / 10, x10 % 10];
+        if (x10 > 0) {
+            int ms10 = (int)(100000.0 / (double)x10 + 0.5);
+            [t appendFormat:@" · %d.%d ms", ms10 / 10, ms10 % 10];
+        }
+        if (ts >= (NSInteger)NSProcessInfoThermalStateCritical)
+            [t appendString:@" · CRIT"];
+        else if (ts >= (NSInteger)NSProcessInfoThermalStateSerious)
+            [t appendString:@" · HOT"];
+        else if (ts >= (NSInteger)NSProcessInfoThermalStateFair)
+            [t appendString:@" · WARM"];
+        if (lpm)
+            [t appendString:@" · LPM"];
+        s_fps.text = t;
+    }
 }
 @end
 
@@ -2598,12 +2739,80 @@ static void auto_layout_poll(void)
 
 static UIEdgeInsets s_safe;
 
-static CGFloat sa2left(void)  { return s_safe.left; }
 static CGFloat sa2top(void)   { return s_safe.top;  }
+
+/* The FPS label sits right of the centred gear (44 pt wide) in the top band
+ * and stops short of the first control on that side (a shoulder, LOOK / CAM or
+ * START), read from the live zone table, so it does not cover BACK / LB. */
+static CGRect fps_frame(void)
+{
+    CGFloat W = s_win ? s_win.bounds.size.width : 568.0;
+    CGFloat x = W / 2.0 + 22.0 + 6.0;
+    CGFloat limit = W - 10.0, w;
+    int n = 0, i;
+    const XBOX_IOS_TOUCH_ZONE_MIRROR *z =
+        (const XBOX_IOS_TOUCH_ZONE_MIRROR *)xbox_ios_touch_zones(&n);
+
+    for (i = 0; z && i < n; i++) {
+        CGFloat edge = (z[i].cx - z[i].rx) * W;
+        if (z[i].cy < 0.25f && edge > x && edge < limit)
+            limit = edge;
+    }
+    w = limit - 6.0 - x;
+    if (w > 300.0)
+        w = 300.0;
+    if (w < 110.0)
+        w = 110.0;
+    return CGRectMake(x, sa2top() + 8.0, w, 24.0);
+}
+
+static void fps_reposition(void)
+{
+    if (s_fps)
+        s_fps.frame = fps_frame();
+}
+
+/* Main thread, from layoutSubviews / safeAreaInsetsDidChange / install: the
+ * window's left and right safe-area insets and its aspect go to the touch
+ * layer (which ignores a value that has not changed). Top and bottom insets
+ * are not used for the zones. Logs when the values change. */
+static void adapt_feed(void)
+{
+    static CGFloat s_last_l = -1.0, s_last_r = -1.0, s_last_w = -1.0, s_last_h = -1.0;
+    CGRect b;
+    UIEdgeInsets sa;
+
+    if (!s_win)
+        return;
+    b = s_win.bounds;
+    if (b.size.width < 1.0 || b.size.height < 1.0)
+        return;
+    sa = s_win.safeAreaInsets;
+    xbox_ios_touch_set_safe_area((float)(sa.left / b.size.width),
+                                 (float)(sa.right / b.size.width));
+    xbox_ios_touch_set_aspect((float)(b.size.width / b.size.height));
+    if (fabs(sa.left - s_last_l) > 0.01 || fabs(sa.right - s_last_r) > 0.01 ||
+        fabs(b.size.width - s_last_w) > 0.01 || fabs(b.size.height - s_last_h) > 0.01) {
+        s_last_l = sa.left;
+        s_last_r = sa.right;
+        s_last_w = b.size.width;
+        s_last_h = b.size.height;
+        fprintf(stderr, "nfsu2: safe area L %.1f R %.1f pt (top %.1f bottom %.1f), window %g x %g, aspect %.3f\n",
+                (double)sa.left, (double)sa.right, (double)sa.top, (double)sa.bottom,
+                (double)b.size.width, (double)b.size.height,
+                (double)(b.size.width / b.size.height));
+    }
+    if (fabs(sa.top - s_safe.top) > 0.01 || fabs(sa.left - s_safe.left) > 0.01) {
+        s_safe = sa;
+        fps_reposition();
+    }
+}
 
 static void build_fps_and_gear(void)
 {
-    s_fps = [[UILabel alloc] initWithFrame:CGRectMake(sa2left() + 10, sa2top() + 8, 170, 24)];
+    s_fps = [[UILabel alloc] initWithFrame:fps_frame()];
+    s_fps.adjustsFontSizeToFitWidth = YES;       /* "30.0 fps · 33.3 ms · CRIT · LPM" */
+    s_fps.minimumScaleFactor = 0.55;
     s_fps.textColor = [UIColor colorWithWhite:1 alpha:0.9];
     s_fps.font = [UIFont monospacedDigitSystemFontOfSize:14 weight:UIFontWeightMedium];
     s_fps.hidden = nfsu2_cfg_show_fps() ? NO : YES;
@@ -2662,6 +2871,27 @@ void ios_touch_overlay_install(void *uiwindow)
     if (s_panel)
         [s_panel removeFromSuperview];
     s_win = win;
+    s_is_pad = ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad) ? 1 : 0;
+    /* Screen adaptation before the overlay builds its controls (so they are
+     * built once): the stored switches, then the window's insets and aspect. */
+    {
+        const char *rv = nfsu2_cfg_get("NFSU2_TOUCH_ROUND");   /* file key, no panel row */
+        int wi, tab_on = 0;
+        for (wi = 0; wi < ITEM_COUNT; wi++) {
+            if (s_items[wi].act == ACT_SAFE)
+                xbox_ios_touch_set_safe_enabled(item_is_on(&s_items[wi]));
+            if (s_items[wi].act == ACT_TABLET) {
+                /* The stored size on an iPad; 1.0 (no shrink) on a phone. */
+                xbox_ios_touch_set_tablet_scale(s_is_pad ? item_slider_value(&s_items[wi]) : 1.0f);
+                tab_on = 1;
+            }
+        }
+        if (!tab_on)
+            xbox_ios_touch_set_tablet_scale(1.0f);
+        if (rv && *rv && (*rv == '0' || *rv == 'n' || *rv == 'N' || *rv == 'f' || *rv == 'F'))
+            xbox_ios_touch_set_round(0);
+        adapt_feed();
+    }
     s_target = [[Nfsu2GearTarget alloc] init];
     Nfsu2Overlay *ov = [[Nfsu2Overlay alloc] initWithFrame:win.bounds];
     ov.autoresizingMask =
@@ -2698,6 +2928,10 @@ void ios_touch_overlay_install(void *uiwindow)
     s_panel.clipsToBounds = YES;
     s_panel.hidden = YES;
     s_panel.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
+    /* The panel sits inside the safe area already and scrolls on its own: no
+     * automatic inset, a visible indicator for the long list. */
+    s_panel.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
+    s_panel.showsVerticalScrollIndicator = YES;
     [win addSubview:s_panel];
 
     build_fps_and_gear();
@@ -2705,12 +2939,14 @@ void ios_touch_overlay_install(void *uiwindow)
     /* Live settings from their stored values. */
     {
         const char *v;
-        s_user_touch_on = item_is_on(&s_items[1]) ? YES : NO;   /* Touch controls */
         {
             int ci;
-            for (ci = 0; ci < ITEM_COUNT; ci++)
-                if (s_items[ci].key && strcmp(s_items[ci].key, "NFSU2_TOUCH_CAPTIONS") == 0)
+            for (ci = 0; ci < ITEM_COUNT; ci++) {
+                if (s_items[ci].act == ACT_TOUCH)                 /* Touch controls */
+                    s_user_touch_on = item_is_on(&s_items[ci]) ? YES : NO;
+                if (s_items[ci].act == ACT_CAPTIONS)
                     s_captions_on = item_is_on(&s_items[ci]);
+            }
         }
         refresh_shapes();
         {
@@ -2726,9 +2962,7 @@ void ios_touch_overlay_install(void *uiwindow)
         }
         v = nfsu2_cfg_get("NFSU2_HAPTICS");
         __atomic_store_n(&s_haptics_on, !(v && *v == '0'), __ATOMIC_RELAXED);
-        s_haptic_gen = [[UIImpactFeedbackGenerator alloc]
-                           initWithStyle:UIImpactFeedbackStyleLight];
-        [s_haptic_gen prepare];
+        haptic_set_strength(nfsu2_cfg_get("NFSU2_HAPTICS_STRENGTH"));
         xbox_ios_touch_set_activity_hook(touch_activity_hook);
         xbox_ios_touch_set_press_hook(touch_press_hook);
         /* Drive-feel settings: the layer already read its env defaults; a

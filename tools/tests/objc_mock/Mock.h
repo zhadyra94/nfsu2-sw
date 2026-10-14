@@ -68,11 +68,17 @@ typedef int UIControlState;
 #define UIButtonTypeSystem 1
 #define UIFontWeightMedium 0.23
 #define UIImpactFeedbackStyleLight 0
+#define UIImpactFeedbackStyleMedium 1
+#define UIImpactFeedbackStyleHeavy 2
+typedef NSInteger UIImpactFeedbackStyle;
+#define UIScrollViewContentInsetAdjustmentNever 2
 #define UIUserInterfaceStyleDark 2
 #define UIInterfaceOrientationLandscapeLeft 4
 #define UIInterfaceOrientationLandscapeRight 3
 typedef NSInteger UIInterfaceOrientation;
+#define NSProcessInfoThermalStateFair 1
 #define NSProcessInfoThermalStateSerious 2
+#define NSProcessInfoThermalStateCritical 3
 #define NSThread_dummy
 #define UIImageSymbolWeightMedium 5
 #define UIImageSymbolWeightSemibold 6
@@ -140,6 +146,7 @@ NSArray *NSSearchPathForDirectoriesInDomains(NSUInteger dir, NSUInteger domain, 
 @interface NSError : NSObject @end
 @interface NSProcessInfo : NSObject
 + (NSProcessInfo*)processInfo; @property (readonly) NSInteger thermalState;
+@property (readonly, getter=isLowPowerModeEnabled) BOOL lowPowerModeEnabled;
 @end
 @interface NSShadow : NSObject @end
 extern NSString *const NSFontAttributeName;
@@ -182,6 +189,11 @@ extern NSString *const NSKernAttributeName;
 - (instancetype)initWithSize:(CGSize)s format:(UIGraphicsImageRendererFormat*)f;
 - (UIImage*)imageWithActions:(void (^)(UIGraphicsImageRendererContext*))a;
 @end
+@interface NSMutableString : NSString
++ (instancetype)stringWithCapacity:(NSUInteger)n;
+- (void)appendString:(NSString *)s; - (void)appendFormat:(NSString *)f, ...;
+@end
+
 @interface NSString (UIKitAdditions)
 - (CGSize)sizeWithAttributes:(NSDictionary*)a;
 - (void)drawAtPoint:(CGPoint)p withAttributes:(NSDictionary*)a;
@@ -240,7 +252,7 @@ extern NSString *const NSKernAttributeName;
 @property (readonly) UIEdgeInsets safeAreaInsets; @property CGFloat cornerRadius_unused;
 @property (nonatomic, copy) NSString *accessibilityLabel;
 - (UIView*)hitTest:(CGPoint)p withEvent:(UIEvent*)e; - (CGPoint)convertPoint:(CGPoint)p toView:(UIView*)v;
-- (void)layoutSubviews; - (void)addSubview:(UIView*)v; - (void)removeFromSuperview;
+- (void)layoutSubviews; - (void)safeAreaInsetsDidChange; - (void)addSubview:(UIView*)v; - (void)removeFromSuperview;
 - (void)bringSubviewToFront:(UIView*)v; - (UIView*)viewWithTag:(NSInteger)t;
 - (CGSize)sizeThatFits:(CGSize)s;
 - (void)addGestureRecognizer:(UIGestureRecognizer*)g;
@@ -267,6 +279,8 @@ extern NSString *const NSKernAttributeName;
 @end
 @interface UIScrollView : UIView
 @property CGSize contentSize; @property CGPoint contentOffset;
+@property NSInteger contentInsetAdjustmentBehavior; @property BOOL showsVerticalScrollIndicator;
+- (void)flashScrollIndicators;
 @end
 @interface UIScene : NSObject @property (readonly) UIInterfaceOrientation interfaceOrientation; @property (readonly) NSInteger activationState; @end
 @interface UIWindowScene : UIScene @property (readonly) UIInterfaceOrientation interfaceOrientation; @end
@@ -285,7 +299,7 @@ extern NSString *const NSKernAttributeName;
 @end
 @interface UIScreen : NSObject + (UIScreen*)mainScreen; @property (readonly) CGFloat scale; @property (readonly) CGRect bounds; @end
 @interface UIImpactFeedbackGenerator : NSObject
-- (instancetype)initWithStyle:(NSInteger)s; - (void)impactOccurred; - (void)prepare;
+- (instancetype)initWithStyle:(UIImpactFeedbackStyle)s; - (void)impactOccurred; - (void)prepare;
 @end
 @interface CMDeviceMotion : NSObject @property (readonly) struct { double x,y,z; } gravity; @end
 @interface CMMotionManager : NSObject

@@ -529,7 +529,7 @@ static const char *const nfsu2_ios_alts[] = { "NFSU2-data", "game", "nfsu2", "NF
 /* Build label for the launch screen. */
 const char *nfsu2_build_label(void)
 {
-    return "v23 " __DATE__;
+    return "v24 " __DATE__;
 }
 
 /* Is the launch screen on? NFSU2_LAUNCHER, default on; an odd value follows
@@ -891,7 +891,7 @@ int main(int argc, char **argv)
     /* Redirect the log FIRST so main-thread init output is captured. */
     ios_log_to_documents();
     setvbuf(stderr, NULL, _IONBF, 0);
-    fprintf(stderr, "nfsu2: build v23 (v22 async submits/drain handshake/swapchain limiter + frame lag and quiet log by default, settings menu, touch v2 Drive layout/haptics/tilt, keyboard)\n");
+    fprintf(stderr, "nfsu2: build v24 (v23 + touch UI: new control look, analog pedals, steering strip, Drive layout by function, layout editor, captions/icons, launch screen, auto Pad/Drive, safe area, iPad sizing)\n");
     fprintf(stderr, "nfsu2: HOME=%s TMPDIR=%s\n",
             getenv("CFFIXED_USER_HOME") ? getenv("CFFIXED_USER_HOME") : "(unset)",
             getenv("TMPDIR") ? getenv("TMPDIR") : "(unset)");
@@ -1117,7 +1117,7 @@ static int game_main(void)
 #ifdef NFSU2_IOS
     ios_log_to_documents();
     setvbuf(stderr, NULL, _IONBF, 0);
-    fprintf(stderr, "nfsu2: build v23 (v22 async submits/drain handshake/swapchain limiter + frame lag and quiet log by default, settings menu, touch v2 Drive layout/haptics/tilt, keyboard)\n");
+    fprintf(stderr, "nfsu2: build v24 (v23 + touch UI: new control look, analog pedals, steering strip, Drive layout by function, layout editor, captions/icons, launch screen, auto Pad/Drive, safe area, iPad sizing)\n");
     fprintf(stderr, "nfsu2: HOME=%s CFFIXED_USER_HOME=%s TMPDIR=%s\n",
             getenv("HOME") ? getenv("HOME") : "(unset)",
             getenv("CFFIXED_USER_HOME") ? getenv("CFFIXED_USER_HOME") : "(unset)",

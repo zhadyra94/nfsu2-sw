@@ -33,6 +33,10 @@
  * (NFSU2_DRIVE_CLASSIC) and the activity hook for the overlay are described in
  * xinput_ios.h.
  *
+ * Screen adaptation (overlay-fed): a safe-area band the zones are mapped into
+ * (Dynamic Island / notch), and, on a window whose aspect is not the phone's,
+ * round controls kept round plus a tablet size factor. See xinput_ios.h.
+ *
  * RECOMP_TOUCH=0 turns the layer off, e.g. to prove a Bluetooth pad works
  * with the touch code out of the way. The settings panel flips it live
  * (xbox_ios_touch_set_enabled), and also picks the zone layout (PAD, or
@@ -171,6 +175,28 @@ static int   s_drive;                 /* 0 PAD, 1 DRIVE */
 static float s_scale = 1.0f;          /* NFSU2_TOUCH_SCALE, 0.7..1.5 */
 static unsigned s_layout_gen;         /* bumped by every rebuild (__atomic) */
 
+/* Screen adaptation (all under s_lock; every default is the identity, so a
+ * layer that is never told anything builds today's table). Fed by the overlay,
+ * never by SDL window events.
+ *   safe area   xbox_ios_touch_set_safe_area: the Dynamic Island / notch bands
+ *               as fractions of the window width; every zone's x is mapped into
+ *               the band between them (zones_rebuild_locked).
+ *   aspect      xbox_ios_touch_set_aspect: window width / height. The tables
+ *               are laid out for PHONE_ASPECT; when the window differs by more
+ *               than ASPECT_TOL, round controls are re-shaped and the tablet
+ *               size factor applies. */
+#define PHONE_ASPECT (852.0f / 393.0f)
+#define ASPECT_TOL   0.10f
+#define SAFE_MAX     0.25f            /* per side; keeps the band >= half the screen */
+#define TABLET_MIN   0.6f
+#define TABLET_MAX   1.2f
+static float s_safe_l, s_safe_r;      /* requested insets, 0..SAFE_MAX */
+static int   s_safe_on = 1;           /* NFSU2_TOUCH_SAFE (the overlay applies it) */
+static float s_zone_aspect;           /* window w / h; 0 = not known */
+static int   s_round_on = 1;          /* NFSU2_TOUCH_ROUND: re-shape round controls */
+static float s_tablet = 1.0f;         /* NFSU2_TOUCH_TABLET_SCALE (overlay: 1.0 on phones) */
+static float s_zone_shift[ZONE_MAX];  /* safe-area x shift per active zone */
+
 /* Panel / env switches of the drive feel. s_steer_on / s_steer_sens /
  * s_analog_pedals are read by the poll under s_lock and written under it. */
 static int   s_drive_classic;         /* NFSU2_DRIVE_CLASSIC (0 default) */
@@ -246,6 +272,84 @@ static void zone_keep_on_screen(XBOX_IOS_TOUCH_ZONE *z)
     else if (z->cy > 1.0f - z->ry) z->cy = 1.0f - z->ry;
 }
 
+/* The aspect the window is treated as: its w / h when that is a landscape
+ * window more than ASPECT_TOL away from the phone tables' aspect, else 0. */
+static float aspect_effective_locked(void)
+{
+    float a = s_zone_aspect;
+    if (!(a >= 1.0f && a <= 3.0f))
+        return 0.0f;                  /* unknown, NaN or portrait */
+    if (fabsf(a / PHONE_ASPECT - 1.0f) <= ASPECT_TOL)
+        return 0.0f;
+    return a;
+}
+
+/* Insets in force: the requested ones while the setting is on. */
+static void safe_effective_locked(float *l, float *r)
+{
+    *l = s_safe_on ? s_safe_l : 0.0f;
+    *r = s_safe_on ? s_safe_r : 0.0f;
+}
+
+/* Controls that are round (or round-ish pills) on the phone: they keep their
+ * shape in points on any aspect. Pedals, triggers and the strip do not. */
+static int zone_is_round_style(const XBOX_IOS_TOUCH_ZONE *z)
+{
+    switch (z->kind) {
+    case XBOX_IOS_ZONE_FLAG:
+    case XBOX_IOS_ZONE_DPAD:
+        return 1;
+    case XBOX_IOS_ZONE_ANALOG:
+        return z->value != XBOX_BUTTON_LTRIGGER && z->value != XBOX_BUTTON_RTRIGGER;
+    default:
+        return 0;
+    }
+}
+
+/* Safe-area shift, a rigid move per half of the screen (spacing and sizes are
+ * kept): zones with cx < 0.5 form the left group, the rest the right group (the
+ * strip goes with its centre). The left group moves right by the amount its
+ * outermost left edge sits inside the left inset; the right group moves left by
+ * the amount its outermost right edge sits inside the right inset. A zone
+ * wider than the band (a strip: its half-width is cut to the band first) is
+ * centred in the band instead. s_zone_shift[i] is the x shift of zone i. */
+static void zones_safe_shift_locked(float sl, float sr)
+{
+    float sk = 1.0f - sl - sr, minl = 2.0f, maxr = -1.0f, shl, shr;
+    int wide[ZONE_MAX];
+    int i;
+
+    for (i = 0; i < ZONE_MAX; i++)
+        s_zone_shift[i] = 0.0f;
+    if (!(sl > 0.0f || sr > 0.0f))
+        return;
+    for (i = 0; i < s_zone_n; i++) {
+        XBOX_IOS_TOUCH_ZONE *z = &s_zones[i];
+        wide[i] = (2.0f * z->rx > sk + 1e-6f);
+        if (z->kind == XBOX_IOS_ZONE_STEER && z->rx > sk * 0.5f)
+            z->rx = sk * 0.5f;              /* cut to the band, centred below */
+        if (wide[i])
+            continue;
+        if (z->cx < 0.5f) {
+            if (z->cx - z->rx < minl)
+                minl = z->cx - z->rx;
+        } else if (z->cx + z->rx > maxr) {
+            maxr = z->cx + z->rx;
+        }
+    }
+    shl = (minl < 2.0f && minl < sl) ? sl - minl : 0.0f;
+    shr = (maxr > -1.0f && maxr > 1.0f - sr) ? maxr - (1.0f - sr) : 0.0f;
+    for (i = 0; i < s_zone_n; i++) {
+        XBOX_IOS_TOUCH_ZONE *z = &s_zones[i];
+        float sh = wide[i] ? sl + sk * 0.5f - z->cx : z->cx < 0.5f ? shl : -shr;
+        z->cx += sh;
+        s_zone_shift[i] = sh;
+    }
+}
+
+/* Active table = preset -> override -> size -> aspect shape -> tablet factor
+ * -> keep on screen (overrides) -> safe-area shift (rigid per half). The result is the one table
+ * hit-testing and the overlay both use. */
 static void zones_rebuild_locked(void)
 {
     const XBOX_IOS_TOUCH_ZONE *src = !s_drive ? s_zones_pad
@@ -253,7 +357,13 @@ static void zones_rebuild_locked(void)
                                                      : s_zones_drive;
     int n = !s_drive ? PAD_COUNT
                      : s_drive_classic ? DRIVE_CLASSIC_COUNT : DRIVE_NEW_COUNT;
+    float ea = aspect_effective_locked();
+    float tab = ea > 0.0f ? s_tablet : 1.0f;
+    float shape = (ea > 0.0f && s_round_on) ? ea / PHONE_ASPECT : 1.0f;
+    float sl, sr;
     int i, m = 0;
+
+    safe_effective_locked(&sl, &sr);
     for (i = 0; i < n; i++) {
         XBOX_IOS_TOUCH_ZONE z = src[i];
         const GeomOv *o = geom_ov_get(s_drive, z.id);
@@ -267,17 +377,23 @@ static void zones_rebuild_locked(void)
             if (!s_steer_on)
                 continue;
             z.ry *= s_scale;
+            z.ry *= tab;              /* the width keeps the steering feel */
             if (z.ry > STEER_RY_MAX)
                 z.ry = STEER_RY_MAX;
         } else {
             z.rx *= s_scale;
             z.ry *= s_scale;
+            if (zone_is_round_style(&z))
+                z.ry *= shape;        /* same shape in points as on the phone */
+            z.rx *= tab;
+            z.ry *= tab;
         }
         if (o)
             zone_keep_on_screen(&z);
         s_zones[m++] = z;
     }
     s_zone_n = m;
+    zones_safe_shift_locked(sl, sr);
     __atomic_add_fetch(&s_layout_gen, 1u, __ATOMIC_RELEASE);
 }
 
@@ -476,6 +592,138 @@ void xbox_ios_touch_set_drive_classic(int on)
     touch_clear_locked();
     s_drive_classic = on ? 1 : 0;
     zones_rebuild_locked();
+    SDL_UnlockMutex(s_lock);
+}
+
+/* ---- Screen adaptation (safe area, aspect, tablet size) ----
+ * Each setter does nothing when the value in force would not change: the
+ * overlay calls them from layoutSubviews, and a rebuild bumps the generation
+ * (a full relay of the layers). None clears fingers: the table keeps its
+ * order, so a held zone stays the same zone. */
+static float safe_clamp(float v)
+{
+    return !(v >= 0.0f) ? 0.0f : v > SAFE_MAX ? SAFE_MAX : v;   /* NaN gives 0 */
+}
+
+/* Fractions of the window width taken by the unsafe bands on the left and on
+ * the right. Zones are mapped into the band between them. */
+void xbox_ios_touch_set_safe_area(float left, float right)
+{
+    touch_prefs_once();
+    left = safe_clamp(left);
+    right = safe_clamp(right);
+    SDL_LockMutex(s_lock);
+    if (fabsf(left - s_safe_l) > 1e-5f || fabsf(right - s_safe_r) > 1e-5f) {
+        float l0, r0, l1, r1;
+        safe_effective_locked(&l0, &r0);
+        s_safe_l = left;
+        s_safe_r = right;
+        safe_effective_locked(&l1, &r1);
+        if (fabsf(l0 - l1) > 1e-5f || fabsf(r0 - r1) > 1e-5f)
+            zones_rebuild_locked();
+    }
+    SDL_UnlockMutex(s_lock);
+}
+
+/* NFSU2_TOUCH_SAFE: 0 = map nothing (full width, as before the safe area). */
+void xbox_ios_touch_set_safe_enabled(int on)
+{
+    touch_prefs_once();
+    on = on ? 1 : 0;
+    SDL_LockMutex(s_lock);
+    if (on != s_safe_on) {
+        s_safe_on = on;
+        if (s_safe_l > 0.0f || s_safe_r > 0.0f)
+            zones_rebuild_locked();
+    }
+    SDL_UnlockMutex(s_lock);
+}
+
+/* The insets in force (zero while the setting is off). */
+void xbox_ios_touch_get_safe_area(float *left, float *right)
+{
+    float l, r;
+    touch_prefs_once();
+    SDL_LockMutex(s_lock);
+    safe_effective_locked(&l, &r);
+    SDL_UnlockMutex(s_lock);
+    if (left)  *left = l;
+    if (right) *right = r;
+}
+
+/* Base x (what zone_geom / set_geom use) <-> screen x for zone idx of the
+ * active table: the zone's group shift is added / removed (see
+ * zones_safe_shift_locked). The shift is the one in force now; an index out of
+ * range gives the value back unchanged. */
+float xbox_ios_touch_base_to_screen_x(int idx, float bx)
+{
+    float sh = 0.0f;
+    touch_prefs_once();
+    SDL_LockMutex(s_lock);
+    if (idx >= 0 && idx < s_zone_n)
+        sh = s_zone_shift[idx];
+    SDL_UnlockMutex(s_lock);
+    return bx + sh;
+}
+
+float xbox_ios_touch_screen_to_base_x(int idx, float sx)
+{
+    float sh = 0.0f;
+    touch_prefs_once();
+    SDL_LockMutex(s_lock);
+    if (idx >= 0 && idx < s_zone_n)
+        sh = s_zone_shift[idx];
+    SDL_UnlockMutex(s_lock);
+    return sx - sh;
+}
+
+/* Window width / height, for the round controls and the tablet size factor.
+ * <= 0 or NaN = unknown (tables as laid out for the phone). Only an aspect
+ * more than 10 % from 852/393 changes the table. */
+void xbox_ios_touch_set_aspect(float w_over_h)
+{
+    float e0, e1;
+
+    touch_prefs_once();
+    if (!(w_over_h > 0.0f))
+        w_over_h = 0.0f;
+    SDL_LockMutex(s_lock);
+    e0 = aspect_effective_locked();
+    s_zone_aspect = w_over_h;
+    e1 = aspect_effective_locked();
+    if (fabsf(e0 - e1) > 1e-4f)
+        zones_rebuild_locked();
+    SDL_UnlockMutex(s_lock);
+}
+
+/* NFSU2_TOUCH_ROUND: 0 = keep the normalized radii of the tables on any aspect
+ * (the tablet size factor still applies). */
+void xbox_ios_touch_set_round(int on)
+{
+    touch_prefs_once();
+    on = on ? 1 : 0;
+    SDL_LockMutex(s_lock);
+    if (on != s_round_on) {
+        s_round_on = on;
+        if (aspect_effective_locked() > 0.0f)
+            zones_rebuild_locked();
+    }
+    SDL_UnlockMutex(s_lock);
+}
+
+/* Size factor on top of the Size setting, applied only while the aspect
+ * differs from the phone's. Clamped 0.6..1.2; NaN gives 1.0. The strip takes
+ * it in height only. */
+void xbox_ios_touch_set_tablet_scale(float k)
+{
+    touch_prefs_once();
+    k = (k != k) ? 1.0f : k < TABLET_MIN ? TABLET_MIN : k > TABLET_MAX ? TABLET_MAX : k;
+    SDL_LockMutex(s_lock);
+    if (fabsf(k - s_tablet) > 1e-5f) {
+        s_tablet = k;
+        if (aspect_effective_locked() > 0.0f)
+            zones_rebuild_locked();
+    }
     SDL_UnlockMutex(s_lock);
 }
 
