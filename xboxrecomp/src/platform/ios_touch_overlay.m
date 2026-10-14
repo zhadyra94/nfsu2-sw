@@ -10,7 +10,13 @@
  * everything else, SDL keeps them). The settings panel is a
  * separate scroll view on the window, so the opacity setting does not fade
  * the menu itself. Every change goes through nfsu2_cfg_set (main.c), which
- * saves nfsu2_env.txt. */
+ * saves nfsu2_env.txt.
+ *
+ * Layout editor ("Edit layout..." in the panel): the overlay takes every touch,
+ * game touch input is suspended, and a tap selects a control, a pan moves it,
+ * a pinch or the -/+ buttons resize it (xinput_ios.c keeps the per-zone
+ * geometry overrides). Done saves them to Documents/nfsu2_touch_layout_<phone|pad>.txt
+ * (loaded again at install); Cancel restores the text taken at entry. */
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <CoreGraphics/CoreGraphics.h>
@@ -49,6 +55,16 @@ extern void xbox_ios_touch_set_steer_sens(float k);
 extern void xbox_ios_touch_set_tilt(float x, int active);
 extern int nv2a_vk_fps_x10(void);
 
+/* Layout editor (xinput_ios.c). Geometry is normalized, base = before the size
+ * setting; text format in xinput_ios.h. */
+extern int  xbox_ios_touch_enabled(void);
+extern int  xbox_ios_touch_get_layout(void);          /* 0 PAD, 1 DRIVE */
+extern int  xbox_ios_touch_zone_geom(int idx, float *cx, float *cy, float *rx, float *ry);
+extern int  xbox_ios_touch_zone_set_geom(int idx, float cx, float cy, float rx, float ry);
+extern void xbox_ios_touch_layout_reset(int drive);
+extern int  xbox_ios_touch_layout_format(char *buf, size_t n);
+extern int  xbox_ios_touch_layout_parse(const char *text);
+
 /* xinput_device.c: live switches (read there from cached atomics). */
 extern void xbox_input_set_rumble(int on);
 extern void xbox_input_set_keyboard(int on);
@@ -60,6 +76,7 @@ extern void ios_keyboard_install(void);
 extern float nfsu2_cfg_overlay_alpha(void);
 extern int   nfsu2_cfg_show_fps(void);
 extern const char *nfsu2_cfg_get(const char *key);
+extern const char *nfsu2_cfg_path(void);          /* the settings file, NULL before cfg_load */
 extern int   nfsu2_cfg_set(const char *key, const char *val);
 
 @class Nfsu2GearTarget;
@@ -68,6 +85,11 @@ static BOOL s_user_touch_on = YES;   /* the panel's Touch controls switch */
 static BOOL s_dev_hidden = NO;       /* a pad or keyboard is attached */
 static void refresh_shapes(void);
 static void overlay_wake(void);
+static UIWindow *s_win;              /* the SDL window the overlay lives on */
+static UIButton *s_gear;             /* hidden while the layout editor runs */
+static void panel_hide(void);
+static void touch_hook_main(void);   /* haptic tick if the Haptics switch is on */
+static NSString *ns(const char *c);
 
 /* ── Look: colours, text and icon images, path helpers ─────────── */
 
@@ -672,6 +694,164 @@ static Nfsu2Ctl *build_ctl(int idx, const XBOX_IOS_TOUCH_ZONE_MIRROR *z, CGFloat
     return c;
 }
 
+/* ── Layout editor: file and geometry helpers ─────────────────── */
+
+#define LAYOUT_TEXT_MAX 8192     /* 2 layouts x 32 ids x ~50 bytes is 3.2 KB at most */
+
+/* Documents/nfsu2_touch_layout_<phone|pad>.txt, in the folder of nfsu2_env.txt
+ * (the Documents folder when that path is unknown). One folder serves an
+ * iPhone and an iPad, so the file name carries the device class. */
+static BOOL layout_file_path(char *out, size_t n)
+{
+    char dir[1100];
+    const char *cfg = nfsu2_cfg_path();
+    const char *slash = cfg ? strrchr(cfg, '/') : NULL;
+    const char *suffix =
+        ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad) ? "_pad" : "_phone";
+
+    dir[0] = 0;
+    if (slash && slash > cfg && (size_t)(slash - cfg) < sizeof dir) {
+        memcpy(dir, cfg, (size_t)(slash - cfg));
+        dir[slash - cfg] = 0;
+    } else {
+        NSArray *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
+                                                            NSUserDomainMask, YES);
+        if (docs.count > 0) {
+            const char *d = [[docs objectAtIndex:0] UTF8String];
+            if (d && strlen(d) < sizeof dir)
+                snprintf(dir, sizeof dir, "%s", d);
+        }
+    }
+    if (!dir[0])
+        return NO;
+    snprintf(out, n, "%s/nfsu2_touch_layout%s.txt", dir, suffix);
+    return YES;
+}
+
+/* Read the saved overrides into the touch layer. A missing file is normal. */
+static void layout_file_load(void)
+{
+    char path[1200];
+    char *buf;
+    FILE *f;
+    size_t got;
+    int n;
+
+    if (!layout_file_path(path, sizeof path))
+        return;
+    f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "nfsu2: no touch layout file at %s\n", path);
+        return;
+    }
+    buf = (char *)malloc(LAYOUT_TEXT_MAX + 1);
+    if (!buf) {
+        fclose(f);
+        return;
+    }
+    got = fread(buf, 1, LAYOUT_TEXT_MAX, f);
+    fclose(f);
+    buf[got] = 0;
+    n = xbox_ios_touch_layout_parse(buf);
+    fprintf(stderr, "nfsu2: touch layout %s: %d zone overrides\n", path, n);
+    free(buf);
+}
+
+/* Write <path>.tmp, then rename() it over the real file: a kill in between
+ * leaves the old file whole. */
+static BOOL layout_file_save(const char *text)
+{
+    char path[1200], tmp[1210];
+    FILE *f;
+    size_t len = strlen(text);
+    BOOL ok;
+
+    if (!layout_file_path(path, sizeof path))
+        return NO;
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    f = fopen(tmp, "wb");
+    if (!f) {
+        fprintf(stderr, "nfsu2: touch layout not saved (cannot write %s)\n", tmp);
+        return NO;
+    }
+    ok = (fwrite(text, 1, len, f) == len) ? YES : NO;
+    if (fflush(f) != 0)
+        ok = NO;
+    if (fclose(f) != 0)
+        ok = NO;
+    if (ok && rename(tmp, path) != 0)
+        ok = NO;
+    if (!ok)
+        remove(tmp);
+    fprintf(stderr, "nfsu2: touch layout %s %s\n", ok ? "saved to" : "NOT saved to", path);
+    return ok;
+}
+
+/* Does the zone (normalized centre and radii; a rectangle for the steering
+ * strip, an ellipse otherwise, like the touch layer's hit test) contain
+ * (x, y)? grow > 1 widens it, for finger slop. */
+static BOOL edit_zone_contains(const XBOX_IOS_TOUCH_ZONE_MIRROR *z, BOOL rect,
+                               float x, float y, float grow)
+{
+    float dx = (x - z->cx) / (z->rx * grow);
+    float dy = (y - z->cy) / (z->ry * grow);
+    if (rect)
+        return (fabsf(dx) <= 1.0f && fabsf(dy) <= 1.0f) ? YES : NO;
+    return (dx * dx + dy * dy <= 1.0f) ? YES : NO;
+}
+
+/* Limits of xbox_ios_touch_zone_set_geom (xinput_ios.c), mirrored so a resize
+ * by the factor f keeps the control's shape: f is cut back until neither radius
+ * would be clamped on its own. A step that grows (f > 1) never shrinks and a
+ * step that shrinks never grows. */
+static float edit_clamp_factor(float rx, float ry, BOOL steer, float f)
+{
+    float rxmax = steer ? 0.45f : 0.30f, rymax = steer ? 0.19f : 0.45f;
+    float lo = fmaxf(0.02f / rx, 0.04f / ry);
+    float hi = fminf(rxmax / rx, rymax / ry);
+    if (!(rx > 0.0f) || !(ry > 0.0f) || !(f > 0.0f))
+        return 1.0f;
+    if (f > 1.0f) {
+        if (f > hi)
+            f = hi;
+        if (f < 1.0f)
+            f = 1.0f;
+    } else {
+        if (f < lo)
+            f = lo;
+        if (f > 1.0f)
+            f = 1.0f;
+    }
+    return f;
+}
+
+/* Name of zone idx for the editor's caption. */
+static NSString *edit_zone_name(int idx)
+{
+    const char *l;
+    switch (xbox_ios_touch_zone_style(idx)) {
+    case ZS_MENU_BACK:  return @"Back";
+    case ZS_MENU_START: return @"Start";
+    case ZS_DPAD:       return @"D-pad";
+    case ZS_STEER:      return @"Steering strip";
+    default:            break;
+    }
+    l = xbox_ios_touch_zone_label(idx);
+    return l ? ns(l) : @"Control";
+}
+
+/* A rectangle as a closed sub-path (empty ones are skipped). */
+static void path_add_rect(UIBezierPath *p, CGRect r)
+{
+    if (r.size.width < 0.5 || r.size.height < 0.5)
+        return;
+    [p moveToPoint:CGPointMake(r.origin.x, r.origin.y)];
+    [p addLineToPoint:CGPointMake(r.origin.x + r.size.width, r.origin.y)];
+    [p addLineToPoint:CGPointMake(r.origin.x + r.size.width, r.origin.y + r.size.height)];
+    [p addLineToPoint:CGPointMake(r.origin.x, r.origin.y + r.size.height)];
+    [p closePath];
+}
+
 /* ── The overlay: layer host, rebuild, per-tick update ─────────── */
 
 @interface Nfsu2Overlay : UIView {
@@ -683,9 +863,27 @@ static Nfsu2Ctl *build_ctl(int idx, const XBOX_IOS_TOUCH_ZONE_MIRROR *z, CGFloat
     BOOL _built;
     unsigned _gen;                /* xbox_ios_touch_layout_gen() at the build */
     CGSize _builtSize;
+    /* Layout editor. */
+    BOOL _editing;
+    BOOL _prevTouch;              /* touch-enabled state at entry, restored at exit */
+    CGFloat _savedAlpha;          /* the Opacity setting, back at exit */
+    int _editDrive;               /* layout being edited: 0 PAD, 1 DRIVE */
+    int _selId;                   /* selected zone id, -1 none */
+    int _dragId;                  /* zone id being panned, -1 none */
+    int _pinchId;                 /* zone id being pinched, -1 none */
+    float _g0[4];                 /* base geometry at the start of a gesture: cx cy rx ry */
+    NSString *_entryText;         /* formatted overrides at entry: what Cancel restores */
+    CALayer *_scrim;              /* dark layer behind the controls */
+    CAShapeLayer *_guide;         /* safe-area / Dynamic Island band, faint red */
+    CAShapeLayer *_outline;       /* dashed outline of the selected zone */
+    UIView *_surface;             /* full-screen sibling that owns the gesture recognizers */
+    UIView *_bar;                 /* the toolbar */
+    UILabel *_barLabel;
+    NSMutableArray *_barButtons;  /* Cancel, Reset, -, +, Done */
 }
 - (void)applyVisibility:(BOOL)vis;
 - (BOOL)syncControls;
+- (void)beginEdit;
 @property (nonatomic, assign) BOOL shapesHidden;   /* touch off, or pad/keyboard on */
 @end
 
@@ -702,9 +900,32 @@ static Nfsu2Ctl *build_ctl(int idx, const XBOX_IOS_TOUCH_ZONE_MIRROR *z, CGFloat
         _ctls = [[NSMutableArray alloc] init];
         _sBase = [[NSMutableArray alloc] init];
         _sKnob = [[NSMutableArray alloc] init];
+        _selId = -1;
+        _dragId = -1;
+        _pinchId = -1;
+        /* Editor layers are created here, before any view is added, so the
+         * toolbar (added at entry) is always above them; hidden until then.
+         * Order bottom to top: scrim, safe-area guide, controls, outline. */
+        _scrim = [CALayer layer];
+        set_bg(_scrim, [UIColor colorWithWhite:0.0 alpha:0.5]);
+        _scrim.hidden = YES;
+        [self.layer addSublayer:_scrim];
+        _guide = [CAShapeLayer layer];
+        set_fill(_guide, rgba(0xFF3B30, 0.22));
+        _guide.strokeColor = NULL;
+        _guide.hidden = YES;
+        [self.layer addSublayer:_guide];
         _host = [CALayer layer];
         _host.frame = self.bounds;
         [self.layer addSublayer:_host];
+        _outline = [CAShapeLayer layer];
+        _outline.fillColor = NULL;
+        set_stroke(_outline, rgba(0xFFD60A, 1.0));
+        _outline.lineWidth = 2.0;
+        _outline.lineDashPattern = [NSArray arrayWithObjects:[NSNumber numberWithInt:7],
+                                                             [NSNumber numberWithInt:4], nil];
+        _outline.hidden = YES;
+        [self.layer addSublayer:_outline];
         self.shapesHidden = NO;
     }
     return self;
@@ -713,6 +934,16 @@ static Nfsu2Ctl *build_ctl(int idx, const XBOX_IOS_TOUCH_ZONE_MIRROR *z, CGFloat
 /* Everything passes through to SDL except the gear and the settings panel. */
 - (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e
 {
+    if (_editing) {
+        /* The editor takes every touch: the toolbar first, then the
+         * full-screen surface that holds the gesture recognizers. */
+        if (_bar && CGRectContainsPoint(_bar.frame, p)) {
+            CGPoint local = [self convertPoint:p toView:_bar];
+            UIView *h = [_bar hitTest:local withEvent:e];
+            return h ? h : _bar;
+        }
+        return _surface ? _surface : self;
+    }
     for (UIView *sub in self.subviews) {
         if (sub.userInteractionEnabled && sub.hidden == NO &&
             CGRectContainsPoint(sub.frame, p)) {
@@ -728,7 +959,7 @@ static Nfsu2Ctl *build_ctl(int idx, const XBOX_IOS_TOUCH_ZONE_MIRROR *z, CGFloat
     _shapesHidden = h;
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
-    _host.hidden = h;
+    _host.hidden = (h && !_editing) ? YES : NO;    /* the editor always shows them */
     [CATransaction commit];
     if (!h) {
         (void)[self syncControls];
@@ -740,6 +971,8 @@ static Nfsu2Ctl *build_ctl(int idx, const XBOX_IOS_TOUCH_ZONE_MIRROR *z, CGFloat
 {
     [super layoutSubviews];
     (void)[self syncControls];          /* rebuilds when the bounds changed */
+    if (_editing)
+        [self updateEditUI];
 }
 
 /* Rebuild every control and stick layer from the zone table. Main thread. */
@@ -821,6 +1054,8 @@ static Nfsu2Ctl *build_ctl(int idx, const XBOX_IOS_TOUCH_ZONE_MIRROR *z, CGFloat
     _built = YES;
     _builtSize = self.bounds.size;
     [CATransaction commit];
+    if (_editing)
+        [self updateEditUI];             /* the outline follows the new table */
 }
 
 /* The two sticks: shown while a finger drives them, base ring at the
@@ -885,7 +1120,7 @@ static Nfsu2Ctl *build_ctl(int idx, const XBOX_IOS_TOUCH_ZONE_MIRROR *z, CGFloat
     unsigned dbits;
     NSUInteger i, n;
 
-    if (_shapesHidden || sz.width < 1.0 || sz.height < 1.0)
+    if ((_shapesHidden && !_editing) || sz.width < 1.0 || sz.height < 1.0)
         return NO;
     if (!_built || xbox_ios_touch_layout_gen() != _gen ||
         sz.width != _builtSize.width || sz.height != _builtSize.height)
@@ -938,6 +1173,421 @@ static Nfsu2Ctl *build_ctl(int idx, const XBOX_IOS_TOUCH_ZONE_MIRROR *z, CGFloat
     s_dev_hidden = vis ? NO : YES;
     refresh_shapes();
 }
+
+/* ── Layout editor ─────────────────────────────────────────────── */
+
+/* Table index of the zone with this id in the active table, -1 if none. */
+- (int)idxOfZoneId:(int)zid
+{
+    int n = 0, i;
+    const XBOX_IOS_TOUCH_ZONE_MIRROR *z;
+
+    if (zid < 0)
+        return -1;
+    z = (const XBOX_IOS_TOUCH_ZONE_MIRROR *)xbox_ios_touch_zones(&n);
+    for (i = 0; z && i < n; i++)
+        if (z[i].id == zid)
+            return i;
+    return -1;
+}
+
+/* The zone under p (view points): the selected one first, then the visually
+ * topmost (the layers are added in table order, so the last index is on top),
+ * then the selected one again with some finger slop. -1 for none. */
+- (int)editHitAt:(CGPoint)p
+{
+    int n = 0, i, sel;
+    CGFloat W = self.bounds.size.width, H = self.bounds.size.height;
+    const XBOX_IOS_TOUCH_ZONE_MIRROR *z;
+    float x, y;
+
+    z = (const XBOX_IOS_TOUCH_ZONE_MIRROR *)xbox_ios_touch_zones(&n);
+    if (!z || n <= 0 || W < 1.0 || H < 1.0)
+        return -1;
+    x = (float)(p.x / W);
+    y = (float)(p.y / H);
+    sel = [self idxOfZoneId:_selId];
+    if (sel >= 0 && edit_zone_contains(&z[sel], xbox_ios_touch_zone_style(sel) == ZS_STEER, x, y, 1.0f))
+        return sel;
+    for (i = n - 1; i >= 0; i--)
+        if (edit_zone_contains(&z[i], xbox_ios_touch_zone_style(i) == ZS_STEER, x, y, 1.0f))
+            return i;
+    if (sel >= 0 && edit_zone_contains(&z[sel], xbox_ios_touch_zone_style(sel) == ZS_STEER, x, y, 1.35f))
+        return sel;
+    return -1;
+}
+
+/* Select the zone at table index idx (-1 = none). A new selection ticks the
+ * haptic generator (when Haptics is on). */
+- (void)selectIdx:(int)idx
+{
+    int n = 0, zid = -1;
+    const XBOX_IOS_TOUCH_ZONE_MIRROR *z =
+        (const XBOX_IOS_TOUCH_ZONE_MIRROR *)xbox_ios_touch_zones(&n);
+
+    if (z && idx >= 0 && idx < n)
+        zid = z[idx].id;
+    if (zid == _selId)
+        return;
+    _selId = zid;
+    if (zid >= 0)
+        touch_hook_main();
+    [self updateEditUI];
+}
+
+/* Scrim, guide band, selection outline, caption and button states. Never
+ * rebuilds the controls (rebuildControls calls this). Main thread. */
+- (void)updateEditUI
+{
+    int n = 0, sel;
+    CGFloat W = self.bounds.size.width, H = self.bounds.size.height;
+    UIEdgeInsets sa = self.safeAreaInsets;
+    const XBOX_IOS_TOUCH_ZONE_MIRROR *z =
+        (const XBOX_IOS_TOUCH_ZONE_MIRROR *)xbox_ios_touch_zones(&n);
+    NSString *lay = _editDrive ? @"Drive" : @"Pad";
+
+    if (!_editing)
+        return;
+    sel = [self idxOfZoneId:_selId];
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    _scrim.frame = self.bounds;
+    _scrim.hidden = NO;
+    _guide.frame = self.bounds;
+    {
+        UIBezierPath *gp = [UIBezierPath bezierPath];
+        CGFloat mid = W - sa.left - sa.right;
+        path_add_rect(gp, CGRectMake(0.0, 0.0, sa.left, H));
+        path_add_rect(gp, CGRectMake(W - sa.right, 0.0, sa.right, H));
+        path_add_rect(gp, CGRectMake(sa.left, 0.0, mid, sa.top));
+        path_add_rect(gp, CGRectMake(sa.left, H - sa.bottom, mid, sa.bottom));
+        set_path(_guide, gp);
+        _guide.hidden = NO;
+    }
+    _outline.frame = self.bounds;
+    if (z && sel >= 0 && sel < n) {
+        const XBOX_IOS_TOUCH_ZONE_MIRROR *s0 = &z[sel];
+        CGRect r = CGRectInset(CGRectMake((s0->cx - s0->rx) * W, (s0->cy - s0->ry) * H,
+                                          2.0 * s0->rx * W, 2.0 * s0->ry * H), -3.0, -3.0);
+        UIBezierPath *op = (xbox_ios_touch_zone_style(sel) == ZS_STEER)
+            ? [UIBezierPath bezierPathWithRoundedRect:r cornerRadius:10.0]
+            : [UIBezierPath bezierPathWithOvalInRect:r];
+        set_path(_outline, op);
+        _outline.hidden = NO;
+    } else {
+        _outline.hidden = YES;
+    }
+    if (sel >= 0)
+        _barLabel.text = [NSString stringWithFormat:@"%@ layout · %@ selected", lay, edit_zone_name(sel)];
+    else
+        _barLabel.text = [NSString stringWithFormat:@"%@ layout · tap a control, drag to move, pinch to resize", lay];
+    for (UIButton *b in _barButtons) {
+        if (b.tag == 3 || b.tag == 4)
+            b.enabled = (sel >= 0) ? YES : NO;
+    }
+    [self layoutEditBar];
+    [CATransaction commit];
+}
+
+- (void)layoutEditBar
+{
+    CGFloat W = self.bounds.size.width;
+    UIEdgeInsets sa = self.safeAreaInsets;
+    CGFloat avail = W - sa.left - sa.right - 16.0;
+    CGFloat bw = avail < 460.0 ? avail : 460.0;
+    CGFloat bwid;
+    NSUInteger k;
+
+    if (!_bar)
+        return;
+    if (bw < 200.0)
+        bw = 200.0;
+    bwid = floor((bw - 16.0) / 5.0);
+    _bar.frame = CGRectMake(sa.left + floor((W - sa.left - sa.right - bw) / 2.0),
+                            sa.top + 6.0, bw, 64.0);
+    _barLabel.frame = CGRectMake(8.0, 4.0, bw - 16.0, 18.0);
+    for (k = 0; k < _barButtons.count; k++) {
+        UIButton *b = [_barButtons objectAtIndex:k];
+        b.frame = CGRectMake(8.0 + bwid * (CGFloat)k, 26.0, bwid, 34.0);
+    }
+}
+
+/* The toolbar and the gesture surface, added on top of everything. */
+- (void)buildEditChrome
+{
+    NSArray *titles = [NSArray arrayWithObjects:@"Cancel", @"Reset", @"−", @"+", @"Done", nil];
+    SEL sels[5] = { @selector(editCancelTapped), @selector(editResetTapped),
+                    @selector(editSmallerTapped), @selector(editBiggerTapped),
+                    @selector(editDoneTapped) };
+    UIColor *tints[5] = { rgba(0xFF8A80, 1.0), rgba(0xFFB74D, 1.0), rgba(0xFFFFFF, 1.0),
+                          rgba(0xFFFFFF, 1.0), rgba(0x5DC21E, 1.0) };
+    int k;
+
+    UIView *surf = [[UIView alloc] initWithFrame:self.bounds];
+    surf.backgroundColor = [UIColor clearColor];
+    surf.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    surf.userInteractionEnabled = YES;
+
+    UITapGestureRecognizer *tap =
+        [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(editTap:)];
+    [surf addGestureRecognizer:tap];
+    UIPanGestureRecognizer *pan =
+        [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(editPan:)];
+    pan.maximumNumberOfTouches = 1;      /* two fingers are the pinch's */
+    [surf addGestureRecognizer:pan];
+    UIPinchGestureRecognizer *pinch =
+        [[UIPinchGestureRecognizer alloc] initWithTarget:self action:@selector(editPinch:)];
+    [surf addGestureRecognizer:pinch];
+    [self addSubview:surf];
+    _surface = surf;
+
+    UIView *bar = [[UIView alloc] initWithFrame:CGRectZero];
+    bar.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.92];
+    bar.layer.cornerRadius = 12.0;
+    bar.clipsToBounds = YES;
+    bar.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
+    UILabel *lb = [[UILabel alloc] initWithFrame:CGRectZero];
+    lb.textColor = [UIColor colorWithWhite:1.0 alpha:0.9];
+    lb.font = [UIFont systemFontOfSize:12.0];
+    lb.textAlignment = NSTextAlignmentCenter;
+    lb.adjustsFontSizeToFitWidth = YES;
+    lb.minimumScaleFactor = 0.7;
+    [bar addSubview:lb];
+    _barLabel = lb;
+    _barButtons = [[NSMutableArray alloc] init];
+    for (k = 0; k < 5; k++) {
+        UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+        [b setTitle:[titles objectAtIndex:(NSUInteger)k] forState:UIControlStateNormal];
+        b.titleLabel.font = [UIFont boldSystemFontOfSize:(k == 2 || k == 3) ? 22.0 : 15.0];
+        b.tintColor = tints[k];
+        b.tag = k + 1;
+        [b addTarget:self action:sels[k] forControlEvents:UIControlEventTouchUpInside];
+        [bar addSubview:b];
+        [_barButtons addObject:b];
+    }
+    [self addSubview:bar];
+    _bar = bar;
+}
+
+/* Enter edit mode for the CURRENT layout (Pad or Drive). Main thread. */
+- (void)beginEdit
+{
+    char buf[LAYOUT_TEXT_MAX];
+
+    if (_editing || !s_win)
+        return;
+    _editing = YES;
+    /* Game touch input off for the duration; the setter, not the Touch
+     * controls switch, so nothing is written to the settings file. */
+    _prevTouch = xbox_ios_touch_enabled() ? YES : NO;
+    xbox_ios_touch_set_enabled(0);
+    _editDrive = xbox_ios_touch_get_layout() ? 1 : 0;
+    buf[0] = 0;
+    (void)xbox_ios_touch_layout_format(buf, sizeof buf);
+    _entryText = [NSString stringWithUTF8String:buf];
+    _selId = -1;
+    _dragId = -1;
+    _pinchId = -1;
+    _savedAlpha = self.alpha;
+    self.alpha = 1.0;                        /* every control at full opacity */
+    s_gear.hidden = YES;
+    panel_hide();
+    [self buildEditChrome];
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    _host.hidden = NO;                       /* even when touch is off / a pad is attached */
+    [CATransaction commit];
+    _built = NO;                             /* force a fresh build now */
+    (void)[self syncControls];
+    [self updateEditUI];
+    fprintf(stderr, "nfsu2: layout editor on (%s)\n", _editDrive ? "drive" : "pad");
+}
+
+/* Leave edit mode. save: write the file; otherwise put back the overrides
+ * taken at entry. */
+- (void)endEditSave:(BOOL)save
+{
+    char buf[LAYOUT_TEXT_MAX];
+
+    if (!_editing)
+        return;
+    if (save) {
+        buf[0] = 0;
+        (void)xbox_ios_touch_layout_format(buf, sizeof buf);
+        (void)layout_file_save(buf);         /* always: a failed save is retried by the next Done */
+    } else {
+        (void)xbox_ios_touch_layout_parse([_entryText UTF8String]);
+    }
+    _editing = NO;
+    _selId = -1;
+    _dragId = -1;
+    _pinchId = -1;
+    [_surface removeFromSuperview];          /* the recognizers go with it */
+    [_bar removeFromSuperview];
+    _surface = nil;
+    _bar = nil;
+    _barLabel = nil;
+    [_barButtons removeAllObjects];
+    _entryText = nil;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    _scrim.hidden = YES;
+    _guide.hidden = YES;
+    _outline.hidden = YES;
+    _host.hidden = _shapesHidden;
+    [CATransaction commit];
+    self.alpha = _savedAlpha;
+    s_gear.hidden = NO;
+    xbox_ios_touch_set_enabled(_prevTouch ? 1 : 0);
+    (void)[self syncControls];
+    overlay_wake();
+    fprintf(stderr, "nfsu2: layout editor off (%s)\n", save ? "done" : "cancelled");
+}
+
+- (void)editDoneTapped   { [self endEditSave:YES]; }
+- (void)editCancelTapped { [self endEditSave:NO]; }
+
+- (void)editResetTapped
+{
+    if (!_editing)
+        return;
+    xbox_ios_touch_layout_reset(_editDrive);
+    (void)[self syncControls];
+    [self updateEditUI];
+}
+
+/* Resize the selected control about its centre by f (rx and ry together). */
+- (void)scaleSelected:(float)f
+{
+    int idx = [self idxOfZoneId:_selId];
+    float cx, cy, rx, ry;
+
+    if (!_editing || idx < 0)
+        return;
+    if (!xbox_ios_touch_zone_geom(idx, &cx, &cy, &rx, &ry))
+        return;
+    f = edit_clamp_factor(rx, ry, xbox_ios_touch_zone_style(idx) == ZS_STEER, f);
+    (void)xbox_ios_touch_zone_set_geom(idx, cx, cy, rx * f, ry * f);
+    (void)[self syncControls];
+    [self updateEditUI];
+}
+
+- (void)editSmallerTapped { [self scaleSelected:0.9f]; }
+- (void)editBiggerTapped  { [self scaleSelected:1.1f]; }
+
+/* After a geometry change. A pure move (fast, and the layers were in step
+ * before) only repositions that control's layer; anything else relays all. */
+- (void)relayoutZone:(int)idx fast:(BOOL)fast
+{
+    unsigned now = xbox_ios_touch_layout_gen();
+
+    if (fast && now != _gen) {
+        int n = 0;
+        const XBOX_IOS_TOUCH_ZONE_MIRROR *z =
+            (const XBOX_IOS_TOUCH_ZONE_MIRROR *)xbox_ios_touch_zones(&n);
+        CGFloat W = self.bounds.size.width, H = self.bounds.size.height;
+        if (z && idx >= 0 && idx < n) {
+            for (Nfsu2Ctl *c in _ctls) {
+                if (c.zoneIdx == idx) {
+                    [CATransaction begin];
+                    [CATransaction setDisableActions:YES];
+                    c.root.position = CGPointMake(z[idx].cx * W, z[idx].cy * H);
+                    [CATransaction commit];
+                    _gen = now;
+                    return;
+                }
+            }
+        }
+    }
+    (void)[self syncControls];
+}
+
+- (void)editTap:(UITapGestureRecognizer *)g
+{
+    if (!_editing || g.state != UIGestureRecognizerStateEnded)
+        return;
+    [self selectIdx:[self editHitAt:[g locationInView:self]]];
+}
+
+/* One finger: move the control that was under it when the touch began. The
+ * position is the geometry at the start plus the whole translation so far
+ * (never incremental, so a clamp at an edge does not drift). */
+- (void)editPan:(UIPanGestureRecognizer *)g
+{
+    CGFloat W = self.bounds.size.width, H = self.bounds.size.height;
+    CGPoint t;
+    int idx;
+
+    if (!_editing || W < 1.0 || H < 1.0)
+        return;
+    t = [g translationInView:self];
+    if (g.state == UIGestureRecognizerStateBegan) {
+        /* The location reported at Began is after the slop movement. */
+        CGPoint p = [g locationInView:self];
+        int n = 0;
+        const XBOX_IOS_TOUCH_ZONE_MIRROR *z;
+
+        _dragId = -1;
+        idx = [self editHitAt:CGPointMake(p.x - t.x, p.y - t.y)];
+        if (idx < 0)
+            return;
+        [self selectIdx:idx];
+        z = (const XBOX_IOS_TOUCH_ZONE_MIRROR *)xbox_ios_touch_zones(&n);
+        if (z && idx < n && xbox_ios_touch_zone_geom(idx, &_g0[0], &_g0[1], &_g0[2], &_g0[3]))
+            _dragId = z[idx].id;
+    } else if (g.state == UIGestureRecognizerStateChanged) {
+        unsigned before;
+        BOOL inSync;
+
+        if (_dragId < 0)
+            return;
+        idx = [self idxOfZoneId:_dragId];
+        if (idx < 0)
+            return;
+        before = xbox_ios_touch_layout_gen();
+        inSync = (_built && before == _gen) ? YES : NO;
+        (void)xbox_ios_touch_zone_set_geom(idx, _g0[0] + (float)(t.x / W),
+                                           _g0[1] + (float)(t.y / H), _g0[2], _g0[3]);
+        [self relayoutZone:idx fast:inSync];
+        [self updateEditUI];
+    } else {
+        _dragId = -1;
+    }
+}
+
+/* Two fingers: resize the selected control (or the one under the pinch
+ * centre) about its centre; g.scale is cumulative since the gesture began. */
+- (void)editPinch:(UIPinchGestureRecognizer *)g
+{
+    int idx;
+
+    if (!_editing)
+        return;
+    if (g.state == UIGestureRecognizerStateBegan) {
+        idx = [self editHitAt:[g locationInView:self]];
+        if (idx >= 0)
+            [self selectIdx:idx];
+        idx = [self idxOfZoneId:_selId];
+        _pinchId = -1;
+        if (idx >= 0 && xbox_ios_touch_zone_geom(idx, &_g0[0], &_g0[1], &_g0[2], &_g0[3]))
+            _pinchId = _selId;
+    } else if (g.state == UIGestureRecognizerStateChanged) {
+        float f;
+
+        if (_pinchId < 0)
+            return;
+        idx = [self idxOfZoneId:_pinchId];
+        if (idx < 0)
+            return;
+        f = edit_clamp_factor(_g0[2], _g0[3], xbox_ios_touch_zone_style(idx) == ZS_STEER,
+                              (float)g.scale);
+        (void)xbox_ios_touch_zone_set_geom(idx, _g0[0], _g0[1], _g0[2] * f, _g0[3] * f);
+        (void)[self syncControls];
+        [self updateEditUI];
+    } else {
+        _pinchId = -1;
+    }
+}
 @end
 
 /* ── FPS counter + gear + settings panel ────────────────────── */
@@ -945,7 +1595,6 @@ static Nfsu2Ctl *build_ctl(int idx, const XBOX_IOS_TOUCH_ZONE_MIRROR *z, CGFloat
 static Nfsu2Overlay *s_ov;
 static UILabel *s_fps;
 static UIScrollView *s_panel;      /* on the window, above the overlay */
-static UIWindow *s_win;
 
 /* The shapes show when touch is on and no pad/keyboard has taken over. */
 static void refresh_shapes(void)
@@ -1126,7 +1775,7 @@ static void tilt_start(void)
 enum { IK_HEAD, IK_SWITCH, IK_SLIDER, IK_SEG, IK_BUTTON };
 enum { ACT_NONE, ACT_FPS, ACT_TOUCH, ACT_LAYOUT, ACT_SCALE, ACT_ALPHA,
        ACT_HAPTICS, ACT_TILT, ACT_TILTSENS, ACT_KEYBOARD, ACT_RUMBLE,
-       ACT_ANALOG, ACT_STEER, ACT_STEERSENS, ACT_TILTCENTRE };
+       ACT_ANALOG, ACT_STEER, ACT_STEERSENS, ACT_TILTCENTRE, ACT_EDITLAYOUT };
 
 typedef struct {
     int         kind;
@@ -1152,6 +1801,8 @@ static const PanelItem s_items[] = {
       .lo = 0.7f, .hi = 1.5f, .def = 1.0f, .decimals = 2, .act = ACT_SCALE },
     { .kind = IK_SLIDER, .title = "Opacity", .key = "NFSU2_OVERLAY_ALPHA",
       .lo = 0.2f, .hi = 0.8f, .def = 0.55f, .decimals = 2, .act = ACT_ALPHA },
+    /* Closes the panel and moves / resizes the controls of the current layout. */
+    { .kind = IK_BUTTON, .title = "Edit layout…", .act = ACT_EDITLAYOUT },
     /* Drive layout: pedal value from the finger's height; the steering strip
      * (a switch back to the dynamic stick) and its gain. */
     { .kind = IK_SWITCH, .title = "Analog pedals", .key = "NFSU2_ANALOG_PEDALS",
@@ -1328,6 +1979,8 @@ static NSString *button_title(int act)
     if (act == ACT_TILTCENTRE)
         return [NSString stringWithFormat:@"Centre tilt now (offset %.1f°)",
                                           s_tilt_centre_deg];
+    if (act == ACT_EDITLAYOUT)
+        return @"Edit layout…";
     return @"";
 }
 
@@ -1548,6 +2201,11 @@ static void panel_hide(void)
     int idx = (int)bt.tag - 1;
     if (idx < 0 || idx >= ITEM_COUNT)
         return;
+    if (s_items[idx].act == ACT_EDITLAYOUT) {
+        panel_hide();
+        [s_ov beginEdit];
+        return;
+    }
     if (s_items[idx].act == ACT_TILTCENTRE) {
         if (tilt_centre_now())
             [bt setTitle:button_title(ACT_TILTCENTRE) forState:UIControlStateNormal];
@@ -1677,6 +2335,8 @@ void ios_touch_overlay_install(void *uiwindow)
     UIWindow *win = (__bridge UIWindow *)uiwindow;
     if (!win)
         return;
+    /* Saved layout first: the overlay builds its controls inside initWithFrame. */
+    layout_file_load();
     for (UIView *sub in win.subviews)
         if ([sub isKindOfClass:[Nfsu2Overlay class]]) {
             [sub removeFromSuperview];
@@ -1711,6 +2371,7 @@ void ios_touch_overlay_install(void *uiwindow)
     [gear addTarget:s_target action:@selector(gearTapped)
    forControlEvents:UIControlEventTouchUpInside];
     [ov addSubview:gear];
+    s_gear = gear;
 
     /* The panel lives on the window, not in the overlay: the overlay's alpha
      * (the Opacity setting) must not fade the menu. Built when opened. */

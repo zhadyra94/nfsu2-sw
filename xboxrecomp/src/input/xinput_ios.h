@@ -19,6 +19,8 @@
 #ifndef NFSU2_XINPUT_IOS_H
 #define NFSU2_XINPUT_IOS_H
 
+#include <stddef.h>
+
 #include "xinput_xbox.h"
 
 /* What a zone drives. ZONE_FLAG sets a wButtons bit (ZONE's `value` is the
@@ -135,8 +137,52 @@ int xbox_ios_touch_zone_style(int idx);   /* OTHER when idx is out of range */
 #define XBOX_IOS_DPAD_BIT_RIGHT 8u
 unsigned xbox_ios_touch_dpad_bits(void);
 
-/* Changes every time the zone table is rebuilt (layout, size, ...). */
+/* Changes every time the zone table is rebuilt (layout, size, geometry edits,
+ * ...). */
 unsigned xbox_ios_touch_layout_gen(void);
+
+/* Active layout: 0 = PAD, 1 = DRIVE. */
+int xbox_ios_touch_get_layout(void);
+
+/* Per-zone geometry overrides (the layout editor). An override replaces one
+ * zone's centre and radii in the preset, keyed by (layout PAD / DRIVE, zone
+ * id); the size setting still scales it after that (a STEER zone keeps its
+ * width, as in the preset). Overrides are stored UNSCALED ("base"). The
+ * DRIVE overrides apply to the classic DRIVE table too (same ids 1..11).
+ * Main thread; every change rebuilds the table and bumps layout_gen.
+ *
+ *   zone_geom       base geometry of zone idx of the ACTIVE table (the
+ *                   override if one exists, else the preset), before the size
+ *                   scale. Returns 0 for an index out of range. Any out
+ *                   pointer may be NULL. Edit from these values, never from
+ *                   xbox_ios_touch_zones(), which already includes the scale.
+ *   zone_set_geom   sets the override of zone idx. Clamps: radii rx 0.02..0.30,
+ *                   ry 0.04..0.45 (a STEER strip: rx up to 0.45, ry up to 0.19,
+ *                   the height the table caps it at), then the centre so the
+ *                   zone lies fully inside 0..1. Returns 0 for a bad index. A
+ *                   call that changes nothing creates no override and does not
+ *                   bump the generation.
+ *   layout_reset    drops every override of that layout (0 PAD, 1 DRIVE).
+ *   layout_format   writes the overrides as text (see below). Returns the
+ *                   length the text needs, snprintf style: buf (n bytes, may be
+ *                   NULL / 0) is always NUL-terminated and truncated if the
+ *                   return value is >= n.
+ *   layout_parse    REPLACES all overrides (both layouts) with the ones in
+ *                   text; returns how many lines were applied. Lines that are
+ *                   not "v1 ..." comments, garbage, unknown layouts or zone
+ *                   ids and non-finite numbers are skipped; values are clamped
+ *                   like zone_set_geom. NULL changes nothing and returns 0.
+ *
+ * Text: one header comment line, then one line per override, PAD first, ids
+ * ascending, normalized base geometry with 4 decimals:
+ *     # nfsu2 touch layout v1 ...
+ *     v1 <pad|drive> <zone id> <cx> <cy> <rx> <ry>
+ */
+int  xbox_ios_touch_zone_geom(int idx, float *cx, float *cy, float *rx, float *ry);
+int  xbox_ios_touch_zone_set_geom(int idx, float cx, float cy, float rx, float ry);
+void xbox_ios_touch_layout_reset(int drive);
+int  xbox_ios_touch_layout_format(char *buf, size_t n);
+int  xbox_ios_touch_layout_parse(const char *text);
 
 /* Called with the zone index when a finger lands on a zone, on whichever
  * thread pumps SDL events. NULL clears it. */

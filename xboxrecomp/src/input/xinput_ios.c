@@ -184,6 +184,68 @@ static int   s_analog_pedals = 1;     /* NFSU2_ANALOG_PEDALS */
  * keeps the bottom edge at or above y = 0.98 from its centre 0.79. */
 #define STEER_RY_MAX 0.19f
 
+/* ---- Per-zone geometry overrides (the layout editor) ----
+ * An override replaces one zone's centre and radii of the preset, before the
+ * size scale. Keyed by (layout, zone id); PAD and DRIVE are separate, and the
+ * DRIVE ones also apply when the classic DRIVE table is on (same ids). All
+ * state is under s_lock. */
+#define GEOM_IDS 32
+typedef struct {
+    int   used;
+    float cx, cy, rx, ry;   /* base (unscaled), rect half-extents for STEER */
+} GeomOv;
+static GeomOv s_geom_ov[2][GEOM_IDS];
+
+#define GEOM_RX_MIN 0.02f
+#define GEOM_RX_MAX 0.30f
+#define GEOM_RY_MIN 0.04f
+#define GEOM_RY_MAX 0.45f
+#define GEOM_STEER_RX_MAX 0.45f
+
+static const GeomOv *geom_ov_get(int drive, int id)
+{
+    if (id < 0 || id >= GEOM_IDS || !s_geom_ov[drive ? 1 : 0][id].used)
+        return NULL;
+    return &s_geom_ov[drive ? 1 : 0][id];
+}
+
+/* The preset (before overrides and scale) of zone `id` in the table the
+ * layout is currently using; NULL when the id is not in it. */
+static const XBOX_IOS_TOUCH_ZONE *preset_find(const XBOX_IOS_TOUCH_ZONE *tab, int n, int id)
+{
+    int i;
+    for (i = 0; i < n; i++)
+        if (tab[i].id == id)
+            return &tab[i];
+    return NULL;
+}
+
+static float clampf_nan_lo(float v, float lo, float hi)
+{
+    return !(v >= lo) ? lo : v > hi ? hi : v;   /* NaN gives lo */
+}
+
+/* Radii first, then the centre so the whole zone lies inside 0..1. */
+static void geom_clamp(int steer, float *cx, float *cy, float *rx, float *ry)
+{
+    *rx = clampf_nan_lo(*rx, GEOM_RX_MIN, steer ? GEOM_STEER_RX_MAX : GEOM_RX_MAX);
+    *ry = clampf_nan_lo(*ry, GEOM_RY_MIN, steer ? STEER_RY_MAX : GEOM_RY_MAX);
+    *cx = clampf_nan_lo(*cx, *rx, 1.0f - *rx);
+    *cy = clampf_nan_lo(*cy, *ry, 1.0f - *ry);
+}
+
+/* An overridden zone stays fully on screen after the size scale too (a
+ * preset zone at 1.5 may poke out, as it always did). */
+static void zone_keep_on_screen(XBOX_IOS_TOUCH_ZONE *z)
+{
+    if (z->rx > 0.5f) z->rx = 0.5f;
+    if (z->ry > 0.5f) z->ry = 0.5f;
+    if (z->cx < z->rx) z->cx = z->rx;
+    else if (z->cx > 1.0f - z->rx) z->cx = 1.0f - z->rx;
+    if (z->cy < z->ry) z->cy = z->ry;
+    else if (z->cy > 1.0f - z->ry) z->cy = 1.0f - z->ry;
+}
+
 static void zones_rebuild_locked(void)
 {
     const XBOX_IOS_TOUCH_ZONE *src = !s_drive ? s_zones_pad
@@ -194,6 +256,13 @@ static void zones_rebuild_locked(void)
     int i, m = 0;
     for (i = 0; i < n; i++) {
         XBOX_IOS_TOUCH_ZONE z = src[i];
+        const GeomOv *o = geom_ov_get(s_drive, z.id);
+        if (o) {
+            z.cx = o->cx;
+            z.cy = o->cy;
+            z.rx = o->rx;
+            z.ry = o->ry;
+        }
         if (z.kind == XBOX_IOS_ZONE_STEER) {
             if (!s_steer_on)
                 continue;
@@ -204,6 +273,8 @@ static void zones_rebuild_locked(void)
             z.rx *= s_scale;
             z.ry *= s_scale;
         }
+        if (o)
+            zone_keep_on_screen(&z);
         s_zones[m++] = z;
     }
     s_zone_n = m;
@@ -1034,12 +1105,220 @@ unsigned xbox_ios_touch_dpad_bits(void)
 }
 
 /* Generation of the zone table: changes whenever it is rebuilt (layout,
- * size, later geometry edits), so the overlay knows when to relay its
+ * size, geometry edits), so the overlay knows when to relay its
  * layers. */
 unsigned xbox_ios_touch_layout_gen(void)
 {
     touch_prefs_once();
     return __atomic_load_n(&s_layout_gen, __ATOMIC_ACQUIRE);
+}
+
+int xbox_ios_touch_get_layout(void)
+{
+    touch_prefs_once();
+    return s_drive ? 1 : 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Layout editor: geometry overrides, text form                         */
+/* ------------------------------------------------------------------ */
+
+/* Base geometry of zone idx of the active table: the override, else the
+ * active preset. Called with s_lock held; 0 when idx is out of range. */
+static int zone_base_locked(int idx, GeomOv *out)
+{
+    const GeomOv *o;
+    const XBOX_IOS_TOUCH_ZONE *p;
+    int id;
+
+    if (idx < 0 || idx >= s_zone_n)
+        return 0;
+    id = s_zones[idx].id;
+    o = geom_ov_get(s_drive, id);
+    if (o) {
+        *out = *o;
+        return 1;
+    }
+    p = !s_drive ? preset_find(s_zones_pad, PAD_COUNT, id)
+      : s_drive_classic ? preset_find(s_zones_drive_classic, DRIVE_CLASSIC_COUNT, id)
+                        : preset_find(s_zones_drive, DRIVE_NEW_COUNT, id);
+    if (!p)
+        return 0;
+    out->used = 0;
+    out->cx = p->cx;
+    out->cy = p->cy;
+    out->rx = p->rx;
+    out->ry = p->ry;
+    return 1;
+}
+
+int xbox_ios_touch_zone_geom(int idx, float *cx, float *cy, float *rx, float *ry)
+{
+    GeomOv g;
+    int ok;
+
+    touch_prefs_once();
+    SDL_LockMutex(s_lock);
+    ok = zone_base_locked(idx, &g);
+    SDL_UnlockMutex(s_lock);
+    if (!ok)
+        return 0;
+    if (cx) *cx = g.cx;
+    if (cy) *cy = g.cy;
+    if (rx) *rx = g.rx;
+    if (ry) *ry = g.ry;
+    return 1;
+}
+
+static int geom_same(const GeomOv *a, float cx, float cy, float rx, float ry)
+{
+    return fabsf(a->cx - cx) < 1e-6f && fabsf(a->cy - cy) < 1e-6f &&
+           fabsf(a->rx - rx) < 1e-6f && fabsf(a->ry - ry) < 1e-6f;
+}
+
+int xbox_ios_touch_zone_set_geom(int idx, float cx, float cy, float rx, float ry)
+{
+    GeomOv cur;
+    int ok = 0, id, steer;
+
+    touch_prefs_once();
+    SDL_LockMutex(s_lock);
+    if (zone_base_locked(idx, &cur)) {
+        id = s_zones[idx].id;
+        steer = (s_zones[idx].kind == XBOX_IOS_ZONE_STEER);
+        if (id >= 0 && id < GEOM_IDS) {
+            geom_clamp(steer, &cx, &cy, &rx, &ry);
+            if (!geom_same(&cur, cx, cy, rx, ry)) {
+                GeomOv *o = &s_geom_ov[s_drive ? 1 : 0][id];
+                o->used = 1;
+                o->cx = cx;
+                o->cy = cy;
+                o->rx = rx;
+                o->ry = ry;
+                zones_rebuild_locked();
+            }
+            ok = 1;
+        }
+    }
+    SDL_UnlockMutex(s_lock);
+    return ok;
+}
+
+void xbox_ios_touch_layout_reset(int drive)
+{
+    touch_prefs_once();
+    SDL_LockMutex(s_lock);
+    memset(s_geom_ov[drive ? 1 : 0], 0, sizeof s_geom_ov[0]);
+    zones_rebuild_locked();
+    SDL_UnlockMutex(s_lock);
+}
+
+/* Append s to buf at *len, counting what does not fit (snprintf style). */
+static void text_put(char *buf, size_t n, size_t *len, const char *s)
+{
+    size_t k = strlen(s);
+    if (buf && n > 0 && *len < n - 1) {
+        size_t room = n - 1 - *len;
+        memcpy(buf + *len, s, k < room ? k : room);
+    }
+    *len += k;
+}
+
+int xbox_ios_touch_layout_format(char *buf, size_t n)
+{
+    static const char *const names[2] = { "pad", "drive" };
+    size_t len = 0;
+    int lay, id;
+    char line[96];
+
+    touch_prefs_once();
+    text_put(buf, n, &len,
+             "# nfsu2 touch layout v1: v1 <pad|drive> <zone id> <cx> <cy> <rx> <ry>"
+             " (normalized, before the size setting)\n");
+    SDL_LockMutex(s_lock);
+    for (lay = 0; lay < 2; lay++)
+        for (id = 0; id < GEOM_IDS; id++) {
+            const GeomOv *o = &s_geom_ov[lay][id];
+            if (!o->used)
+                continue;
+            snprintf(line, sizeof line, "v1 %s %d %.4f %.4f %.4f %.4f\n",
+                     names[lay], id, (double)o->cx, (double)o->cy,
+                     (double)o->rx, (double)o->ry);
+            text_put(buf, n, &len, line);
+        }
+    SDL_UnlockMutex(s_lock);
+    if (buf && n > 0)
+        buf[len < n ? len : n - 1] = 0;
+    return (int)len;
+}
+
+/* One "v1 <layout> <id> <cx> <cy> <rx> <ry>" line into tmp; 1 when applied. */
+static int parse_geom_line(const char *line, GeomOv tmp[2][GEOM_IDS])
+{
+    char lay[8];
+    int id, drive, steer, got;
+    float cx, cy, rx, ry;
+    const XBOX_IOS_TOUCH_ZONE *p;
+
+    got = sscanf(line, " v1 %7s %d %f %f %f %f", lay, &id, &cx, &cy, &rx, &ry);
+    if (got != 6)
+        return 0;
+    if (strcasecmp(lay, "pad") == 0)
+        drive = 0;
+    else if (strcasecmp(lay, "drive") == 0)
+        drive = 1;
+    else
+        return 0;
+    if (id < 0 || id >= GEOM_IDS)
+        return 0;
+    if (!isfinite(cx) || !isfinite(cy) || !isfinite(rx) || !isfinite(ry))
+        return 0;
+    /* The new DRIVE table holds every DRIVE id (the classic one is a subset). */
+    p = drive ? preset_find(s_zones_drive, DRIVE_NEW_COUNT, id)
+              : preset_find(s_zones_pad, PAD_COUNT, id);
+    if (!p)
+        return 0;
+    steer = (p->kind == XBOX_IOS_ZONE_STEER);
+    geom_clamp(steer, &cx, &cy, &rx, &ry);
+    tmp[drive][id].used = 1;
+    tmp[drive][id].cx = cx;
+    tmp[drive][id].cy = cy;
+    tmp[drive][id].rx = rx;
+    tmp[drive][id].ry = ry;
+    return 1;
+}
+
+int xbox_ios_touch_layout_parse(const char *text)
+{
+    GeomOv tmp[2][GEOM_IDS];
+    const char *p = text;
+    int applied = 0;
+
+    if (!text)
+        return 0;
+    touch_prefs_once();
+    memset(tmp, 0, sizeof tmp);
+    while (*p) {
+        char line[160];
+        const char *e = p;
+        size_t len;
+
+        while (*e && *e != '\n')
+            e++;
+        len = (size_t)(e - p);
+        if (len >= sizeof line)
+            len = sizeof line - 1;   /* an over-long line is garbage anyway */
+        memcpy(line, p, len);
+        line[len] = 0;
+        if (parse_geom_line(line, tmp))
+            applied++;
+        p = *e ? e + 1 : e;
+    }
+    SDL_LockMutex(s_lock);
+    memcpy(s_geom_ov, tmp, sizeof s_geom_ov);
+    zones_rebuild_locked();
+    SDL_UnlockMutex(s_lock);
+    return applied;
 }
 
 /* ------------------------------------------------------------------ */

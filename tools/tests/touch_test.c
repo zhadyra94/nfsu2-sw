@@ -155,7 +155,7 @@ static void lift_all(void)
 
 /* Back to a known state: touch on, PAD layout, scale 1, no tilt, no hooks,
  * analog pedals on, steering strip on at sensitivity 1, new DRIVE table, no
- * fingers, 16:9 window. The setters clear all fingers by contract; the
+ * geometry overrides, no fingers, 16:9 window. The setters clear all fingers by contract; the
  * explicit lift keeps reset() sound even if that contract breaks. */
 static void reset(void)
 {
@@ -166,6 +166,8 @@ static void reset(void)
     xbox_ios_touch_set_steer(1);
     xbox_ios_touch_set_steer_sens(1.0f);
     xbox_ios_touch_set_drive_classic(0);
+    xbox_ios_touch_layout_reset(1);
+    xbox_ios_touch_layout_reset(0);
     xbox_ios_touch_set_layout(0);
     xbox_ios_touch_set_scale(1.0f);
     xbox_ios_touch_set_tilt(0.0f, 0);
@@ -2256,6 +2258,485 @@ static void env_case(const char *name, const char *what)
 }
 
 /* ------------------------------------------------------------------ */
+/* Layout editor: geometry overrides and their text form                */
+/* ------------------------------------------------------------------ */
+
+/* Table index of the zone with this id in the active table, -1 if none. */
+static int zone_by_id(int id)
+{
+    int n = zcount(), i;
+    for (i = 0; i < n; i++)
+        if (zone(i)->id == id)
+            return i;
+    return -1;
+}
+
+static int near4(float a, float b)
+{
+    return fabsf(a - b) < 1e-4f;
+}
+
+static void geom_of(int idx, float g[4])
+{
+    int ok = xbox_ios_touch_zone_geom(idx, &g[0], &g[1], &g[2], &g[3]);
+    CHECK(ok, "zone_geom(%d) failed", idx);
+    if (!ok)
+        g[0] = g[1] = g[2] = g[3] = -1.0f;
+}
+
+/* 21. set_geom moves the hit area (scale applied), zone_geom stays unscaled. */
+static void t_geom_move(void)
+{
+    int zi, id;
+    float g0[4], g1[4], ox, oy, nx, ny;
+    const XBOX_IOS_TOUCH_ZONE *z;
+    XBOX_INPUT_STATE s;
+
+    reset();
+    zi = zone_by_label("A");
+    if (zi < 0)
+        return;
+    id = zone(zi)->id;
+    geom_of(zi, g0);
+    ox = g0[0];
+    oy = g0[1];
+
+    /* The old centre presses A; a spot in the middle of the screen is bare. */
+    fdown(1, ox, oy);
+    s = rd();
+    CHECK(s.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 255, "A not pressed at its preset centre");
+    fup(1);
+    nx = 0.50f;
+    ny = 0.55f;
+    require_bare(nx, ny);
+
+    xbox_ios_touch_set_scale(1.25f);
+    zi = zone_by_id(id);
+    CHECK(zi >= 0 && xbox_ios_touch_zone_set_geom(zi, nx, ny, g0[2], g0[3]) == 1, "set_geom refused");
+    z = zone(zi);
+    CHECK(z && near4(z->cx, nx) && near4(z->cy, ny), "table centre %.4f,%.4f want %.4f,%.4f",
+          z ? z->cx : -1.0f, z ? z->cy : -1.0f, nx, ny);
+    CHECK(z && near4(z->rx, g0[2] * 1.25f) && near4(z->ry, g0[3] * 1.25f),
+          "table radii %.4f,%.4f want %.4f,%.4f (base * 1.25)", z ? z->rx : -1.0f, z ? z->ry : -1.0f,
+          g0[2] * 1.25f, g0[3] * 1.25f);
+    geom_of(zi, g1);
+    CHECK(near4(g1[0], nx) && near4(g1[1], ny) && near4(g1[2], g0[2]) && near4(g1[3], g0[3]),
+          "zone_geom returned scaled or wrong values %.4f,%.4f,%.4f,%.4f", g1[0], g1[1], g1[2], g1[3]);
+
+    /* Old point misses, new point hits, the edge follows the scaled radius. */
+    fdown(1, ox, oy);
+    s = rd();
+    CHECK(s.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 0, "A still pressed at its OLD centre");
+    fup(1);
+    fdown(1, nx, ny);
+    s = rd();
+    CHECK(s.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 255, "A not pressed at its NEW centre");
+    fup(1);
+    fdown(1, nx + g0[2] * 1.25f * 0.9f, ny);
+    s = rd();
+    CHECK(s.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 255, "A not pressed at 0.9 scaled radii");
+    fup(1);
+    fdown(1, nx + g0[2] * 1.25f * 1.1f, ny);
+    s = rd();
+    CHECK(s.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 0, "A pressed at 1.1 scaled radii");
+    fup(1);
+
+    /* The override survives a size change and a layout round trip. */
+    xbox_ios_touch_set_scale(1.0f);
+    xbox_ios_touch_set_layout(1);
+    xbox_ios_touch_set_layout(0);
+    zi = zone_by_id(id);
+    z = zone(zi);
+    CHECK(z && near4(z->cx, nx) && near4(z->cy, ny) && near4(z->rx, g0[2]),
+          "override lost over scale / layout switches");
+    reset();
+}
+
+/* 21b. Clamps, bad indices, NaN. */
+static void t_geom_clamp(void)
+{
+    int zi, si;
+    float g[4], nan = NAN;
+
+    reset();
+    CHECK(xbox_ios_touch_zone_geom(-1, NULL, NULL, NULL, NULL) == 0, "geom(-1) accepted");
+    CHECK(xbox_ios_touch_zone_geom(zcount(), NULL, NULL, NULL, NULL) == 0, "geom(n) accepted");
+    CHECK(xbox_ios_touch_zone_set_geom(-1, 0.5f, 0.5f, 0.05f, 0.1f) == 0, "set_geom(-1) accepted");
+    CHECK(xbox_ios_touch_zone_set_geom(zcount() + 5, 0.5f, 0.5f, 0.05f, 0.1f) == 0, "set_geom(n+5) accepted");
+    CHECK(xbox_ios_touch_zone_geom(0, NULL, NULL, NULL, NULL) == 1, "geom with NULL outs refused");
+
+    zi = zone_by_label("A");
+    if (zi < 0)
+        return;
+    /* Too big: radii capped, centre pulled inside. */
+    xbox_ios_touch_zone_set_geom(zi, -5.0f, 9.0f, 1.0f, 2.0f);
+    geom_of(zi, g);
+    CHECK(near4(g[2], 0.30f) && near4(g[3], 0.45f), "big radii -> %.4f,%.4f want 0.30,0.45", g[2], g[3]);
+    CHECK(near4(g[0], 0.30f) && near4(g[1], 0.55f), "centre -> %.4f,%.4f want 0.30,0.55", g[0], g[1]);
+    /* Too small. */
+    xbox_ios_touch_zone_set_geom(zi, 0.5f, 0.5f, 0.0f, -1.0f);
+    geom_of(zi, g);
+    CHECK(near4(g[2], 0.02f) && near4(g[3], 0.04f), "tiny radii -> %.4f,%.4f want 0.02,0.04", g[2], g[3]);
+    /* Far corner: the whole zone stays inside 0..1. */
+    xbox_ios_touch_zone_set_geom(zi, 2.0f, 2.0f, 0.05f, 0.1f);
+    geom_of(zi, g);
+    CHECK(near4(g[0], 0.95f) && near4(g[1], 0.90f), "corner -> %.4f,%.4f want 0.95,0.90", g[0], g[1]);
+    /* NaN does not poison the table. */
+    xbox_ios_touch_zone_set_geom(zi, nan, nan, nan, nan);
+    geom_of(zi, g);
+    CHECK(isfinite(g[0]) && isfinite(g[1]) && isfinite(g[2]) && isfinite(g[3]) &&
+          g[0] >= g[2] && g[0] <= 1.0f - g[2] && g[1] >= g[3] && g[1] <= 1.0f - g[3],
+          "NaN gave %.4f,%.4f,%.4f,%.4f", g[0], g[1], g[2], g[3]);
+
+    /* The steering strip: half-width up to 0.45, height capped where the
+     * table caps it (0.19), still on screen. */
+    xbox_ios_touch_set_layout(1);
+    si = zone_by_kind(XBOX_IOS_ZONE_STEER);
+    if (si >= 0) {
+        xbox_ios_touch_zone_set_geom(si, 0.0f, 1.0f, 0.9f, 0.9f);
+        geom_of(si, g);
+        CHECK(near4(g[2], 0.45f) && near4(g[3], 0.19f), "strip radii -> %.4f,%.4f want 0.45,0.19", g[2], g[3]);
+        CHECK(near4(g[0], 0.45f) && near4(g[1], 0.81f), "strip centre -> %.4f,%.4f want 0.45,0.81", g[0], g[1]);
+    }
+    reset();
+}
+
+/* 21c. Reset restores the preset; layouts are independent (id 7 is RT in PAD
+ * and GAS in DRIVE). */
+static void t_geom_layouts(void)
+{
+    int zp, zd;
+    float pad0[4], drv0[4], g[4];
+    unsigned gen;
+
+    reset();
+    zp = zone_by_id(7);
+    geom_of(zp, pad0);
+    xbox_ios_touch_set_layout(1);
+    zd = zone_by_id(7);
+    geom_of(zd, drv0);
+    CHECK(zp >= 0 && zd >= 0, "no zone with id 7");
+    CHECK(!near4(pad0[0], drv0[0]) || !near4(pad0[1], drv0[1]), "test setup: id 7 is at the same place in both");
+
+    /* Edit DRIVE 7: PAD 7 does not move. */
+    xbox_ios_touch_zone_set_geom(zd, 0.60f, 0.60f, 0.05f, 0.10f);
+    geom_of(zd, g);
+    CHECK(near4(g[0], 0.60f) && near4(g[1], 0.60f), "DRIVE edit not applied");
+    xbox_ios_touch_set_layout(0);
+    zp = zone_by_id(7);
+    geom_of(zp, g);
+    CHECK(near4(g[0], pad0[0]) && near4(g[1], pad0[1]) && near4(g[2], pad0[2]) && near4(g[3], pad0[3]),
+          "PAD 7 changed by a DRIVE edit: %.4f,%.4f", g[0], g[1]);
+
+    /* Edit PAD 7, then reset DRIVE: PAD keeps its edit, DRIVE is back. */
+    xbox_ios_touch_zone_set_geom(zp, 0.30f, 0.30f, 0.05f, 0.10f);
+    gen = xbox_ios_touch_layout_gen();
+    xbox_ios_touch_layout_reset(1);
+    CHECK(xbox_ios_touch_layout_gen() != gen, "layout_reset did not bump the generation");
+    geom_of(zp, g);
+    CHECK(near4(g[0], 0.30f) && near4(g[1], 0.30f), "PAD edit lost by a DRIVE reset");
+    xbox_ios_touch_set_layout(1);
+    zd = zone_by_id(7);
+    geom_of(zd, g);
+    CHECK(near4(g[0], drv0[0]) && near4(g[1], drv0[1]) && near4(g[2], drv0[2]) && near4(g[3], drv0[3]),
+          "DRIVE 7 not back at the preset after layout_reset(1)");
+    /* The hit area is back too. */
+    CHECK(zone_hit(drv0[0], drv0[1]) == zd, "preset centre does not hit the restored zone");
+    CHECK(zone_hit(0.60f, 0.60f) != zd, "the edited spot still hits the reset zone");
+
+    /* Reset of the layout that is not active works as well. */
+    xbox_ios_touch_set_layout(0);
+    xbox_ios_touch_layout_reset(0);
+    zp = zone_by_id(7);
+    geom_of(zp, g);
+    CHECK(near4(g[0], pad0[0]) && near4(g[1], pad0[1]), "PAD 7 not back after layout_reset(0)");
+    reset();
+}
+
+/* 21d. layout_gen: bumps on a change and a reset, not on reads or no-ops. */
+static void t_geom_gen(void)
+{
+    int zi;
+    float g[4];
+    unsigned g0, g1;
+
+    reset();
+    zi = zone_by_label("B");
+    if (zi < 0)
+        return;
+    geom_of(zi, g);
+    g0 = xbox_ios_touch_layout_gen();
+    (void)xbox_ios_touch_zone_geom(zi, NULL, NULL, NULL, NULL);
+    CHECK(xbox_ios_touch_layout_gen() == g0, "zone_geom bumped the generation");
+    xbox_ios_touch_zone_set_geom(zi, g[0], g[1], g[2], g[3]);   /* unchanged */
+    CHECK(xbox_ios_touch_layout_gen() == g0, "a no-op set_geom bumped the generation");
+    {
+        char buf[512];
+        (void)xbox_ios_touch_layout_format(buf, sizeof buf);
+        CHECK(strstr(buf, "\nv1 ") == NULL, "a no-op set_geom created an override");
+    }
+    xbox_ios_touch_zone_set_geom(zi, g[0] - 0.05f, g[1] - 0.05f, g[2], g[3]);
+    g1 = xbox_ios_touch_layout_gen();
+    CHECK(g1 != g0, "set_geom did not bump the generation");
+    xbox_ios_touch_zone_set_geom(zi, g[0] - 0.05f, g[1] - 0.05f, g[2], g[3]);
+    CHECK(xbox_ios_touch_layout_gen() == g1, "repeating the same set_geom bumped again");
+    xbox_ios_touch_layout_reset(0);
+    CHECK(xbox_ios_touch_layout_gen() != g1, "layout_reset did not bump the generation");
+    g0 = xbox_ios_touch_layout_gen();
+    CHECK(xbox_ios_touch_layout_parse("v1 pad 3 0.5 0.5 0.05 0.1\n") == 1, "parse of one line");
+    CHECK(xbox_ios_touch_layout_gen() != g0, "parse did not bump the generation");
+    reset();
+}
+
+/* 21e. format -> parse reproduces the geometry, and the text itself. */
+static void t_geom_roundtrip(void)
+{
+    static const int ids_pad[3] = { 8, 3, 1 };
+    static const int ids_drv[3] = { 7, 12, 4 };
+    char t1[4096], t2[4096];
+    float want_pad[3][4], want_drv[3][4], g[4];
+    float pre_pad[3][4], pre_drv[3][4];
+    int k, zi, n1, n2, applied;
+
+    reset();
+    n1 = xbox_ios_touch_layout_format(t1, sizeof t1);
+    CHECK(n1 > 0 && t1[0] == '#' && (size_t)n1 == strlen(t1), "empty format: header comment only, got %d", n1);
+    CHECK(strstr(t1, "\nv1 ") == NULL, "an empty layout has override lines");
+
+    for (k = 0; k < 3; k++) {
+        zi = zone_by_id(ids_pad[k]);
+        geom_of(zi, pre_pad[k]);
+        xbox_ios_touch_zone_set_geom(zi, 0.30f + 0.1234567f * (float)k, 0.40f + 0.0777777f * (float)k,
+                                     0.04f + 0.0111111f * (float)k, 0.09f + 0.0222222f * (float)k);
+        geom_of(zi, want_pad[k]);
+    }
+    xbox_ios_touch_set_layout(1);
+    for (k = 0; k < 3; k++) {
+        zi = zone_by_id(ids_drv[k]);
+        geom_of(zi, pre_drv[k]);
+        xbox_ios_touch_zone_set_geom(zi, 0.35f + 0.0987654f * (float)k, 0.45f + 0.0666666f * (float)k,
+                                     0.05f + 0.0123456f * (float)k, 0.10f + 0.0212121f * (float)k);
+        geom_of(zi, want_drv[k]);
+    }
+    n1 = xbox_ios_touch_layout_format(t1, sizeof t1);
+    CHECK(n1 > 0 && (size_t)n1 == strlen(t1), "format length %d vs strlen %zu", n1, strlen(t1));
+    {
+        int lines = 0;
+        const char *p = t1;
+        while ((p = strstr(p, "\nv1 ")) != NULL) {
+            lines++;
+            p++;
+        }
+        CHECK(lines == 6, "%d override lines, want 6", lines);
+        CHECK(strstr(t1, "v1 pad 1 ") && strstr(t1, "v1 drive 12 "), "expected lines missing");
+        CHECK(strstr(t1, "v1 pad 1 ") < strstr(t1, "v1 pad 3 ") && strstr(t1, "v1 pad 8 ") < strstr(t1, "v1 drive 4 "),
+              "lines are not PAD first, ids ascending");
+    }
+
+    /* Wipe everything, check it is gone, parse it back. */
+    xbox_ios_touch_layout_reset(0);
+    xbox_ios_touch_layout_reset(1);
+    zi = zone_by_id(ids_drv[0]);
+    geom_of(zi, g);
+    CHECK(near4(g[0], pre_drv[0][0]) && near4(g[1], pre_drv[0][1]), "setup: reset did not clear");
+    applied = xbox_ios_touch_layout_parse(t1);
+    CHECK(applied == 6, "parse applied %d lines, want 6", applied);
+    for (k = 0; k < 3; k++) {
+        zi = zone_by_id(ids_drv[k]);
+        geom_of(zi, g);
+        CHECK(near4(g[0], want_drv[k][0]) && near4(g[1], want_drv[k][1]) &&
+              near4(g[2], want_drv[k][2]) && near4(g[3], want_drv[k][3]),
+              "DRIVE id %d: %.4f,%.4f,%.4f,%.4f want %.4f,%.4f,%.4f,%.4f", ids_drv[k], g[0], g[1], g[2], g[3],
+              want_drv[k][0], want_drv[k][1], want_drv[k][2], want_drv[k][3]);
+    }
+    xbox_ios_touch_set_layout(0);
+    for (k = 0; k < 3; k++) {
+        zi = zone_by_id(ids_pad[k]);
+        geom_of(zi, g);
+        CHECK(near4(g[0], want_pad[k][0]) && near4(g[1], want_pad[k][1]) &&
+              near4(g[2], want_pad[k][2]) && near4(g[3], want_pad[k][3]),
+              "PAD id %d: %.4f,%.4f,%.4f,%.4f want %.4f,%.4f,%.4f,%.4f", ids_pad[k], g[0], g[1], g[2], g[3],
+              want_pad[k][0], want_pad[k][1], want_pad[k][2], want_pad[k][3]);
+    }
+    n2 = xbox_ios_touch_layout_format(t2, sizeof t2);
+    CHECK(n2 == n1 && strcmp(t1, t2) == 0, "format after parse differs:\n%s---\n%s", t1, t2);
+
+    /* parse REPLACES: a text with one line leaves exactly that one. */
+    CHECK(xbox_ios_touch_layout_parse("v1 pad 3 0.5 0.5 0.05 0.1\n") == 1, "single-line parse");
+    n2 = xbox_ios_touch_layout_format(t2, sizeof t2);
+    CHECK(strstr(t2, "v1 pad 3 ") && !strstr(t2, "v1 pad 8 ") && !strstr(t2, "v1 drive"),
+          "parse did not replace the old overrides:\n%s", t2);
+    zi = zone_by_id(ids_pad[0]);
+    geom_of(zi, g);
+    CHECK(near4(g[0], pre_pad[0][0]) && near4(g[1], pre_pad[0][1]), "an override outlived a replacing parse");
+
+    /* Format into small buffers: no overflow, NUL, snprintf length. */
+    {
+        char tiny[8];
+        char guard[2][16];
+        int full;
+        xbox_ios_touch_layout_parse(t1);
+        full = xbox_ios_touch_layout_format(NULL, 0);
+        CHECK(full == n1, "format(NULL,0) = %d, want %d", full, n1);
+        memset(tiny, 'x', sizeof tiny);
+        n2 = xbox_ios_touch_layout_format(tiny, 0);
+        CHECK(n2 == n1 && tiny[0] == 'x', "format(buf,0) wrote or returned %d", n2);
+        n2 = xbox_ios_touch_layout_format(tiny, sizeof tiny);
+        CHECK(n2 == n1 && tiny[sizeof tiny - 1] == 0 && strlen(tiny) == sizeof tiny - 1 &&
+              strncmp(tiny, t1, sizeof tiny - 1) == 0, "truncated format: len %d, text \"%s\"", n2, tiny);
+        memset(guard, 0x7E, sizeof guard);
+        n2 = xbox_ios_touch_layout_format(guard[0], 1);
+        CHECK(n2 == n1 && guard[0][0] == 0 && guard[0][1] == 0x7E, "format(buf,1) not just a NUL");
+    }
+    reset();
+}
+
+/* 21f. parse ignores garbage, unknown ids / layouts / versions, non-finite
+ * numbers, accepts CRLF and clamps. */
+static void t_geom_parse(void)
+{
+    static const char text[] =
+        "# a comment line\n"
+        "garbage\n"
+        "\n"
+        "v1 pad 3 0.5 0.5 0.05 0.1\n"            /* ok */
+        "v1 pad 99 0.5 0.5 0.05 0.1\n"           /* unknown id */
+        "v1 xbox 3 0.5 0.5 0.05 0.1\n"           /* unknown layout */
+        "v2 pad 4 0.5 0.5 0.05 0.1\n"            /* unknown version */
+        "v1 drive 12 2.0 -3 9 9\n"               /* ok, clamped */
+        "v1 pad 4 nan 0.5 0.05 0.1\n"            /* not finite */
+        "v1 pad 5 0.5 inf 0.05 0.1\n"            /* not finite */
+        "v1 pad 6 0.5 0.5\n"                     /* short */
+        "v1 drive 4 abc 0.5 0.05 0.1\n"          /* not a number */
+        "  v1 pad 5 0.3 0.3 0.04 0.09\r\n"       /* ok: CRLF, leading blanks */
+        "v1 pad 11 0.5 0.5 0.05 0.1";            /* ok: no final newline */
+    int applied, zi;
+    float g[4];
+    char out[1024];
+
+    reset();
+    applied = xbox_ios_touch_layout_parse(text);
+    CHECK(applied == 4, "parse applied %d lines, want 4", applied);
+    zi = zone_by_id(3);
+    geom_of(zi, g);
+    CHECK(near4(g[0], 0.5f) && near4(g[1], 0.5f) && near4(g[2], 0.05f) && near4(g[3], 0.1f), "pad 3 wrong");
+    zi = zone_by_id(5);
+    geom_of(zi, g);
+    CHECK(near4(g[0], 0.3f) && near4(g[1], 0.3f) && near4(g[2], 0.04f) && near4(g[3], 0.09f), "pad 5 (CRLF) wrong");
+    zi = zone_by_id(4);
+    geom_of(zi, g);
+    {
+        float preset_cx = zone(zi)->cx;
+        CHECK(near4(g[0], preset_cx), "pad 4 moved by a line that was garbage");
+    }
+    xbox_ios_touch_set_layout(1);
+    zi = zone_by_id(12);
+    if (zi >= 0) {
+        geom_of(zi, g);
+        CHECK(near4(g[2], 0.45f) && near4(g[3], 0.19f) && near4(g[0], 0.55f) && near4(g[1], 0.19f),
+              "drive 12 not clamped: %.4f,%.4f,%.4f,%.4f", g[0], g[1], g[2], g[3]);
+    } else {
+        record_fail(__LINE__, "no zone with id 12 in DRIVE");
+    }
+    xbox_ios_touch_set_layout(0);
+
+    /* Our own header line is a comment. */
+    xbox_ios_touch_layout_format(out, sizeof out);
+    CHECK(xbox_ios_touch_layout_parse(out) == 4, "the formatted text does not parse back to 4 lines");
+
+    /* NULL changes nothing; "" clears everything. */
+    CHECK(xbox_ios_touch_layout_parse(NULL) == 0, "parse(NULL) != 0");
+    xbox_ios_touch_layout_format(out, sizeof out);
+    CHECK(strstr(out, "v1 pad 3 ") != NULL, "parse(NULL) dropped the overrides");
+    CHECK(xbox_ios_touch_layout_parse("") == 0, "parse(\"\") != 0");
+    xbox_ios_touch_layout_format(out, sizeof out);
+    CHECK(strstr(out, "\nv1 ") == NULL, "parse(\"\") left overrides");
+    zi = zone_by_id(3);
+    geom_of(zi, g);
+    CHECK(near4(g[0], zone(zi)->cx), "zone 3 table and geom disagree after a clear");
+
+    /* A line longer than the parser's buffer is garbage, not a crash. */
+    {
+        char *big = malloc(100100);
+        if (big) {
+            memset(big, 'a', 99990);
+            memcpy(big + 99990, "\nv1 pad 3 0.5 0.5 0.05 0.1\n", 28);
+            CHECK(xbox_ios_touch_layout_parse(big) == 1, "long garbage line broke the parser");
+            free(big);
+        }
+    }
+    reset();
+}
+
+/* 21g. An overridden zone stays on screen at the largest size; the strip keeps
+ * its width; the classic DRIVE table takes the DRIVE overrides by id. */
+static void t_geom_on_screen(void)
+{
+    int zi, si;
+    float g[4], classic7[4];
+    const XBOX_IOS_TOUCH_ZONE *z;
+
+    reset();
+    /* The classic DRIVE preset of id 7, read now (never hard-coded). */
+    xbox_ios_touch_set_layout(1);
+    xbox_ios_touch_set_drive_classic(1);
+    geom_of(zone_by_id(7), classic7);
+    xbox_ios_touch_set_drive_classic(0);
+    xbox_ios_touch_set_layout(0);
+    zi = zone_by_label("A");
+    if (zi < 0)
+        return;
+    geom_of(zi, g);
+    xbox_ios_touch_zone_set_geom(zi, 0.0f, 1.0f, g[2], g[3]);   /* corner, clamped on base extents */
+    xbox_ios_touch_set_scale(1.5f);
+    z = zone(zi);
+    CHECK(z && z->cx - z->rx >= -1e-6f && z->cx + z->rx <= 1.0f + 1e-6f &&
+          z->cy - z->ry >= -1e-6f && z->cy + z->ry <= 1.0f + 1e-6f,
+          "overridden zone leaves the screen at 1.5x: c %.4f,%.4f r %.4f,%.4f",
+          z ? z->cx : -1.0f, z ? z->cy : -1.0f, z ? z->rx : -1.0f, z ? z->ry : -1.0f);
+    CHECK(z && near4(z->rx, g[2] * 1.5f), "radius at 1.5x is %.4f", z ? z->rx : -1.0f);
+    geom_of(zi, g);
+    CHECK(near4(g[0], g[2]) && near4(g[1], 1.0f - g[3]), "base centre was moved by the scale");
+
+    /* Strip: its width does not follow the size setting, its centre is its own. */
+    xbox_ios_touch_set_scale(1.0f);
+    xbox_ios_touch_set_layout(1);
+    si = zone_by_kind(XBOX_IOS_ZONE_STEER);
+    if (si >= 0) {
+        xbox_ios_touch_zone_set_geom(si, 0.45f, 0.50f, 0.25f, 0.15f);
+        xbox_ios_touch_set_scale(1.5f);
+        z = zone(zone_by_kind(XBOX_IOS_ZONE_STEER));
+        CHECK(z && near4(z->rx, 0.25f) && near4(z->cx, 0.45f) && near4(z->cy, 0.50f) && near4(z->ry, 0.19f),
+              "strip at 1.5x: c %.4f,%.4f r %.4f,%.4f", z ? z->cx : -1.0f, z ? z->cy : -1.0f,
+              z ? z->rx : -1.0f, z ? z->ry : -1.0f);
+        xbox_ios_touch_set_scale(1.0f);
+        /* A finger on the new strip steers; the old preset spot no longer does. */
+        {
+            XBOX_INPUT_STATE s;
+            fdown(1, 0.45f + 0.20f, 0.50f);
+            s = rd();
+            CHECK(s.Gamepad.sThumbLX > 5000, "strip finger right of centre: LX=%d", s.Gamepad.sThumbLX);
+            fup(1);
+        }
+    }
+
+    /* Classic DRIVE: ids 1..11 take the same overrides. */
+    reset();
+    xbox_ios_touch_set_layout(1);
+    zi = zone_by_id(7);
+    xbox_ios_touch_zone_set_geom(zi, 0.60f, 0.60f, 0.05f, 0.10f);
+    xbox_ios_touch_set_drive_classic(1);
+    zi = zone_by_id(7);
+    geom_of(zi, g);
+    CHECK(zi >= 0 && near4(g[0], 0.60f) && near4(g[1], 0.60f), "classic DRIVE ignores the DRIVE override");
+    xbox_ios_touch_layout_reset(1);
+    geom_of(zone_by_id(7), g);
+    CHECK(near4(g[0], classic7[0]) && near4(g[1], classic7[1]) && near4(g[2], classic7[2]),
+          "classic preset not back after reset: %.4f,%.4f", g[0], g[1]);
+    reset();
+}
+
+/* ------------------------------------------------------------------ */
 
 int main(void)
 {
@@ -2326,6 +2807,13 @@ int main(void)
     run_case("18   Activity hook: every tracked finger down, not moves / repeats / off", t_activity_hook, NULL);
     run_case("19   DRIVE geometry on 852x393: no overlap, off the island, sizes", t_drive_geometry, NULL);
     run_case("20   NFSU2_DRIVE_CLASSIC / set_drive_classic: the old table", t_drive_classic, NULL);
+    run_case("21   Layout editor: set_geom moves the hit area (scale applied)", t_geom_move, NULL);
+    run_case("21b  Layout editor: clamps, bad indices, NaN, strip limits", t_geom_clamp, NULL);
+    run_case("21c  Layout editor: overrides are per layout; reset restores the preset", t_geom_layouts, NULL);
+    run_case("21d  Layout editor: layout_gen bumps on change / reset / parse only", t_geom_gen, NULL);
+    run_case("21e  Layout editor: format -> parse round trip, replace, small buffers", t_geom_roundtrip, NULL);
+    run_case("21f  Layout editor: parse tolerates garbage, CRLF, NULL, empty", t_geom_parse, NULL);
+    run_case("21g  Layout editor: on screen at 1.5x, strip width, classic DRIVE", t_geom_on_screen, NULL);
 
     reset();
     SDL_Quit();
