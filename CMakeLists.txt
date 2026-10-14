@@ -46,6 +46,7 @@ set(GAME_SOURCES
     src/text_patch.c
     src/movie_crop.c
 src/nic.c
+    src/nfsu2_state.c
 )
 
 if(IOS)

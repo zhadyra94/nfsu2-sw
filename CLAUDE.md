@@ -858,6 +858,12 @@ only, never files): `../IOS_IMPROVEMENT_MAP.md`.
   the game dir's UDATA. Identity check in main.c: title ID 0x4541005A or a
   clean fatal; SHA-256 mismatch only warns. Linux: boots NFSU2.iso to the
   same menus as the folder; NFSU1.iso refused; PC CD falls back to folder.
+- **Auto Pad/Drive (experimental, `NFSU2_TOUCH_AUTO`):** `src/nfsu2_state.c`
+  reads gameflow 0x428E34, mode 0x3E5A64, flag 0x3FBCFC from guest memory;
+  the overlay polls in the 0.5 s tick, 2 equal polls switch, a short -1
+  run keeps the layout, 6 in a row (~3 s, e.g. results screen) fall back to
+  Pad (flyby stays Pad), never writes `NFSU2_TOUCH_LAYOUT`. Free roam and quit-to-menu are
+  not validated. Test: `tools/tests/run_state_test.sh`.
 - **Input:** touch layer `xinput_ios.c` (PAD preset unchanged, DRIVE preset
   with GAS/BRAKE pedals, size 0.7-1.5, layout switch clears fingers),
   overlay `ios_touch_overlay.m` draws from the same table; touch off really

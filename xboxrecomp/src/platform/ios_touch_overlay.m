@@ -74,6 +74,11 @@ extern void xbox_input_set_keyboard(int on);
 /* ios_keyboard.m */
 extern void ios_keyboard_install(void);
 
+/* src/nfsu2_state.c: race state from guest memory (Auto Pad/Drive). */
+extern int nfsu2_in_race(void);
+extern int nfsu2_state_words(unsigned *gameflow, unsigned *mode, unsigned *flag);
+extern int nfsu2_auto_layout_step(int *state, int reading);
+
 /* Settings (Documents/nfsu2_env.txt, loaded and saved in main.c). */
 extern float nfsu2_cfg_overlay_alpha(void);
 extern int   nfsu2_cfg_show_fps(void);
@@ -92,6 +97,8 @@ static UIButton *s_gear;             /* hidden while the layout editor runs */
 static void panel_hide(void);
 static void touch_hook_main(void);   /* haptic tick if the Haptics switch is on */
 static NSString *ns(const char *c);
+static int s_auto_on = 0;            /* the panel's Auto Pad/Drive switch (main thread) */
+static int s_auto_state = 0;         /* debounce state of nfsu2_auto_layout_step */
 
 /* ── Look: colours, text and icon images, path helpers ─────────── */
 
@@ -1113,6 +1120,7 @@ static void path_add_rect(UIBezierPath *p, CGRect r)
 - (void)applyVisibility:(BOOL)vis;
 - (BOOL)syncControls;
 - (void)beginEdit;
+- (BOOL)isEditing;
 @property (nonatomic, assign) BOOL shapesHidden;   /* touch off, or pad/keyboard on */
 @end
 
@@ -1394,6 +1402,11 @@ static void path_add_rect(UIBezierPath *p, CGRect r)
     if ([self syncSticks])
         active = YES;
     return active;
+}
+
+- (BOOL)isEditing
+{
+    return _editing;
 }
 
 - (void)applyVisibility:(BOOL)vis
@@ -2006,7 +2019,7 @@ enum { IK_HEAD, IK_SWITCH, IK_SLIDER, IK_SEG, IK_BUTTON };
 enum { ACT_NONE, ACT_FPS, ACT_TOUCH, ACT_LAYOUT, ACT_SCALE, ACT_ALPHA,
        ACT_HAPTICS, ACT_TILT, ACT_TILTSENS, ACT_KEYBOARD, ACT_RUMBLE,
        ACT_ANALOG, ACT_STEER, ACT_STEERSENS, ACT_TILTCENTRE, ACT_EDITLAYOUT,
-       ACT_CAPTIONS };
+       ACT_CAPTIONS, ACT_AUTOLAYOUT };
 
 typedef struct {
     int         kind;
@@ -2019,6 +2032,7 @@ typedef struct {
     const char *labels, *values;     /* segmented: '|' separated */
     const char *def_val;             /* segmented: value when unset */
     int         act;                 /* live effect, ACT_* */
+    const char *note;                /* switch: small grey line under the row, or NULL */
 } PanelItem;
 
 static const PanelItem s_items[] = {
@@ -2028,6 +2042,11 @@ static const PanelItem s_items[] = {
     { .kind = IK_SEG, .title = "Layout", .key = "NFSU2_TOUCH_LAYOUT",
       .labels = "Pad|Drive", .values = "pad|drive", .def_val = "pad",
       .act = ACT_LAYOUT },
+    /* The manual Layout above stays the saved choice; the auto switch is
+     * transient (never written to NFSU2_TOUCH_LAYOUT). */
+    { .kind = IK_SWITCH, .title = "Auto Pad/Drive (experimental)", .key = "NFSU2_TOUCH_AUTO",
+      .on = "1", .off = "0", .def_on = 0, .act = ACT_AUTOLAYOUT,
+      .note = "Drive while racing, Pad in menus; may misread free roam" },
     { .kind = IK_SLIDER, .title = "Size", .key = "NFSU2_TOUCH_SCALE",
       .lo = 0.7f, .hi = 1.5f, .def = 1.0f, .decimals = 2, .act = ACT_SCALE },
     { .kind = IK_SLIDER, .title = "Opacity", .key = "NFSU2_OVERLAY_ALPHA",
@@ -2137,6 +2156,13 @@ static float item_slider_value(const PanelItem *it)
     return f < it->lo ? it->lo : f > it->hi ? it->hi : f;
 }
 
+/* The saved manual layout (Layout control): 1 = Drive. */
+static int manual_layout_drive(void)
+{
+    const char *v = nfsu2_cfg_get("NFSU2_TOUCH_LAYOUT");
+    return (v && strcasecmp(v, "drive") == 0) ? 1 : 0;
+}
+
 /* Apply a setting's live effect. on / fv / sv carry the new value. */
 static void apply_live(int act, int on, float fv, const char *sv)
 {
@@ -2150,8 +2176,25 @@ static void apply_live(int act, int on, float fv, const char *sv)
         refresh_shapes();
         break;
     case ACT_LAYOUT:
+        /* With Auto on the live layout belongs to the race state; the stored
+         * choice is what comes back when Auto goes off. */
+        if (s_auto_on)
+            break;
         xbox_ios_touch_set_layout(sv && strcasecmp(sv, "drive") == 0);
         (void)[s_ov syncControls];     /* new layout generation: relays the layers */
+        break;
+    case ACT_AUTOLAYOUT:
+        s_auto_on = on ? 1 : 0;
+        s_auto_state = 0;
+        if (!on) {                     /* back to the manual choice */
+            if (xbox_ios_touch_get_layout() != manual_layout_drive()) {
+                xbox_ios_touch_set_layout(manual_layout_drive());
+                (void)[s_ov syncControls];
+            }
+            fprintf(stderr, "nfsu2: auto layout off\n");
+        } else {
+            fprintf(stderr, "nfsu2: auto layout on\n");
+        }
         break;
     case ACT_SCALE:
         xbox_ios_touch_set_scale(fv);
@@ -2253,6 +2296,11 @@ static CGFloat panel_add_item(int idx, CGFloat y, CGFloat w)
         [sw addTarget:s_target action:@selector(switchChanged:)
                     forControlEvents:UIControlEventValueChanged];
         [s_panel addSubview:sw];
+        if (it->note) {
+            [s_panel addSubview:panel_label(ns(it->note), CGRectMake(12, y + 34, w - 24, 16), 11,
+                                            [UIColor lightGrayColor], NO)];
+            return y + 54;
+        }
         return y + 36;
     }
     if (it->kind == IK_SLIDER) {
@@ -2396,6 +2444,8 @@ static void panel_hide(void)
 
 /* UIControl targets: NSObject categories can't reach our statics, so route
  * through a small helper object. */
+static void auto_layout_poll(void);
+
 @interface Nfsu2GearTarget : NSObject
 - (void)fpsTick;
 @end
@@ -2511,6 +2561,7 @@ static void panel_hide(void)
         s_last_thermal = ts;
         fprintf(stderr, "nfsu2: thermal state %ld\n", (long)ts);
     }
+    auto_layout_poll();
     if (!s_fps || s_fps.hidden)
         return;
     int x10 = nv2a_vk_fps_x10();
@@ -2520,6 +2571,30 @@ static void panel_hide(void)
         s_fps.text = [NSString stringWithFormat:@"%d.%d fps", x10 / 10, x10 % 10];
 }
 @end
+
+/* Auto Pad/Drive: one poll per fpsTick (0.5 s, main thread). The debounce
+ * runs on every poll; the layout is changed only when nothing else owns the
+ * controls (editor closed, touch on, no pad/keyboard). Never written to the
+ * settings file. */
+static void auto_layout_poll(void)
+{
+    int target, cur;
+    unsigned gf = 0, mode = 0, flag = 0;
+
+    if (!s_auto_on)
+        return;
+    target = nfsu2_auto_layout_step(&s_auto_state, nfsu2_in_race());
+    if (target < 0 || !s_ov || [s_ov isEditing] || !s_user_touch_on || s_dev_hidden)
+        return;
+    cur = xbox_ios_touch_get_layout() ? 1 : 0;
+    if (cur == target)
+        return;
+    (void)nfsu2_state_words(&gf, &mode, &flag);
+    xbox_ios_touch_set_layout(target);
+    (void)[s_ov syncControls];
+    fprintf(stderr, "nfsu2: auto layout -> %s (gameflow %u, mode %u, flag %u)\n",
+            target ? "drive" : "pad", gf, mode, flag);
+}
 
 static UIEdgeInsets s_safe;
 
@@ -2638,6 +2713,12 @@ void ios_touch_overlay_install(void *uiwindow)
                     s_captions_on = item_is_on(&s_items[ci]);
         }
         refresh_shapes();
+        {
+            int ai;
+            for (ai = 0; ai < ITEM_COUNT; ai++)
+                if (s_items[ai].act == ACT_AUTOLAYOUT)
+                    s_auto_on = item_is_on(&s_items[ai]);
+        }
         v = nfsu2_cfg_get("NFSU2_TILT_SENS");
         if (v && *v) {
             float f = (float)atof(v);
