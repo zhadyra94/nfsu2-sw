@@ -25,6 +25,9 @@
 #include <string.h>
 #include <errno.h>
 #include <signal.h>
+#ifdef NFSU2_IOS
+#include <sys/stat.h>
+#endif
 
 #include <xbox/xboxrecomp.h>
 
@@ -71,6 +74,7 @@ extern void xbox_path_init(const char *game_dir, const char *save_dir);
 
 /* Disc image backend (xboxrecomp/src/kernel/xbox_xiso.c). */
 extern int xiso_autodetect(const char *game_dir);
+extern int xiso_find_image(const char *dir, char *out, size_t n);
 extern void xiso_unmount(void);
 extern void *xiso_read_file(const char *rel, size_t *size);
 extern const char *xiso_image_path(void);
@@ -161,7 +165,7 @@ const char *SDL_GetError(void);
 int SDL_WaitEvent(void *event);
 void SDL_RaiseWindow(void *window);
 /* Settings: Documents/nfsu2_env.txt, KEY=VALUE (Switch nfsu2x_env.txt format). */
-static struct { char key[64]; char val[64]; } s_cfg[64];   /* 64: cfg_load
+static struct { char key[64]; char val[64]; unsigned char dirty; } s_cfg[64];   /* 64: cfg_load
  * reads up to 64 lines; a 17th line used to overflow the 16-entry array.
  * key[64]: MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS is 36 characters and a
  * 32-byte key exported a truncated name MoltenVK never reads. */
@@ -371,6 +375,9 @@ int nfsu2_cfg_set(const char *key, const char *val)
         snprintf(s_cfg[idx].key, sizeof s_cfg[0].key, "%s", key);
     }
     snprintf(s_cfg[idx].val, sizeof s_cfg[0].val, "%s", val);
+    /* Changed since boot: nfsu2_cfg_export_changed() exports it, even when
+     * the file write below fails (the value still applies to this boot). */
+    s_cfg[idx].dirty = 1;
 
     if (!s_cfg_path[0]) {
         fprintf(stderr, "nfsu2: setting %s=%s not saved (no settings path)\n", key, val);
@@ -382,6 +389,27 @@ int nfsu2_cfg_set(const char *key, const char *val)
     }
     fprintf(stderr, "nfsu2: setting %s=%s saved\n", key, val);
     return 1;
+}
+
+/* Export the keys nfsu2_cfg_set changed since boot (or since the last call)
+ * with overwrite, then clear their flags. Same contract as cfg_load's bridge
+ * (empty values too: SDL_AUDIO_CATEGORY "on" is ""), but overwriting, so a
+ * launch-screen choice beats the value cfg_load exported. setenv may
+ * reallocate environ: main() calls this on the main thread before the first
+ * thread exists, and nowhere else. */
+void nfsu2_cfg_export_changed(void)
+{
+    int i, n = 0;
+
+    for (i = 0; i < s_cfg_n; i++) {
+        if (!s_cfg[i].dirty)
+            continue;
+        s_cfg[i].dirty = 0;
+        if (setenv(s_cfg[i].key, s_cfg[i].val, 1) == 0)
+            n++;
+    }
+    if (n)
+        fprintf(stderr, "nfsu2: %d launch-screen setting(s) exported\n", n);
 }
 
 float nfsu2_cfg_overlay_alpha(void)
@@ -492,6 +520,93 @@ static const char *ios_save_dir(void)
     if (!nfsu2_ios_save[0])
         NSTemporaryDirectory_path("Documents");
     return nfsu2_ios_save;
+}
+
+/* Folders people copy the game into, probed in this order after the plain
+ * game dir. Shared with game_main so the launch screen and the boot agree. */
+static const char *const nfsu2_ios_alts[] = { "NFSU2-data", "game", "nfsu2", "NFSU2" };
+
+/* Build label for the launch screen. */
+const char *nfsu2_build_label(void)
+{
+    return "v23 " __DATE__;
+}
+
+/* Is the launch screen on? NFSU2_LAUNCHER, default on; an odd value follows
+ * the in-game panel's rule (0/n/f off, 1/y/t on, else the default). */
+static int nfsu2_launcher_enabled(void)
+{
+    const char *v = nfsu2_cfg_get("NFSU2_LAUNCHER");
+
+    if (!v || !v[0])
+        return 1;
+    if (*v == '0' || *v == 'n' || *v == 'N' || *v == 'f' || *v == 'F')
+        return 0;
+    return 1;
+}
+
+/* What game_main will find, decided WITHOUT mounting or reading anything, so
+ * the launch screen can run on the main thread before the window exists.
+ * Mirrors game_main's resolution in the same order (game_dir at lines
+ * 1155-1185, xiso_autodetect(game_dir) at line 1196; keep them in step):
+ *   1. NFSU2_GAME_DIR, else Documents                    (game_main: game_dir)
+ *   2. <dir>/default.xbe; if absent, the first of nfsu2_ios_alts whose
+ *      default.xbe exists becomes the dir; if none does the dir stays as is
+ *   3. xiso_find_image(dir): NFSU2_ISO=0 off, NFSU2_ISO=<path> (beats a
+ *      folder, as xiso_autodetect always did), no default.xbe -> the first
+ *      *.iso in sorted order. Found and a regular file -> image.
+ *   4. else default.xbe present -> folder
+ *   5. else none
+ * Returns 1 folder, 2 image, 0 none; desc gets "folder: <path>",
+ * "image: <name> (<size>)" or "none". An image that exists but fails to
+ * mount at boot cannot be seen from here (nothing is opened). Local buffers
+ * only: nfsu2_ios_gamedir stays for game_main. */
+int nfsu2_game_data_status(char *desc, size_t n)
+{
+    char dir[1100], probe[1200], img[1100];
+    const char *gd = getenv("NFSU2_GAME_DIR");
+    int found = 0;
+    size_t i;
+    FILE *f;
+    struct stat st;
+
+    if (!desc || n == 0)
+        return 0;
+    desc[0] = 0;
+    if (!gd || !gd[0])
+        gd = NFSU2_DEFAULT_GAME_DIR;
+    snprintf(dir, sizeof dir, "%s", gd);
+
+    snprintf(probe, sizeof probe, "%s/default.xbe", dir);
+    f = fopen(probe, "rb");
+    if (f) { fclose(f); found = 1; }
+    for (i = 0; !found && i < sizeof nfsu2_ios_alts / sizeof nfsu2_ios_alts[0]; i++) {
+        char alt[1100];
+
+        snprintf(alt, sizeof alt, "%s/%s", dir, nfsu2_ios_alts[i]);
+        snprintf(probe, sizeof probe, "%s/default.xbe", alt);
+        f = fopen(probe, "rb");
+        if (f) {
+            fclose(f);
+            snprintf(dir, sizeof dir, "%s", alt);
+            found = 1;
+        }
+    }
+
+    if (xiso_find_image(dir, img, sizeof img) &&
+        stat(img, &st) == 0 && S_ISREG(st.st_mode)) {
+        const char *base = strrchr(img, '/');
+        double gb = (double)st.st_size / 1e9;
+
+        snprintf(desc, n, "image: %s (%.2f GB)", base ? base + 1 : img, gb);
+        return 2;
+    }
+    if (found) {
+        snprintf(desc, n, "folder: %s", dir);
+        return 1;
+    }
+    snprintf(desc, n, "none");
+    return 0;
 }
 #endif
 
@@ -814,14 +929,33 @@ int main(int argc, char **argv)
             char cfgp[1100];
             snprintf(cfgp, sizeof cfgp, "%s/nfsu2_env.txt", gd && gd[0] ? gd : docs);
             cfg_load(cfgp);
-            /* Default render scale 2 on iOS (A17 has the fill rate;
-             * 480p upscaled looks soft). cfg_load's setenv bridge
-             * ran first, so an explicit key always wins. */
-            if (!getenv("RECOMP_GL_SCALE"))
-                setenv("RECOMP_GL_SCALE", "2", 0);
             fprintf(stderr, "nfsu2: cwd %s (caches persist)\n",
                     gd && gd[0] ? gd : docs);
         }
+    }
+    {
+        /* Launch screen: AFTER cfg_load, BEFORE the defaults below, the
+         * window and every thread. It runs on this thread only, writes its
+         * choices with nfsu2_cfg_set (table + file, no setenv) and returns
+         * on Play; the changed keys are then exported once with overwrite
+         * (safe: no other thread exists yet). Any failure inside the
+         * launcher is logged there and we go straight on to the game.
+         * NFSU2_LAUNCHER=0 skips it. */
+        extern int ios_launcher_run(void);
+        if (nfsu2_launcher_enabled()) {
+            fprintf(stderr, "nfsu2: launch screen %s\n",
+                    ios_launcher_run() ? "done (Play)" : "not shown");
+            nfsu2_cfg_export_changed();
+        } else {
+            fprintf(stderr, "nfsu2: launch screen off (NFSU2_LAUNCHER=0)\n");
+        }
+    }
+    {
+        /* Default render scale 2 on iOS (A17 has the fill rate; 480p
+         * upscaled looks soft). cfg_load's bridge and the launch screen's
+         * export ran first, so an explicit key always wins. */
+        if (!getenv("RECOMP_GL_SCALE"))
+            setenv("RECOMP_GL_SCALE", "2", 0);
         /* Async queue submits: the default (1) encodes inside
          * vkQueueSubmit on the calling thread, which then waits for the
          * CAMetalLayer drawable. Overwrite 0: a key in nfsu2_env.txt
@@ -1025,7 +1159,6 @@ static int game_main(void)
     /* Files pushed from a PC often land one level deeper than expected.
      * Before failing, probe the layouts people actually produce. */
     {
-        static const char *alts[] = { "NFSU2-data", "game", "nfsu2", "NFSU2" };
         char probe[1100];
         FILE *f;
         size_t i;
@@ -1034,9 +1167,9 @@ static int game_main(void)
         snprintf(probe, sizeof probe, "%s/default.xbe", game_dir);
         f = fopen(probe, "rb");
         if (f) { fclose(f); found = 1; }
-        for (i = 0; !found && i < sizeof alts / sizeof alts[0]; i++) {
+        for (i = 0; !found && i < sizeof nfsu2_ios_alts / sizeof nfsu2_ios_alts[0]; i++) {
             snprintf(nfsu2_ios_gamedir, sizeof nfsu2_ios_gamedir,
-                     "%s/%s", game_dir, alts[i]);
+                     "%s/%s", game_dir, nfsu2_ios_alts[i]);
             snprintf(probe, sizeof probe, "%s/default.xbe", nfsu2_ios_gamedir);
             f = fopen(probe, "rb");
             if (f) {

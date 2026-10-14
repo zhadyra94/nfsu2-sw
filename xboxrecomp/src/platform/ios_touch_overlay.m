@@ -2106,6 +2106,9 @@ static const PanelItem s_items[] = {
      * splitting render passes; default off until measured on device. */
     { .kind = IK_SWITCH, .title = "Hoist texture uploads",
       .key = "RECOMP_VK_HOIST", .on = "1", .off = "0", .def_on = 0 },
+    /* ios_launcher.m: the screen before boot (main.c reads the key). */
+    { .kind = IK_SWITCH, .title = "Show launch screen next time",
+      .key = "NFSU2_LAUNCHER", .on = "1", .off = "0", .def_on = 1 },
 };
 #define ITEM_COUNT ((int)(sizeof s_items / sizeof s_items[0]))
 

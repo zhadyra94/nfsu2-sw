@@ -41,6 +41,12 @@ typedef NSUInteger UIViewAutoresizing;
 #define UIViewAutoresizingFlexibleWidth 2
 #define UIViewAutoresizingFlexibleHeight 16
 #define NSRunLoopCommonModes ((NSString*)0)
+#define NSDefaultRunLoopMode ((NSString*)0)
+typedef NSUInteger UIInterfaceOrientationMask;
+#define UIInterfaceOrientationMaskLandscape 24
+#define UIWindowLevelNormal 0.0
+#define UISceneActivationStateForegroundActive 0
+#define UISceneActivationStateForegroundInactive 1
 #define NSTextAlignmentRight 2
 #define NSTextAlignmentCenter 1
 #define UIGestureRecognizerStateBegan 1
@@ -92,6 +98,8 @@ void dispatch_async(dispatch_queue_t, dispatch_block_t);
 - (NSUInteger)length;
 - (double)doubleValue;
 - (NSInteger)caseInsensitiveCompare:(NSString *)o;
+- (NSString *)uppercaseString;
+- (NSString *)stringByAppendingString:(NSString *)s;
 @end
 @interface NSArray : NSObject <NSFastEnumeration>
 - (NSUInteger)count; - (id)objectAtIndex:(NSUInteger)i;
@@ -113,9 +121,14 @@ NSArray *NSSearchPathForDirectoriesInDomains(NSUInteger dir, NSUInteger domain, 
 @interface NSThread : NSObject
 + (BOOL)isMainThread;
 @end
+@interface NSDate : NSObject
++ (instancetype)dateWithTimeIntervalSinceNow:(double)s;
+@end
 @interface NSRunLoop : NSObject
 + (NSRunLoop*)mainRunLoop; - (void)addTimer:(id)t forMode:(NSString*)m;
+- (BOOL)runMode:(NSString*)mode beforeDate:(NSDate*)d;
 @end
+@interface NSSet : NSObject <NSFastEnumeration> - (NSUInteger)count; @end
 @interface NSTimer : NSObject
 + (NSTimer*)timerWithTimeInterval:(double)i target:(id)t selector:(SEL)s userInfo:(id)u repeats:(BOOL)r;
 + (NSTimer*)scheduledTimerWithTimeInterval:(double)i target:(id)t selector:(SEL)s userInfo:(id)u repeats:(BOOL)r;
@@ -225,6 +238,7 @@ extern NSString *const NSKernAttributeName;
 @property (strong) UIColor *backgroundColor; @property (readonly) NSArray *subviews;
 @property UIViewAutoresizing autoresizingMask; @property NSInteger overrideUserInterfaceStyle;
 @property (readonly) UIEdgeInsets safeAreaInsets; @property CGFloat cornerRadius_unused;
+@property (nonatomic, copy) NSString *accessibilityLabel;
 - (UIView*)hitTest:(CGPoint)p withEvent:(UIEvent*)e; - (CGPoint)convertPoint:(CGPoint)p toView:(UIView*)v;
 - (void)layoutSubviews; - (void)addSubview:(UIView*)v; - (void)removeFromSuperview;
 - (void)bringSubviewToFront:(UIView*)v; - (UIView*)viewWithTag:(NSInteger)t;
@@ -236,7 +250,7 @@ extern NSString *const NSKernAttributeName;
 @property NSInteger textAlignment, numberOfLines; @property BOOL adjustsFontSizeToFitWidth; @property CGFloat minimumScaleFactor;
 @end
 @interface UIControl : UIView
-@property (getter=isEnabled) BOOL enabled;
+@property (getter=isEnabled) BOOL enabled; @property (readonly, getter=isTracking) BOOL tracking;
 - (void)addTarget:(id)t action:(SEL)a forControlEvents:(NSUInteger)e;
 @end
 @interface UISwitch : UIControl @property (getter=isOn) BOOL on; @end
@@ -248,16 +262,28 @@ extern NSString *const NSKernAttributeName;
 @end
 @interface UIButton : UIControl
 + (instancetype)buttonWithType:(NSInteger)t;
-- (void)setTitle:(NSString*)t forState:(NSInteger)s; - (void)setImage:(UIImage*)i forState:(NSInteger)s;
+- (void)setTitle:(NSString*)t forState:(NSInteger)s; - (void)setTitleColor:(UIColor*)c forState:(NSInteger)s; - (void)setImage:(UIImage*)i forState:(NSInteger)s;
 @property (readonly) UILabel *titleLabel; @property (strong) UIColor *tintColor;
 @end
 @interface UIScrollView : UIView
 @property CGSize contentSize; @property CGPoint contentOffset;
 @end
-@interface UIScene : NSObject @property (readonly) UIInterfaceOrientation interfaceOrientation; @end
+@interface UIScene : NSObject @property (readonly) UIInterfaceOrientation interfaceOrientation; @property (readonly) NSInteger activationState; @end
 @interface UIWindowScene : UIScene @property (readonly) UIInterfaceOrientation interfaceOrientation; @end
-@interface UIWindow : UIView @property (readonly) UIWindowScene *windowScene; @end
-@interface UIScreen : NSObject + (UIScreen*)mainScreen; @property (readonly) CGFloat scale; @end
+@interface UIViewController : NSObject
+@property (nonatomic, strong) UIView *view; @property NSInteger overrideUserInterfaceStyle;
+- (void)viewDidLoad; - (void)viewDidLayoutSubviews;
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations; - (BOOL)shouldAutorotate;
+@end
+@interface UIWindow : UIView
+@property (readonly) UIWindowScene *windowScene; @property CGFloat windowLevel;
+@property (nonatomic, strong) UIViewController *rootViewController;
+- (instancetype)initWithWindowScene:(UIWindowScene*)s; - (void)makeKeyAndVisible;
+@end
+@interface UIApplication : NSObject
++ (UIApplication*)sharedApplication; @property (readonly) NSSet *connectedScenes;
+@end
+@interface UIScreen : NSObject + (UIScreen*)mainScreen; @property (readonly) CGFloat scale; @property (readonly) CGRect bounds; @end
 @interface UIImpactFeedbackGenerator : NSObject
 - (instancetype)initWithStyle:(NSInteger)s; - (void)impactOccurred; - (void)prepare;
 @end

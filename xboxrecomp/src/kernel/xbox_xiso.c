@@ -30,6 +30,8 @@
 int  xiso_mount(const char *p) { (void)p; return 0; }
 void xiso_unmount(void) {}
 int  xiso_autodetect(const char *d) { (void)d; return 0; }
+int  xiso_find_image(const char *d, char *o, size_t n)
+{ (void)d; if (o && n) o[0] = 0; return 0; }
 int  xiso_active(void) { return 0; }
 const char *xiso_image_path(void) { return NULL; }
 const xiso_node *xiso_node_at(int i) { (void)i; return NULL; }
@@ -610,75 +612,91 @@ static int has_iso_suffix(const char *n)
     return n[0] != '.' && l > 4 && strcasecmp(n + l - 4, ".iso") == 0;
 }
 
-static int name_cmp(const void *a, const void *b)
+/* Sorted order of image names: case-insensitive, then exact (stable). */
+static int name_cmp(const char *a, const char *b)
 {
-    int c = strcasecmp(*(char *const *)a, *(char *const *)b);
-    return c ? c : strcmp(*(char *const *)a, *(char *const *)b);
+    int c = strcasecmp(a, b);
+    return c ? c : strcmp(a, b);
+}
+
+/* Which image would be used, without opening it. This is the one place that
+ * holds the selection rules; xiso_autodetect mounts what it returns and the
+ * launch screen (main.c nfsu2_game_data_status) only reports it, so the two
+ * cannot drift. Silent: it runs twice at boot.
+ *   NFSU2_ISO=0       -> 0
+ *   NFSU2_ISO=<path>  -> 1, out = path (checked before default.xbe, as the
+ *                        mount always was; the file is not opened here)
+ *   <dir>/default.xbe readable -> 0 (the extracted disc wins)
+ *   else              -> 1, out = <dir>/<first *.iso in name_cmp order>
+ * Returns 0 and an empty out when there is none. */
+int xiso_find_image(const char *dir, char *out, size_t n)
+{
+    const char *env = getenv("NFSU2_ISO");
+    char probe[1100];
+    char best[256];
+    DIR *d;
+    struct dirent *de;
+
+    if (!out || n == 0)
+        return 0;
+    out[0] = 0;
+    if (env && env[0]) {
+        if (strcmp(env, "0") == 0 || strlen(env) >= n)
+            return 0;
+        snprintf(out, n, "%s", env);
+        return 1;
+    }
+    if (!dir || !dir[0])
+        return 0;
+    snprintf(probe, sizeof probe, "%s/default.xbe", dir);
+    if (access(probe, R_OK) == 0)
+        return 0;
+
+    d = opendir(dir);
+    if (!d)
+        return 0;
+    best[0] = 0;
+    while ((de = readdir(d)) != NULL) {
+        struct stat st;
+        const char *cand = de->d_name;
+
+        if (!has_iso_suffix(cand) || strlen(cand) >= sizeof best)
+            continue;
+        snprintf(probe, sizeof probe, "%s/%s", dir, cand);
+        if (stat(probe, &st) != 0 || !S_ISREG(st.st_mode))
+            continue;
+        if (!best[0] || name_cmp(cand, best) < 0)
+            snprintf(best, sizeof best, "%s", cand);
+    }
+    closedir(d);
+    if (!best[0])
+        return 0;
+    if (snprintf(out, n, "%s/%s", dir, best) >= (int)n) {
+        out[0] = 0;
+        return 0;
+    }
+    return 1;
 }
 
 int xiso_autodetect(const char *game_dir)
 {
     const char *env = getenv("NFSU2_ISO");
-    char probe[1100];
-    DIR *d;
-    struct dirent *de;
-    char **names = NULL;
-    int n = 0, cap = 0, mounted = 0;
+    char path[1100];
 
-    if (env && env[0]) {
-        if (strcmp(env, "0") == 0) {
-            fprintf(stderr, "[XISO] disc image mode disabled (NFSU2_ISO=0)\n");
-            return 0;
-        }
-        if (xiso_mount(env))
-            return 1;
+    if (env && env[0] && strcmp(env, "0") == 0) {
+        fprintf(stderr, "[XISO] disc image mode disabled (NFSU2_ISO=0)\n");
+        return 0;
+    }
+    if (!xiso_find_image(game_dir, path, sizeof path))
+        return 0;                       /* folder wins, or no image */
+    if (xiso_mount(path))
+        return 1;
+    if (env && env[0])
         fprintf(stderr, "[XISO] NFSU2_ISO=%s unusable, using the game folder\n",
                 env);
-        return 0;
-    }
-    if (!game_dir || !game_dir[0])
-        return 0;
-    snprintf(probe, sizeof probe, "%s/default.xbe", game_dir);
-    if (access(probe, R_OK) == 0)
-        return 0;                               /* extracted disc wins */
-
-    d = opendir(game_dir);
-    if (!d)
-        return 0;
-    while ((de = readdir(d)) != NULL) {
-        struct stat st;
-
-        if (!has_iso_suffix(de->d_name))
-            continue;
-        snprintf(probe, sizeof probe, "%s/%s", game_dir, de->d_name);
-        if (stat(probe, &st) != 0 || !S_ISREG(st.st_mode))
-            continue;
-        if (n == cap) {
-            char **t = realloc(names, (size_t)(cap = cap ? cap * 2 : 8) * sizeof *t);
-            if (!t)
-                break;
-            names = t;
-        }
-        names[n] = strdup(de->d_name);
-        if (names[n])
-            n++;
-    }
-    closedir(d);
-
-    if (n > 0) {
-        qsort(names, (size_t)n, sizeof *names, name_cmp);
-        snprintf(probe, sizeof probe, "%s/%s", game_dir, names[0]);
-        for (int i = 1; i < n; i++)
-            fprintf(stderr, "[XISO] ignoring extra image %s/%s\n", game_dir,
-                    names[i]);
-        mounted = xiso_mount(probe);
-        if (!mounted)
-            fprintf(stderr, "[XISO] %s unusable, using the game folder\n", probe);
-    }
-    for (int i = 0; i < n; i++)
-        free(names[i]);
-    free(names);
-    return mounted;
+    else
+        fprintf(stderr, "[XISO] %s unusable, using the game folder\n", path);
+    return 0;
 }
 
 #endif /* _WIN32 */

@@ -44,6 +44,13 @@ void xiso_unmount(void);
  * Returns 1 when an image is mounted. */
 int  xiso_autodetect(const char *game_dir);
 
+/* The same decision, without mounting or opening anything and without log
+ * output. Returns 1 and the image path in out (NFSU2_ISO=<path> as given,
+ * else <dir>/<first *.iso in sorted order>); 0 and an empty out when image
+ * mode is off (NFSU2_ISO=0), when <dir>/default.xbe exists, or when there is
+ * no *.iso. xiso_autodetect is this plus xiso_mount. */
+int  xiso_find_image(const char *dir, char *out, size_t n);
+
 int         xiso_active(void);
 const char *xiso_image_path(void);
 const xiso_node *xiso_node_at(int idx);
