@@ -42,6 +42,8 @@ extern int xbox_ios_touch_zone_pressed(int idx);
 extern float xbox_ios_touch_zone_value(int idx);     /* pedal level 0..1, strip steer -1..1 */
 extern const char *xbox_ios_touch_zone_label(int idx);
 extern int xbox_ios_touch_zone_style(int idx);       /* ZS_* below */
+extern const char *xbox_ios_touch_zone_caption(int idx);  /* short function text or NULL */
+extern const char *xbox_ios_touch_zone_icon(int idx);     /* SF Symbol name or NULL */
 extern unsigned xbox_ios_touch_dpad_bits(void);      /* up 1, down 2, left 4, right 8 */
 extern unsigned xbox_ios_touch_layout_gen(void);     /* bumped on every zone-table rebuild */
 extern void xbox_ios_touch_set_enabled(int on);
@@ -103,6 +105,8 @@ enum {
 };
 
 static CGFloat s_cscale = 2.0;       /* screen scale, refreshed at every rebuild */
+static int s_captions_on = 1;         /* Button captions switch (main thread only) */
+static unsigned s_style_epoch = 0;   /* bumped by the panel: rebuild the control layers */
 
 static UIColor *rgba(unsigned hex, CGFloat a)
 {
@@ -221,6 +225,90 @@ static UIImage *symbol_image(NSString *name, CGFloat pt)
         (void)ctx;
         [tinted drawInRect:CGRectMake(0.0, 0.0, sz.width, sz.height)];
     }];
+}
+
+/* Approximate height of the capital letters of an image made by text_image /
+ * caption_image: the line box is about 1.19 em, the capitals about 0.72 em, and
+ * the capitals sit on the vertical centre of the box (2 pt of padding each
+ * side). Used to stack glyphs by their ink instead of by their line boxes. */
+static CGFloat text_ink(UIImage *im)
+{
+    return fmax(0.6 * (im.size.height - 4.0), 1.0);
+}
+
+/* The caption font: bold, slightly letter-spaced. */
+static NSDictionary *caption_attrs(CGFloat fs, UIColor *color)
+{
+    return @{ NSFontAttributeName: [UIFont boldSystemFontOfSize:fs],
+              NSForegroundColorAttributeName: color,
+              NSKernAttributeName: [NSNumber numberWithDouble:(double)(fs * 0.06)] };
+}
+
+/* Caption text, white 0.85, rendered once. The font shrinks until the text is
+ * no wider than maxw (0 = no limit, never below 6 pt). `strong` draws a heavier
+ * dark shadow, for a caption that sits over the game picture instead of on the
+ * control body. */
+static UIImage *caption_image(NSString *s, CGFloat fs, CGFloat maxw, BOOL strong)
+{
+    UIColor *fg = [UIColor colorWithWhite:1.0 alpha:0.85];
+    NSDictionary *attrs = caption_attrs(fs, fg);
+    CGSize sz = [s sizeWithAttributes:attrs];
+    if (maxw > 0.0 && sz.width > maxw && sz.width > 1.0) {
+        fs = floor(fs * maxw / sz.width);
+        if (fs < 6.0)
+            fs = 6.0;
+        attrs = caption_attrs(fs, fg);
+        sz = [s sizeWithAttributes:attrs];
+    }
+    NSDictionary *dark = caption_attrs(fs, [UIColor colorWithWhite:0.0 alpha:strong ? 0.85 : 0.55]);
+    NSDictionary *side = caption_attrs(fs, [UIColor colorWithWhite:0.0 alpha:0.6]);
+    CGFloat pad = 2.0;
+    CGSize canvas = CGSizeMake(ceil(sz.width) + 2.0 * pad, ceil(sz.height) + 2.0 * pad);
+    UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:canvas
+                                                                        format:img_format()];
+    return [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+        (void)ctx;
+        if (strong) {
+            [s drawAtPoint:CGPointMake(pad + 1.0, pad + 0.8) withAttributes:side];
+            [s drawAtPoint:CGPointMake(pad - 1.0, pad + 0.8) withAttributes:side];
+            [s drawAtPoint:CGPointMake(pad, pad + 1.6) withAttributes:dark];
+        } else {
+            [s drawAtPoint:CGPointMake(pad, pad + 1.0) withAttributes:dark];
+        }
+        [s drawAtPoint:CGPointMake(pad, pad) withAttributes:attrs];
+    }];
+}
+
+/* A bitmap as a child layer of `parent`, centred at `centre`, drawn at `size`
+ * (points). The CGImage is read here, from a parameter that the caller keeps
+ * alive for the whole call, and retained by the layer's contents. */
+static void add_image_layer(CALayer *parent, UIImage *img, CGPoint centre, CGSize size)
+{
+    CGImageRef cgi = img.CGImage;
+    CALayer *ll = [CALayer layer];
+    ll.bounds = CGRectMake(0.0, 0.0, size.width, size.height);
+    ll.position = centre;
+    ll.contents = (__bridge id)cgi;
+    ll.contentsScale = img.scale;
+    [parent addSublayer:ll];
+}
+
+/* Width of a w x h rounded rectangle (corner radius r; a circle is r = w/2 =
+ * h/2) at the height y below its top. */
+static CGFloat chord_at(CGFloat w, CGFloat h, CGFloat r, CGFloat y)
+{
+    CGFloat dy = 0.0;
+    if (r > w / 2.0)
+        r = w / 2.0;
+    if (r > h / 2.0)
+        r = h / 2.0;
+    if (y < r)
+        dy = r - y;
+    else if (y > h - r)
+        dy = y - (h - r);
+    if (dy <= 0.0)
+        return w;
+    return w - 2.0 * (r - sqrt(fmax(r * r - dy * dy, 0.0)));
 }
 
 /* Closed polygon with every corner rounded by a quad curve. */
@@ -358,6 +446,139 @@ static void fit_rounded(CGFloat A, CGFloat B, CGFloat fx, CGFloat fy, CGFloat fr
     set_stroke(self.ring, p ? self.ringHot : self.ringIdle);
 }
 @end
+
+/* The main text of a control (its primary label), by control kind. */
+static UIImage *main_label_image(int style, BOOL wide, CGFloat w, CGFloat h,
+                                 const char *lbl, UIColor *accent, UIColor *white)
+{
+    NSString *s = [NSString stringWithUTF8String:lbl];
+    if (wide)
+        return text_image(s, h * 0.40, w * 0.84, accent);
+    if (style <= ZS_FACE_Y)
+        return text_image(s, w * 0.46, w * 0.70, accent);
+    if (style == ZS_SHOULDER_BLACK || style == ZS_SHOULDER_WHITE)
+        return text_image(s, w * 0.30, w * 0.72, white);
+    if (style == ZS_TRIGGER_L || style == ZS_TRIGGER_R)
+        return text_image(s, fmin(h * 0.22, w * 0.42), w * 0.80, white);
+    if (style == ZS_PEDAL_GAS || style == ZS_PEDAL_BRAKE)
+        return text_image(s, h * 0.12, w * 0.78, white);
+    return nil;
+}
+
+/* Glyphs of a control that has an icon and / or a caption: the main glyph (the
+ * icon with the primary label small under it, or the primary label alone), and
+ * the caption. The caption goes inside, under the main glyph, when it fits the
+ * control's shape; otherwise just outside the shape, below it (above it when
+ * the bottom would leave the screen). Never changes the control's size.
+ * posY is the control's centre y in the overlay, H the overlay height. */
+static void add_glyphs(CALayer *root, int style, BOOL wide, CGFloat w, CGFloat h, CGFloat r,
+                       CGFloat posY, CGFloat H, UIImage *icon, const char *lbl,
+                       const char *capc, UIColor *accent, UIColor *white)
+{
+    BOOL menu = (style == ZS_MENU_BACK || style == ZS_MENU_START);
+    BOOL face = (style <= ZS_FACE_Y);
+    CGFloat m = fmin(w, h);
+    CGFloat gap = fmax(2.0, h * 0.06);
+    UIImage *i1 = nil, *i2 = nil, *ci = nil;
+    CGSize s1 = CGSizeZero, s2 = CGSizeZero, sc = CGSizeZero;
+    CGFloat ink1 = 0.0, ink2 = 0.0, inkc = 0.0;
+    CGFloat total, gapc, y;
+    BOOL inside = NO;
+    NSString *cs = capc ? [NSString stringWithUTF8String:capc] : nil;
+
+    if (icon) {
+        CGSize isz = icon.size;
+        CGFloat k = fmin(1.0, (m * 0.45) / fmax(fmax(isz.width, isz.height), 1.0));
+        i1 = icon;
+        s1 = CGSizeMake(isz.width * k, isz.height * k);
+        ink1 = s1.height;
+        if (lbl) {
+            CGFloat fsl = fmax(7.0, m * 0.16);
+            i2 = text_image([NSString stringWithUTF8String:lbl], fsl, w * 0.78,
+                            face ? accent : white);
+            s2 = i2.size;
+            ink2 = text_ink(i2);
+        }
+    } else if (menu) {
+        i1 = text_image(style == ZS_MENU_BACK ? @"BACK" : @"START", h * 0.34, w * 0.86, white);
+        s1 = i1.size;
+        ink1 = text_ink(i1);
+    } else if (lbl) {
+        i1 = main_label_image(style, wide, w, h, lbl, accent, white);
+        if (i1) {
+            s1 = i1.size;
+            ink1 = text_ink(i1);
+        }
+    }
+    total = (i1 ? ink1 : 0.0) + (i2 ? gap + ink2 : 0.0);
+    gapc = i1 ? gap : 0.0;
+
+    if (cs) {
+        CGFloat cfs = fmax(8.0, h * 0.20);
+        ci = caption_image(cs, cfs, 0.0, NO);
+        sc = ci.size;
+        inkc = text_ink(ci);
+        {
+            CGFloat all = total + gapc + inkc;
+            CGFloat t0 = (h - all) / 2.0;
+            CGFloat cap_top = t0 + total + gapc;
+            BOOL ok = (all <= h * 0.84);
+            if (ok && i1) {
+                CGFloat a = chord_at(w, h, r, t0), b = chord_at(w, h, r, t0 + ink1);
+                ok = (s1.width <= fmin(a, b) * 0.95);
+                if (ok && i2) {
+                    CGFloat t2 = t0 + ink1 + gap;
+                    a = chord_at(w, h, r, t2);
+                    b = chord_at(w, h, r, t2 + ink2);
+                    ok = ((s2.width - 4.0) <= fmin(a, b) * 0.95);
+                }
+            }
+            if (ok) {
+                CGFloat avail = fmin(chord_at(w, h, r, cap_top),
+                                     chord_at(w, h, r, cap_top + inkc)) * 0.92;
+                CGFloat f = avail / fmax(sc.width - 4.0, 1.0);
+                if (f < 1.0) {
+                    if (f < 0.62 || cfs * f < 8.0) {
+                        ok = NO;
+                    } else {
+                        ci = caption_image(cs, cfs, avail, NO);
+                        sc = ci.size;
+                        inkc = text_ink(ci);
+                    }
+                }
+            }
+            inside = ok;
+        }
+        if (!inside) {
+            /* Outside the shape: heavier shadow, no width limit worth having. */
+            ci = caption_image(cs, fmax(9.0, h * 0.20), w * 2.2, YES);
+            sc = ci.size;
+            inkc = text_ink(ci);
+        }
+    }
+
+    y = (h - (inside ? total + gapc + inkc : total)) / 2.0;
+    if (i1) {
+        add_image_layer(root, i1, CGPointMake(w / 2.0, y + ink1 / 2.0), s1);
+        y += ink1;
+    }
+    if (i2) {
+        y += gap;
+        add_image_layer(root, i2, CGPointMake(w / 2.0, y + ink2 / 2.0), s2);
+        y += ink2;
+    }
+    if (ci) {
+        if (inside) {
+            y += gapc;
+            add_image_layer(root, ci, CGPointMake(w / 2.0, y + inkc / 2.0), sc);
+        } else {
+            CGFloat cy = h + 2.0 + inkc / 2.0;                    /* below the shape */
+            if (posY + h / 2.0 + 5.0 + inkc > H && posY - h / 2.0 - 5.0 - inkc >= 0.0)
+                cy = -2.0 - inkc / 2.0;                           /* above it */
+            add_image_layer(root, ci, CGPointMake(w / 2.0, cy), sc);
+        }
+    }
+}
 
 /* Builds the layers of zone idx. Geometry comes from the runtime zone table
  * (normalized centre and radii against the overlay size, in points). */
@@ -647,39 +868,46 @@ static Nfsu2Ctl *build_ctl(int idx, const XBOX_IOS_TOUCH_ZONE_MIRROR *z, CGFloat
         c.arms = arms;
     }
 
-    /* Label or icon, rendered once. */
+    /* Label, icon and caption, rendered once. A control with an icon (that
+     * loads) or a caption to show goes through add_glyphs; the others keep the
+     * plain label path. */
     {
         const char *lbl = lbl0;
+        const char *capc = (s_captions_on && !pedal) ? xbox_ios_touch_zone_caption(idx) : NULL;
+        const char *icoc = pedal ? NULL : xbox_ios_touch_zone_icon(idx);
+        UIImage *icon = icoc ? symbol_image(ns(icoc), fmin(w, h) * 0.45) : nil;
+        if (!icon && icoc && strcmp(icoc, "arrow.uturn.backward") == 0)
+            icon = symbol_image(@"arrow.uturn.left", fmin(w, h) * 0.45);   /* iOS 13 name */
+        /* The arrow icon already says up/down: drop the arrow glyph from the
+         * small label under it ("SHIFT↑" -> "SHIFT"). The C label keeps the
+         * arrow for when the icon does not load. */
+        if (icon && icoc && (strcmp(icoc, "arrow.up") == 0 || strcmp(icoc, "arrow.down") == 0)
+            && lbl && strncmp(lbl, "SHIFT", 5) == 0)
+            lbl = "SHIFT";
         UIImage *li NS_VALID_UNTIL_END_OF_SCOPE = nil;
         CGFloat ly = h / 2.0;
-        if (menu) {
-            BOOL back = (style == ZS_MENU_BACK);
-            li = symbol_image(back ? @"rectangle.on.rectangle" : @"line.3.horizontal", h * 0.46);
-            if (!li)
-                li = text_image(back ? @"BACK" : @"START", h * 0.34, w * 0.86, white);
-        } else if (lbl) {
-            NSString *s = [NSString stringWithUTF8String:lbl];
-            if (wide)
-                li = text_image(s, h * 0.40, w * 0.84, accent);
-            else if (face)
-                li = text_image(s, w * 0.46, w * 0.70, accent);
-            else if (shoulder)
-                li = text_image(s, w * 0.30, w * 0.72, white);
-            else if (trigger)
-                li = text_image(s, fmin(h * 0.22, w * 0.42), w * 0.80, white);
-            else if (pedal)
-                li = text_image(s, h * 0.12, w * 0.78, white);
-        }
-        if (li) {
-            CGImageRef cgi = li.CGImage;
-            CALayer *ll = [CALayer layer];
-            if (pedal)
-                ly = h * 0.08 + li.size.height / 2.0;
-            ll.bounds = CGRectMake(0.0, 0.0, li.size.width, li.size.height);
-            ll.position = CGPointMake(w / 2.0, ly);
-            ll.contentsScale = li.scale;
-            ll.contents = (__bridge id)cgi;
-            [root addSublayer:ll];
+        if (icon || capc) {
+            add_glyphs(root, style, wide, w, h, r, z->cy * H, H, icon, lbl, capc, accent, white);
+        } else {
+            if (menu) {
+                BOOL back = (style == ZS_MENU_BACK);
+                li = symbol_image(back ? @"rectangle.on.rectangle" : @"line.3.horizontal", h * 0.46);
+                if (!li)
+                    li = text_image(back ? @"BACK" : @"START", h * 0.34, w * 0.86, white);
+            } else if (lbl) {
+                li = main_label_image(style, wide, w, h, lbl, accent, white);
+            }
+            if (li) {
+                CGImageRef cgi = li.CGImage;
+                CALayer *ll = [CALayer layer];
+                if (pedal)
+                    ly = h * 0.08 + li.size.height / 2.0;
+                ll.bounds = CGRectMake(0.0, 0.0, li.size.width, li.size.height);
+                ll.position = CGPointMake(w / 2.0, ly);
+                ll.contentsScale = li.scale;
+                ll.contents = (__bridge id)cgi;
+                [root addSublayer:ll];
+            }
         }
     }
 
@@ -862,6 +1090,7 @@ static void path_add_rect(UIBezierPath *p, CGRect r)
     BOOL _stickOn[2];
     BOOL _built;
     unsigned _gen;                /* xbox_ios_touch_layout_gen() at the build */
+    unsigned _styleEpoch;         /* s_style_epoch at the build (captions switch) */
     CGSize _builtSize;
     /* Layout editor. */
     BOOL _editing;
@@ -985,6 +1214,7 @@ static void path_add_rect(UIBezierPath *p, CGRect r)
     NSArray *old;
 
     _gen = xbox_ios_touch_layout_gen();
+    _styleEpoch = s_style_epoch;
     z = (const XBOX_IOS_TOUCH_ZONE_MIRROR *)xbox_ios_touch_zones(&n);
     s_cscale = [UIScreen mainScreen].scale;
     if (s_cscale < 1.0)
@@ -1122,7 +1352,7 @@ static void path_add_rect(UIBezierPath *p, CGRect r)
 
     if ((_shapesHidden && !_editing) || sz.width < 1.0 || sz.height < 1.0)
         return NO;
-    if (!_built || xbox_ios_touch_layout_gen() != _gen ||
+    if (!_built || xbox_ios_touch_layout_gen() != _gen || s_style_epoch != _styleEpoch ||
         sz.width != _builtSize.width || sz.height != _builtSize.height)
         [self rebuildControls];
 
@@ -1775,7 +2005,8 @@ static void tilt_start(void)
 enum { IK_HEAD, IK_SWITCH, IK_SLIDER, IK_SEG, IK_BUTTON };
 enum { ACT_NONE, ACT_FPS, ACT_TOUCH, ACT_LAYOUT, ACT_SCALE, ACT_ALPHA,
        ACT_HAPTICS, ACT_TILT, ACT_TILTSENS, ACT_KEYBOARD, ACT_RUMBLE,
-       ACT_ANALOG, ACT_STEER, ACT_STEERSENS, ACT_TILTCENTRE, ACT_EDITLAYOUT };
+       ACT_ANALOG, ACT_STEER, ACT_STEERSENS, ACT_TILTCENTRE, ACT_EDITLAYOUT,
+       ACT_CAPTIONS };
 
 typedef struct {
     int         kind;
@@ -1801,6 +2032,9 @@ static const PanelItem s_items[] = {
       .lo = 0.7f, .hi = 1.5f, .def = 1.0f, .decimals = 2, .act = ACT_SCALE },
     { .kind = IK_SLIDER, .title = "Opacity", .key = "NFSU2_OVERLAY_ALPHA",
       .lo = 0.2f, .hi = 0.8f, .def = 0.55f, .decimals = 2, .act = ACT_ALPHA },
+    /* Function text under the buttons (E-BRAKE, NOS, LOOK ...). */
+    { .kind = IK_SWITCH, .title = "Button captions", .key = "NFSU2_TOUCH_CAPTIONS",
+      .on = "1", .off = "0", .def_on = 1, .act = ACT_CAPTIONS },
     /* Closes the panel and moves / resizes the controls of the current layout. */
     { .kind = IK_BUTTON, .title = "Edit layout…", .act = ACT_EDITLAYOUT },
     /* Drive layout: pedal value from the finger's height; the steering strip
@@ -1937,6 +2171,11 @@ static void apply_live(int act, int on, float fv, const char *sv)
         break;
     case ACT_ANALOG:
         xbox_ios_touch_set_analog_pedals(on);
+        break;
+    case ACT_CAPTIONS:
+        s_captions_on = on ? 1 : 0;
+        s_style_epoch++;                   /* the layers are rebuilt by syncControls */
+        (void)[s_ov syncControls];
         break;
     case ACT_STEER:
         xbox_ios_touch_set_steer(on);      /* rebuilds the table, clears fingers */
@@ -2389,6 +2628,12 @@ void ios_touch_overlay_install(void *uiwindow)
     {
         const char *v;
         s_user_touch_on = item_is_on(&s_items[1]) ? YES : NO;   /* Touch controls */
+        {
+            int ci;
+            for (ci = 0; ci < ITEM_COUNT; ci++)
+                if (s_items[ci].key && strcmp(s_items[ci].key, "NFSU2_TOUCH_CAPTIONS") == 0)
+                    s_captions_on = item_is_on(&s_items[ci]);
+        }
         refresh_shapes();
         v = nfsu2_cfg_get("NFSU2_TILT_SENS");
         if (v && *v) {

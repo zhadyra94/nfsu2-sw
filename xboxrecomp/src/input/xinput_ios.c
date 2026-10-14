@@ -519,6 +519,64 @@ const char *xbox_ios_touch_zone_label(int idx)
     }
 }
 
+/* Short function text the overlay may draw under a zone's main glyph (see the
+ * header). Same index convention as xbox_ios_touch_zone_label(). */
+const char *xbox_ios_touch_zone_caption(int idx)
+{
+    const XBOX_IOS_TOUCH_ZONE *z;
+
+    touch_prefs_once();
+    if (idx < 0 || idx >= s_zone_n)
+        return NULL;
+    if (s_drive && !s_drive_classic)
+        return NULL;   /* the new DRIVE labels already name the function */
+    z = &s_zones[idx];
+    if (z->kind == XBOX_IOS_ZONE_FLAG)
+        return z->value == XBOX_GAMEPAD_START ? "PAUSE" : NULL;
+    if (z->kind != XBOX_IOS_ZONE_ANALOG)
+        return NULL;
+    switch (z->value) {
+    case XBOX_BUTTON_A:        return "E-BRAKE";
+    case XBOX_BUTTON_B:        return "NOS";
+    case XBOX_BUTTON_X:        return "SHIFT UP";
+    case XBOX_BUTTON_Y:        return "SHIFT DN";
+    case XBOX_BUTTON_BLACK:    return "LOOK";
+    case XBOX_BUTTON_WHITE:    return "CAM";
+    case XBOX_BUTTON_LTRIGGER: return "BRAKE";
+    case XBOX_BUTTON_RTRIGGER: return "GAS";
+    default:                   return NULL;
+    }
+}
+
+/* SF Symbol name for zone idx, or NULL (see the header). */
+const char *xbox_ios_touch_zone_icon(int idx)
+{
+    const XBOX_IOS_TOUCH_ZONE *z;
+    int new_drive;
+
+    touch_prefs_once();
+    if (idx < 0 || idx >= s_zone_n)
+        return NULL;
+    z = &s_zones[idx];
+    new_drive = (s_drive && !s_drive_classic);
+    if (z->kind == XBOX_IOS_ZONE_FLAG) {
+        if (z->value == XBOX_GAMEPAD_START) return "pause.fill";
+        if (z->value == XBOX_GAMEPAD_BACK)  return "arrow.uturn.backward";
+        return NULL;
+    }
+    if (z->kind != XBOX_IOS_ZONE_ANALOG)
+        return NULL;
+    switch (z->value) {
+    case XBOX_BUTTON_BLACK: return "eye.fill";
+    case XBOX_BUTTON_WHITE: return "camera.fill";
+    case XBOX_BUTTON_A:     return new_drive ? "exclamationmark.octagon.fill" : NULL;
+    case XBOX_BUTTON_B:     return new_drive ? "flame.fill" : NULL;
+    case XBOX_BUTTON_X:     return new_drive ? "arrow.up" : NULL;
+    case XBOX_BUTTON_Y:     return new_drive ? "arrow.down" : NULL;
+    default:                return NULL;   /* pedals / triggers keep their text */
+    }
+}
+
 /* Called (on whichever thread pumps SDL events) when a finger lands on a
  * zone. The overlay uses it for haptics. NULL clears. */
 void xbox_ios_touch_set_press_hook(void (*hook)(int))

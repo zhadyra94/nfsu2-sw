@@ -106,6 +106,22 @@ float xbox_ios_touch_zone_value(int idx);
  * (Black), CAM (White). */
 const char *xbox_ios_touch_zone_label(int idx);
 
+/* Short function text for the overlay to draw under the zone's main glyph, or
+ * NULL for none. PAD and classic DRIVE (the letters name buttons there): A
+ * "E-BRAKE", B "NOS", X "SHIFT UP", Y "SHIFT DN", Black "LOOK", White "CAM",
+ * LT "BRAKE", RT "GAS", START "PAUSE"; BACK, D-pad and STEER NULL. The new
+ * DRIVE layout returns NULL for every zone (its labels already are the
+ * function). The overlay skips captions on pedal-style controls. ASCII. */
+const char *xbox_ios_touch_zone_caption(int idx);
+
+/* SF Symbol name the overlay draws on zone idx instead of the text label, or
+ * NULL (keep the text). Black "eye.fill", White "camera.fill", START
+ * "pause.fill", BACK "arrow.uturn.backward" in every layout; in the new DRIVE
+ * layout also A "exclamationmark.octagon.fill", B "flame.fill", X "arrow.up",
+ * Y "arrow.down". PAD / classic faces, LT / RT, pedals, D-pad and STEER: NULL.
+ * The overlay falls back to the text when a symbol does not load. */
+const char *xbox_ios_touch_zone_icon(int idx);
+
 /* Look of a zone, for the overlay (derived from the zone's kind / value and
  * the active layout: in DRIVE the LT / RT zones are pedals). Values of
  * XBOX_IOS_STYLE_*. ios_touch_overlay.m cannot include this header and

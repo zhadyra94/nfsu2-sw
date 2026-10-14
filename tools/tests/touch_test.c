@@ -1218,6 +1218,123 @@ static void t_zone_style(void)
     reset();
 }
 
+/* Zone with this analog button, -1 when the table has none (no failure). */
+static int zone_by_button(int button)
+{
+    int n = zcount(), i;
+    for (i = 0; i < n; i++) {
+        const XBOX_IOS_TOUCH_ZONE *z = zone(i);
+        if (z->kind == XBOX_IOS_ZONE_ANALOG && z->value == button)
+            return i;
+    }
+    return -1;
+}
+
+static const char *cap_of(int zi)  { return zi >= 0 ? xbox_ios_touch_zone_caption(zi) : NULL; }
+static const char *icon_of(int zi) { return zi >= 0 ? xbox_ios_touch_zone_icon(zi) : NULL; }
+
+/* want == NULL: the accessor must return NULL. */
+static void expect_str(const char *got, const char *want, const char *what)
+{
+    if (!want)
+        CHECK(got == NULL, "%s: \"%s\", want NULL", what, got ? got : "");
+    else
+        CHECK(got && strcmp(got, want) == 0, "%s: \"%s\", want \"%s\"", what,
+              got ? got : "(null)", want);
+}
+
+/* Captions and icons for the overlay: PAD, new DRIVE, classic DRIVE. */
+static void t_caption_icon(void)
+{
+    static const struct { int button; const char *name, *cap, *icon; } pad[] = {
+        { XBOX_BUTTON_A,        "A",  "E-BRAKE",  NULL },
+        { XBOX_BUTTON_B,        "B",  "NOS",      NULL },
+        { XBOX_BUTTON_X,        "X",  "SHIFT UP", NULL },
+        { XBOX_BUTTON_Y,        "Y",  "SHIFT DN", NULL },
+        { XBOX_BUTTON_BLACK,    "LB", "LOOK",     "eye.fill" },
+        { XBOX_BUTTON_WHITE,    "RB", "CAM",      "camera.fill" },
+        { XBOX_BUTTON_LTRIGGER, "LT", "BRAKE",    NULL },
+        { XBOX_BUTTON_RTRIGGER, "RT", "GAS",      NULL },
+    };
+    static const struct { int button; const char *name, *icon; } drv[] = {
+        { XBOX_BUTTON_A,        "E-BRAKE", "exclamationmark.octagon.fill" },
+        { XBOX_BUTTON_B,        "NOS",     "flame.fill" },
+        { XBOX_BUTTON_X,        "SHIFT up", "arrow.up" },
+        { XBOX_BUTTON_Y,        "SHIFT down", "arrow.down" },
+        { XBOX_BUTTON_BLACK,    "LOOK",    "eye.fill" },
+        { XBOX_BUTTON_WHITE,    "CAM",     "camera.fill" },
+        { XBOX_BUTTON_LTRIGGER, "BRAKE",   NULL },
+        { XBOX_BUTTON_RTRIGGER, "GAS",     NULL },
+    };
+    size_t k;
+    int pass, i, zi;
+
+    reset();
+    /* PAD */
+    for (k = 0; k < sizeof pad / sizeof pad[0]; k++) {
+        zi = zone_by_button(pad[k].button);
+        CHECK(zi >= 0, "PAD %s: no zone", pad[k].name);
+        expect_str(cap_of(zi), pad[k].cap, pad[k].name);
+        expect_str(icon_of(zi), pad[k].icon, pad[k].name);
+        /* The primary label stays the controller name. */
+        if (zi >= 0)
+            expect_str(xbox_ios_touch_zone_label(zi), pad[k].name, "PAD primary label");
+    }
+    zi = zone_by_flag(XBOX_GAMEPAD_START);
+    expect_str(cap_of(zi), "PAUSE", "PAD START caption");
+    expect_str(icon_of(zi), "pause.fill", "PAD START icon");
+    zi = zone_by_flag(XBOX_GAMEPAD_BACK);
+    expect_str(cap_of(zi), NULL, "PAD BACK caption");
+    expect_str(icon_of(zi), "arrow.uturn.backward", "PAD BACK icon");
+    zi = zone_by_kind(XBOX_IOS_ZONE_DPAD);
+    expect_str(cap_of(zi), NULL, "PAD D-pad caption");
+    expect_str(icon_of(zi), NULL, "PAD D-pad icon");
+
+    /* New DRIVE: no captions at all, icons on the function buttons. */
+    xbox_ios_touch_set_layout(1);
+    for (i = 0; i < zcount(); i++)
+        CHECK(xbox_ios_touch_zone_caption(i) == NULL, "DRIVE zone %d has a caption", i);
+    for (k = 0; k < sizeof drv / sizeof drv[0]; k++) {
+        zi = zone_by_button(drv[k].button);
+        CHECK(zi >= 0, "DRIVE %s: no zone", drv[k].name);
+        expect_str(icon_of(zi), drv[k].icon, drv[k].name);
+    }
+    expect_str(icon_of(zone_by_flag(XBOX_GAMEPAD_START)), "pause.fill", "DRIVE START icon");
+    expect_str(icon_of(zone_by_flag(XBOX_GAMEPAD_BACK)), "arrow.uturn.backward", "DRIVE BACK icon");
+    expect_str(icon_of(zone_by_kind(XBOX_IOS_ZONE_DPAD)), NULL, "DRIVE D-pad icon");
+    expect_str(icon_of(zone_by_kind(XBOX_IOS_ZONE_STEER)), NULL, "DRIVE strip icon");
+    /* The primary labels did not move. */
+    expect_str(xbox_ios_touch_zone_label(zone_by_button(XBOX_BUTTON_B)), "NOS", "DRIVE B label");
+
+    /* Classic DRIVE: PAD captions, old labels, no face icons. */
+    xbox_ios_touch_set_drive_classic(1);
+    for (k = 0; k < sizeof pad / sizeof pad[0]; k++) {
+        zi = zone_by_button(pad[k].button);
+        CHECK(zi >= 0, "classic %s: no zone", pad[k].name);
+        expect_str(cap_of(zi), pad[k].cap, pad[k].name);
+        expect_str(icon_of(zi), pad[k].icon, pad[k].name);
+    }
+    expect_str(xbox_ios_touch_zone_label(zone_by_button(XBOX_BUTTON_A)), "A", "classic A label");
+    expect_str(xbox_ios_touch_zone_label(zone_by_button(XBOX_BUTTON_BLACK)), "LB", "classic LB label");
+    expect_str(cap_of(zone_by_flag(XBOX_GAMEPAD_START)), "PAUSE", "classic START caption");
+    expect_str(icon_of(zone_by_flag(XBOX_GAMEPAD_BACK)), "arrow.uturn.backward", "classic BACK icon");
+
+    /* Out of range, in every table. */
+    for (pass = 0; pass < 3; pass++) {
+        xbox_ios_touch_set_drive_classic(pass == 2);
+        xbox_ios_touch_set_layout(pass != 0);
+        CHECK(xbox_ios_touch_zone_caption(-1) == NULL && xbox_ios_touch_zone_caption(zcount()) == NULL &&
+              xbox_ios_touch_zone_caption(1000) == NULL, "caption out of range (table %d)", pass);
+        CHECK(xbox_ios_touch_zone_icon(-1) == NULL && xbox_ios_touch_zone_icon(zcount()) == NULL &&
+              xbox_ios_touch_zone_icon(1000) == NULL, "icon out of range (table %d)", pass);
+    }
+    /* Back in PAD the captions return. */
+    xbox_ios_touch_set_drive_classic(0);
+    xbox_ios_touch_set_layout(0);
+    expect_str(cap_of(zone_by_button(XBOX_BUTTON_B)), "NOS", "PAD B caption after the round trip");
+    reset();
+}
+
 /* The pressed D-pad arms, as bits, agree with what the game reads. */
 static void t_dpad_bits(void)
 {
@@ -2793,6 +2910,7 @@ int main(void)
     run_case("13   Focus loss / background clear all fingers",      t_lifecycle, NULL);
     run_case("14   Overlay queries: stick(), zone_label(), zone_pressed()", t_overlay_queries, NULL);
     run_case("15   zone_style(): faces, shoulders, triggers / pedals, menu", t_zone_style, NULL);
+    run_case("15d  zone_caption() / zone_icon(): PAD, DRIVE, classic DRIVE, out of range", t_caption_icon, NULL);
     run_case("15b  dpad_bits(): arms held, matches the state, cleared on lift", t_dpad_bits, NULL);
     run_case("15c  layout_gen(): moves on rebuild only", t_layout_gen, NULL);
     run_case("16   Analog pedals: ~90 at the bottom, 255 from the 40% mark up, DRIVE only", t_pedal_analog, NULL);

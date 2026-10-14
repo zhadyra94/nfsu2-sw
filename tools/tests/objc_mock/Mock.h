@@ -22,6 +22,7 @@ typedef struct { CGFloat width, height; } CGSize;
 typedef struct { CGPoint origin; CGSize size; } CGRect;
 typedef struct { CGFloat top, left, bottom, right; } UIEdgeInsets;
 static const CGRect CGRectZero = {{0,0},{0,0}};
+static const CGSize CGSizeZero = {0,0};
 static const CGPoint CGPointZero = {0,0};
 static inline CGPoint CGPointMake(CGFloat x, CGFloat y){CGPoint p={x,y};return p;}
 static inline CGSize CGSizeMake(CGFloat w, CGFloat h){CGSize p={w,h};return p;}
@@ -107,6 +108,7 @@ NSArray *NSSearchPathForDirectoriesInDomains(NSUInteger dir, NSUInteger domain, 
 @end
 @interface NSNumber : NSObject
 + (NSNumber*)numberWithInt:(int)i;
++ (NSNumber*)numberWithDouble:(double)d;
 @end
 @interface NSThread : NSObject
 + (BOOL)isMainThread;
@@ -129,6 +131,7 @@ NSArray *NSSearchPathForDirectoriesInDomains(NSUInteger dir, NSUInteger domain, 
 @interface NSShadow : NSObject @end
 extern NSString *const NSFontAttributeName;
 extern NSString *const NSForegroundColorAttributeName;
+extern NSString *const NSKernAttributeName;
 
 @interface UIColor : NSObject
 + (UIColor*)colorWithRed:(CGFloat)r green:(CGFloat)g blue:(CGFloat)b alpha:(CGFloat)a;
