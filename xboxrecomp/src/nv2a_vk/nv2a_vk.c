@@ -178,6 +178,8 @@ typedef struct {
 typedef struct {
     VkCommandPool   pool;
     VkCommandBuffer cb;
+    VkCommandBuffer pre;        /* hoisted texture uploads; submitted before cb */
+    int             pre_open;   /* pre is recording */
     VkFence         fence;
     VkSemaphore     acquired, rendered;
     VkBuffer        ring;
@@ -241,11 +243,69 @@ static void frame_begin(void)
     garbage_free(s_f);
     s_f->ring_off = 0;
     vkResetCommandPool(s_dev, s_f->pool, 0);
+    s_f->pre_open = 0;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(s_f->cb, &bi);
     s_cb = s_f->cb;
     s_cb_gen++;
     s_dyn_valid = 0;
+}
+
+/* RECOMP_VK_HOIST: texture uploads are recorded into a "pre" command buffer
+ * that runs before the frame's main one (same vkQueueSubmit), so they do not
+ * end the render pass. Only for a texture nothing sampled earlier in this
+ * frame (the copy then runs before draws that never read it), plus the
+ * UNDEFINED->GENERAL change of an image created for it. Default off; 1 on;
+ * 2 on for even s_frame only (A/B dumps). */
+static int s_hoist_mode = -1;
+static uint32_t s_hoist_up, s_inline_up;    /* tex_upload calls hoisted / inline */
+static int s_up_hoist;                      /* tex_get: this texture's uploads are hoisted */
+static int s_trans_pre;                     /* image_to_general goes into pre */
+
+static int hoist_on(void)
+{
+    if (s_hoist_mode < 0) {
+        const char *e = getenv("RECOMP_VK_HOIST");
+        s_hoist_mode = e && *e == '2' ? 2 : (e && *e == '1');
+        fprintf(stderr, "  [VK] texture upload hoisting mode %d\n", s_hoist_mode);
+    }
+    return s_hoist_mode == 2 ? !(s_frame & 1) : s_hoist_mode;
+}
+
+/* The pre buffer, opened on first use. It starts with a barrier on the
+ * earlier submits (their reads of the textures it overwrites). */
+static VkCommandBuffer pre_cb(void)
+{
+    if (!s_f->pre_open) {
+        VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+        VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(s_f->pre, &bi);
+        mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        vkCmdPipelineBarrier(s_f->pre, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+        s_f->pre_open = 1;
+    }
+    return s_f->pre;
+}
+
+/* Close pre (if open) with one barrier to everything in the main buffer.
+ * Returns the number of buffers to submit: pre is first when it is used. */
+static uint32_t submit_cbs(VkCommandBuffer out[2])
+{
+    uint32_t n = 0;
+    if (s_f->pre_open) {
+        VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+        mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        vkCmdPipelineBarrier(s_f->pre, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+        vkEndCommandBuffer(s_f->pre);
+        out[n++] = s_f->pre;
+    }
+    out[n++] = s_cb;
+    return n;
 }
 
 /* Space in this frame's ring: returns the offset, *ptr the mapping. */
@@ -378,10 +438,40 @@ static void set_surface_scissor(const uint32_t *r, const VkSurf *s)
     }
 }
 
-static void begin_rendering(VkSurf *s, VkDepthBuf *d)
+/* RECOMP_VK_CLEAR_LOAD: a pass that starts with a full clear begins with
+ * LOAD_OP_CLEAR. On a tile GPU that skips loading the attachments from
+ * memory, and MoltenVK draws a quad for every vkCmdClearAttachments.
+ * unset = on for iOS, off elsewhere; 0 off, 1 on, 2 on for even s_frame
+ * only (A/B dumps). */
+static int s_cl_mode = -1;
+static uint32_t s_cl_passes, s_cl_folded;   /* passes begun with a CLEAR load, clears folded */
+
+static int clear_load_on(void)
+{
+    if (s_cl_mode < 0) {
+        const char *e = getenv("RECOMP_VK_CLEAR_LOAD");
+#ifdef NFSU2_IOS
+        s_cl_mode = e && *e ? (*e == '2' ? 2 : *e != '0') : 1;
+#else
+        s_cl_mode = e && *e ? (*e == '2' ? 2 : *e != '0') : 0;
+#endif
+        fprintf(stderr, "  [VK] clear as load op mode %d\n", s_cl_mode);
+    }
+    return s_cl_mode == 2 ? !(s_frame & 1) : s_cl_mode;
+}
+
+/* What begin_rendering should clear instead of load. */
+typedef struct {
+    int    color, depth, stencil;
+    float  rgba[4], z;
+    uint32_t st;
+} BeginClear;
+
+static void begin_rendering_c(VkSurf *s, VkDepthBuf *d, const BeginClear *bc)
 {
     VkRenderingAttachmentInfo ca = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
     VkRenderingAttachmentInfo da = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
+    VkRenderingAttachmentInfo sa = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
     VkRenderingInfo ri = { VK_STRUCTURE_TYPE_RENDERING_INFO };
 
     if (s_in_render && s_rt == s && s_rt_depth == d)
@@ -415,6 +505,30 @@ static void begin_rendering(VkSurf *s, VkDepthBuf *d)
         ri.pDepthAttachment = &da;
         ri.pStencilAttachment = &da;
     }
+    if (bc) {
+        int any = 0;
+        if (bc->color) {
+            ca.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            memcpy(ca.clearValue.color.float32, bc->rgba, sizeof bc->rgba);
+            any = 1;
+        }
+        if (d && (bc->depth || bc->stencil)) {
+            /* Depth and stencil load differently: a second info for stencil. */
+            sa = da;
+            if (bc->depth) {
+                da.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                da.clearValue.depthStencil.depth = bc->z;
+            }
+            if (bc->stencil) {
+                sa.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                sa.clearValue.depthStencil.stencil = bc->st;
+            }
+            ri.pStencilAttachment = &sa;
+            any = 1;
+        }
+        if (any)
+            s_cl_passes++;
+    }
     p_begin_rendering(s_cb, &ri);
     s_in_render = 1;
     s_rt = s;
@@ -422,15 +536,25 @@ static void begin_rendering(VkSurf *s, VkDepthBuf *d)
     set_viewport(s->pw, s->ph);
 }
 
+static void begin_rendering(VkSurf *s, VkDepthBuf *d)
+{
+    begin_rendering_c(s, d, NULL);
+}
+
 /* An image in GENERAL layout, from UNDEFINED; recorded outside rendering. */
 static void image_to_general(VkImage img, VkImageAspectFlags aspect)
 {
     VkImageMemoryBarrier b = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+    VkCommandBuffer cb = s_cb;
+    if (s_trans_pre) {
+        cb = pre_cb();                  /* no pass split: the pre buffer is separate */
+    } else {
 #ifdef NFSU2_IOS
-    if (s_in_render)
-        s_ios_split_by = 2;
+        if (s_in_render)
+            s_ios_split_by = 2;
 #endif
-    end_rendering();
+        end_rendering();
+    }
     b.srcAccessMask = 0;
     b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -440,7 +564,7 @@ static void image_to_general(VkImage img, VkImageAspectFlags aspect)
     b.subresourceRange.aspectMask = aspect;
     b.subresourceRange.levelCount = 1;
     b.subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
-    vkCmdPipelineBarrier(s_cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &b);
 }
 
@@ -795,6 +919,7 @@ static void tex_upload(VkTex *t, const void *src, uint32_t bytes, uint32_t row_t
     void *dst;
     VkDeviceSize at = ring_alloc(bytes, 16, &dst);
     VkBufferImageCopy rg;
+    VkCommandBuffer cb = s_cb;
 
     if (!dst)
         return;
@@ -802,11 +927,17 @@ static void tex_upload(VkTex *t, const void *src, uint32_t bytes, uint32_t row_t
 #ifdef NFSU2_IOS
     s_ios_uploads++;
     s_ios_up_bytes += bytes;
-    if (s_in_render)
+    if (s_in_render && !s_up_hoist)
         s_ios_split_by = 1;
 #endif
-    end_rendering();
-    barrier_all();
+    if (s_up_hoist) {
+        cb = pre_cb();
+        s_hoist_up++;
+    } else {
+        s_inline_up++;
+        end_rendering();
+        barrier_all();
+    }
     memset(&rg, 0, sizeof rg);
     rg.bufferOffset = at;
     rg.bufferRowLength = row_texels;
@@ -816,7 +947,7 @@ static void tex_upload(VkTex *t, const void *src, uint32_t bytes, uint32_t row_t
     rg.imageExtent.width = t->w;
     rg.imageExtent.height = t->h;
     rg.imageExtent.depth = 1;
-    vkCmdCopyBufferToImage(s_cb, s_f->ring, t->image, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
+    vkCmdCopyBufferToImage(cb, s_f->ring, t->image, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
 }
 
 /* Cube map faces follow each other, each with its mip chain, padded to 128
@@ -891,6 +1022,7 @@ static VkImageView tex_get(uint32_t va, uint32_t color, uint32_t w, uint32_t h, 
     uint32_t i, hash;
     VkFormat fmt = VK_FORMAT_B8G8R8A8_UNORM;
     uint32_t layers = face ? 6 : 1, f, size;
+    int was_used, hoist;
 
     for (i = s_tex_head[tex_bucket(va, color, w, h)]; i; i = s_tex_next[i - 1]) {
         VkTex *c = &s_tex[i - 1];
@@ -900,6 +1032,7 @@ static VkImageView tex_get(uint32_t va, uint32_t color, uint32_t w, uint32_t h, 
             break;
         }
     }
+    was_used = t && t->used == s_frame;     /* sampled earlier this frame; before we stamp it */
     if (t && t->checked == s_frame) {
         t->used = s_frame;
         return t->view;
@@ -925,6 +1058,7 @@ static VkImageView tex_get(uint32_t va, uint32_t color, uint32_t w, uint32_t h, 
         tex_free(t);
         t = NULL;
     }
+    hoist = hoist_on() && (!t || !was_used);
     if (!t) {
         for (i = 0; i < VK_MAX_TEX; i++) {
             VkTex *c = &s_tex[i];
@@ -938,9 +1072,12 @@ static VkImageView tex_get(uint32_t va, uint32_t color, uint32_t w, uint32_t h, 
         t->face = face;
         VT("texture %08X fmt %02X %ux%u pitch %u%s\n", va, color, w, h, pitch,
            face ? " cube" : "");
-        if (!make_image_n(w, h, layers, fmt,
-                          VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                          VK_IMAGE_ASPECT_COLOR_BIT, &t->image, &t->view, &t->mem)) {
+        s_trans_pre = hoist;
+        i = make_image_n(w, h, layers, fmt,
+                         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                         VK_IMAGE_ASPECT_COLOR_BIT, &t->image, &t->view, &t->mem);
+        s_trans_pre = 0;
+        if (!i) {
             memset(t, 0, sizeof *t);
             return face ? s_dummy_cube_view : s_dummy_view;
         }
@@ -952,8 +1089,10 @@ static VkImageView tex_get(uint32_t va, uint32_t color, uint32_t w, uint32_t h, 
     t->hash = hash;
     t->used = t->checked = s_frame;
 
+    s_up_hoist = hoist;
     for (f = 0; f < layers; f++)
         tex_fill(t, va + f * face, f);
+    s_up_hoist = 0;
     size = fmt != VK_FORMAT_B8G8R8A8_UNORM ? tex_bytes(color, w, h, 0) : w * h * 4;
     tex_account(t, size * layers);
     return t->view;
@@ -2859,8 +2998,13 @@ static int ready_impl(void)
         vkCreateCommandPool(s_dev, &cpi, NULL, &f->pool);
         cai.commandPool = f->pool;
         cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cai.commandBufferCount = 1;
-        vkAllocateCommandBuffers(s_dev, &cai, &f->cb);
+        cai.commandBufferCount = 2;
+        {
+            VkCommandBuffer cbs[2];
+            vkAllocateCommandBuffers(s_dev, &cai, cbs);
+            f->cb = cbs[0];
+            f->pre = cbs[1];
+        }
         vkCreateFence(s_dev, &fci, NULL, &f->fence);
         vkCreateSemaphore(s_dev, &sci, NULL, &f->acquired);
         vkCreateSemaphore(s_dev, &sci, NULL, &f->rendered);
@@ -2963,11 +3107,12 @@ static void flush_frame_wait(void)
 {
     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
     VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    VkCommandBuffer cbs[2];
     end_rendering();
     s_rt = NULL;
     vkEndCommandBuffer(s_cb);
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &s_cb;
+    si.commandBufferCount = submit_cbs(cbs);
+    si.pCommandBuffers = cbs;
 #ifdef NFSU2_IOS
     ios_park_point();
 #endif
@@ -2977,6 +3122,7 @@ static void flush_frame_wait(void)
     garbage_free(s_f);
     s_f->ring_off = 0;
     vkResetCommandPool(s_dev, s_f->pool, 0);
+    s_f->pre_open = 0;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(s_cb, &bi);
     s_cb_gen++;
@@ -3986,8 +4132,37 @@ static void vk_clear(const Nv2aSurface *sf, const Nv2aRenderState *rs,
         return;
     VT("clear %08X %ux%u flags %X rect %d,%d %ux%u depth %p\n", s->va, s->pw, s->ph, flags,
        rect.rect.offset.x, rect.rect.offset.y, rect.rect.extent.width, rect.rect.extent.height, (void *)d);
-    begin_rendering(s, d);
-    vkCmdClearAttachments(s_cb, nca, ca, 1, &rect);
+    /* A clear that opens a new pass and covers its whole render area becomes
+     * the pass's load op: every aspect in ca[] (full colour, depth, stencil)
+     * folds, so no vkCmdClearAttachments is left. */
+    if (clear_load_on() && !(s_in_render && s_rt == s && s_rt_depth == d)) {
+        uint32_t rw = s->pw, rh = s->ph, i;
+        if (d && d->pw < rw) rw = d->pw;
+        if (d && d->ph < rh) rh = d->ph;
+        if (rect.rect.offset.x == 0 && rect.rect.offset.y == 0 &&
+            rect.rect.extent.width == rw && rect.rect.extent.height == rh) {
+            BeginClear bc;
+            memset(&bc, 0, sizeof bc);
+            for (i = 0; i < nca; i++) {
+                if (ca[i].aspectMask == VK_IMAGE_ASPECT_COLOR_BIT) {
+                    bc.color = 1;
+                    memcpy(bc.rgba, ca[i].clearValue.color.float32, sizeof bc.rgba);
+                } else {
+                    bc.depth = !!(ca[i].aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT);
+                    bc.stencil = !!(ca[i].aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT);
+                    bc.z = ca[i].clearValue.depthStencil.depth;
+                    bc.st = ca[i].clearValue.depthStencil.stencil;
+                }
+            }
+            begin_rendering_c(s, d, &bc);
+            s_cl_folded++;
+            nca = 0;
+        }
+    }
+    if (nca) {
+        begin_rendering(s, d);
+        vkCmdClearAttachments(s_cb, nca, ca, 1, &rect);
+    }
     VT("  cleared\n");
     s->dirty = 1;
     s->gen++;
@@ -4060,6 +4235,7 @@ static void vk_flip(void)
     int have_image = 0;
     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
     VkPipelineStageFlags ws = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkCommandBuffer sub_cbs[2];
 #ifdef NFSU2_IOS
     int acq_ok = 0;                 /* this frame's acquire returned VK_SUCCESS */
     uint64_t t_sub = 0, t_pre = 0;
@@ -4095,7 +4271,7 @@ static void vk_flip(void)
         s_inst_on = s_frame & 1;
     {
         static int st = -1;
-        static uint32_t st_frame;
+        static uint32_t st_frame, st_cl_passes, st_cl_folded, st_hoist, st_inline;
         if (st < 0) {
             const char *e = getenv("RECOMP_DRAW_STATS");
             st = e && *e == '1';
@@ -4104,6 +4280,16 @@ static void vk_flip(void)
             fprintf(stderr, "[vk] per frame: %u draws -> %u draw calls (%u instances appended)\n",
                     s_st_draws / (s_frame - st_frame), s_st_calls / (s_frame - st_frame),
                     s_st_inst / (s_frame - st_frame));
+            fprintf(stderr, "[vk] per frame: %.2f load-clear passes, %.2f clears folded, "
+                    "%.2f uploads hoisted, %.2f inline\n",
+                    (double)(s_cl_passes - st_cl_passes) / (s_frame - st_frame),
+                    (double)(s_cl_folded - st_cl_folded) / (s_frame - st_frame),
+                    (double)(s_hoist_up - st_hoist) / (s_frame - st_frame),
+                    (double)(s_inline_up - st_inline) / (s_frame - st_frame));
+            st_cl_passes = s_cl_passes;
+            st_cl_folded = s_cl_folded;
+            st_hoist = s_hoist_up;
+            st_inline = s_inline_up;
             s_st_draws = s_st_calls = s_st_inst = 0;
             st_frame = s_frame;
         }
@@ -4295,8 +4481,8 @@ static void vk_flip(void)
 #endif
     VT("flip %u: submit (image %d)\n", s_frame, have_image);
     vkEndCommandBuffer(s_cb);
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &s_cb;
+    si.commandBufferCount = submit_cbs(sub_cbs);
+    si.pCommandBuffers = sub_cbs;
     if (have_image) {
         si.waitSemaphoreCount = 1;
         si.pWaitSemaphores = &s_f->acquired;
@@ -4357,7 +4543,7 @@ static void vk_flip(void)
         /* Always-on 10 s line: where do the executor's flips go (submit
          * and present are where MoltenVK may wait for a drawable)? */
         static uint64_t win_start, sub_sum, sub_max, pre_sum, pre_max;
-        static uint32_t flips, npre, sub_base, reb_base;
+        static uint32_t flips, npre, sub_base, reb_base, cl_p_base, cl_f_base, ho_base, in_base;
         uint64_t now = hz_now();
         if (!win_start) {
             win_start = now;
@@ -4390,9 +4576,17 @@ static void vk_flip(void)
 #endif
                 fprintf(stderr, "[ios-vk2] 10 s: passes/frame %.1f, upload-split passes/frame %.1f, "
                         "layout-split passes/frame %.1f, uploads/frame %.1f, upload KB/frame %.1f, "
+                        "load-clear passes/frame %.1f, clears folded/frame %.1f, "
+                        "hoisted uploads/frame %.1f, inline uploads/frame %.1f, "
                         "mem left %llu MB\n",
                         s_ios_passes / nf, s_ios_up_splits / nf, s_ios_lay_splits / nf,
-                        s_ios_uploads / nf, s_ios_up_bytes / 1024.0 / nf, mem_mb);
+                        s_ios_uploads / nf, s_ios_up_bytes / 1024.0 / nf,
+                        (s_cl_passes - cl_p_base) / nf, (s_cl_folded - cl_f_base) / nf,
+                        (s_hoist_up - ho_base) / nf, (s_inline_up - in_base) / nf, mem_mb);
+                cl_p_base = s_cl_passes;
+                cl_f_base = s_cl_folded;
+                ho_base = s_hoist_up;
+                in_base = s_inline_up;
                 s_ios_passes = s_ios_up_splits = s_ios_lay_splits = s_ios_uploads = 0;
                 s_ios_up_bytes = 0;
             }
