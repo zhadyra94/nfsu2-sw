@@ -705,6 +705,21 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   queued (immediate-when-late flag), so frame times are not quantised --
   an adaptive vblank hold was tried and never triggered (trace: retires
   8 ms after a vblank, no vblank between).
+- **60 fps race time floor (v25, src/recomp_manual.c `dt_floor_at_swap`):**
+  `RECOMP_PRESENT_INTERVAL=1` forces every-vblank presents, so races run
+  above 30 fps. The main-loop time step (sub_001890C0, called per iteration
+  from 0x0018A8C0) clamps time at a floor float[0x428EE8] (1/60 at boot, 1/30
+  at NIS start, 1/60 at NIS stop) and emits N = int(t*3600+0.5) physics
+  ticks. Iterations shorter than the floor count as a full floor, so game
+  time runs at fps/30: 1.10 at 33 fps with floor 1/30 (Linux, lavapipe).
+  Fix: at each swap, under interval 1, set the floor to 0 (zero, the
+  default; measured sim/wall 0.97-0.99, N0=0 in every run). Kill switch:
+  `RECOMP_DT_FLOOR=game` leaves the game's floor (the v24 behaviour).
+  Other modes: `clamp` (floor above 1/60 -> 1/60; 1.13-1.20 near 60 fps),
+  `test30` (debug, forces 1/30). Logs: `[dt] 60 fps time floor: <mode>` once,
+  `[dt] game floor a -> b, using c` on each game change, `RECOMP_DT_LOG=1`
+  per-second line. Interval 2 never reaches this code. Not yet measured at
+  60 fps in a race: lavapipe races ran at 23-26 fps.
 - **Clocks (switch_nx.c, opt-in):** NFSU2_CPU_MHZ / NFSU2_GPU_MHZ /
   NFSU2_MEM_MHZ via clkrst (8.0+) or pcv: highest listed rate <= the
   request, caps 1785 / 921.6 / 1600, old rates restored on exit (atexit +
@@ -885,6 +900,12 @@ only, never files): `../IOS_IMPROVEMENT_MAP.md`.
   Pre-launch screen `src/ios_launcher.m` runs after cfg_load and before any
   thread / SDL_CreateWindow, exports only the keys it changed
   (`nfsu2_cfg_export_changed`); `NFSU2_LAUNCHER=0` skips it.
+- **Steering (v25):** DRIVE strip default x 0.06-0.28 (51-239 pt on 852),
+  RELATIVE by default (`NFSU2_STEER_MODE=relative|absolute`): the
+  touch-down x is straight, d = (x - x_down) / (0.075 / sens), clamp, 0.04
+  deadzone rescaled, out = sign(d)*a^curve (`NFSU2_STEER_CURVE` 1.0-2.0,
+  default 1.35); absolute = old centre-based strip. A saved editor
+  override of the strip (zone id 12) keeps the old width until Reset.
 - **Layout geometry order** (`zones_rebuild_locked`): preset -> editor
   override -> Size -> aspect shape (round zones keep their phone shape in
   points when the window aspect is >10% off 852/393; `NFSU2_TOUCH_ROUND=0`)

@@ -24,6 +24,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
+#include <time.h>
 
 /* The generated register model (g_eax/g_esp are thread-local there) and the
  * XBOX_PTR/MEM32 accessors; the register names below are its macros. */
@@ -363,8 +364,8 @@ void sub_002E8F20(void)
  * which game code calls directly. Forcing it at the device Reset is not
  * enough: Present saves/overrides/restores the value and the wrappers
  * rewrite it. Catch it at the readers instead: rewrite every-vblank
- * whenever RECOMP_PRESENT_INTERVAL=1. The sim is timer-based, so this
- * does not change game speed. */
+ * whenever RECOMP_PRESENT_INTERVAL=1. The forced present rate also feeds
+ * the main-loop time floor below, so it is not free of side effects. */
 extern void sub_002EB4B0_gen(void);
 extern void sub_002EB6A0_gen(void);
 
@@ -398,17 +399,144 @@ static void force_interval(uint32_t slot)
     }
 }
 
+/* ── 60 fps time floor (0x428EE8) at each swap ─────────────────
+ *
+ * sub_001890C0, the main-loop time step (one call per iteration from
+ * 0x0018A8C0), takes t = max(acc + dt, float[0x428EE8]), caps t at 3/60 and
+ * emits N = int(t*3600+0.5) physics ticks (0x4289B4). The game sets the
+ * floor to 1/60 at boot, 1/30 at NIS start and 1/60 at NIS stop. Above 30
+ * fps each iteration is shorter than 1/30 and counts as a full 1/30, so
+ * game time runs at fps/30 (measured 1.10 at 33 fps with floor 1/30).
+ * The swap runs after the game's NIS write and before the next iteration,
+ * so the value set here applies to every step.
+ *
+ * RECOMP_DT_FLOOR, only with RECOMP_PRESENT_INTERVAL=1:
+ *   zero    (default) floor 0: time is conserved at any fps
+ *   clamp   floor above 1/60 -> 1/60
+ *   game    leave the game's floor (the old behaviour, kill switch)
+ *   test30  force 1/30 (reproduces the 2x case)
+ * Unset or unknown is zero. RECOMP_DT_LOG=1 prints a line per second. */
+enum { DT_ZERO, DT_CLAMP, DT_GAME, DT_TEST30 };
+static const char *const dt_names[] = { "zero", "clamp", "game", "test30" };
+
+static int dt_floor_mode(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("RECOMP_DT_FLOOR");
+        v = DT_ZERO;
+        if (e && strcmp(e, "clamp") == 0)
+            v = DT_CLAMP;
+        else if (e && strcmp(e, "game") == 0)
+            v = DT_GAME;
+        else if (e && strcmp(e, "test30") == 0)
+            v = DT_TEST30;
+    }
+    return v;
+}
+
+static float dt_f32(uint32_t raw)
+{
+    float f;
+    memcpy(&f, &raw, sizeof f);
+    return f;
+}
+
+static uint32_t dt_bits(float f)
+{
+    uint32_t u;
+    memcpy(&u, &f, sizeof u);
+    return u;
+}
+
+static float dt_use(int mode, float game)
+{
+    switch (mode) {
+    case DT_ZERO:   return 0.0f;
+    case DT_CLAMP:  return game > 1.0f / 60.0f ? 1.0f / 60.0f : game;
+    case DT_TEST30: return 1.0f / 30.0f;
+    default:        return game;    /* DT_GAME: leave it */
+    }
+}
+
+static void dt_floor_at_swap(void)
+{
+    static int logon = -1, started;
+    static uint32_t last_written, last_game;
+    static int seen;
+    static unsigned swaps, n0;
+    static uint64_t nsum;
+    static double last_s;
+    int mode = dt_floor_mode();
+    uint32_t mem = MEM32(0x428EE8u);
+    float game, use;
+
+    if (!started) {
+        started = 1;
+        fprintf(stderr, "[dt] 60 fps time floor: %s (RECOMP_DT_FLOOR)\n", dt_names[mode]);
+    }
+    if (logon < 0) {
+        const char *e = getenv("RECOMP_DT_LOG");
+        logon = (e && strcmp(e, "1") == 0);
+    }
+
+    /* The game's own floor: whatever was in memory that we did not write. */
+    if (!seen) {
+        seen = 1;
+        last_game = mem;
+        game = dt_f32(mem);
+        fprintf(stderr, "[dt] game floor %.6f (start), using %.6f\n", game, dt_use(mode, game));
+    } else if (mode == DT_GAME ? mem != last_game : mem != last_written) {
+        game = dt_f32(mem);
+        if (mem != last_game) {
+            float prev = dt_f32(last_game);
+            last_game = mem;
+            fprintf(stderr, "[dt] game floor %.6f -> %.6f, using %.6f\n", prev, game,
+                    dt_use(mode, game));
+        }
+    }
+    game = dt_f32(last_game);
+    use = dt_use(mode, game);
+    if (mode != DT_GAME)
+        MEM32(0x428EE8u) = dt_bits(use);
+    last_written = MEM32(0x428EE8u);
+
+    if (logon) {
+        struct timespec ts;
+        double now;
+        swaps++;
+        if (MEM32(0x4289B4u) == 0u)
+            n0++;
+        nsum += (int32_t)MEM32(0x4289B4u);
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        now = (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+        if (last_s == 0.0)
+            last_s = now;
+        if (now - last_s >= 1.0) {
+            fprintf(stderr, "[dt] wall=%.3f swaps=%u N0=%u sim_s=%.4f floor=%.6f\n",
+                    now - last_s, swaps, n0, (double)nsum / 3600.0, use);
+            swaps = n0 = 0;
+            nsum = 0;
+            last_s = now;
+        }
+    }
+}
+
 void sub_002EB4B0(void)
 {
-    if (swap_interval_wanted())
+    if (swap_interval_wanted()) {
         force_interval(0x2F76FCu);
+        dt_floor_at_swap();
+    }
     sub_002EB4B0_gen();
 }
 
 void sub_002EB6A0(void)
 {
-    if (swap_interval_wanted())
+    if (swap_interval_wanted()) {
         force_interval(0x2F76FCu);
+        dt_floor_at_swap();
+    }
     sub_002EB6A0_gen();
 }
 
