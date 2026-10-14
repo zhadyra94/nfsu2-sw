@@ -23,11 +23,17 @@
 
 /* What a zone drives. ZONE_FLAG sets a wButtons bit (ZONE's `value` is the
  * XBOX_GAMEPAD_* flag), ZONE_ANALOG presses an analog button (`value` is an
- * XBOX_BUTTON_* index, pressed = 255), ZONE_DPAD maps the touch's offset
- * from the zone centre to D-pad flags (diagonals included). */
+ * XBOX_BUTTON_* index, pressed = 255; the DRIVE pedals read lower when the
+ * thumb slides down the pedal, see NFSU2_ANALOG_PEDALS), ZONE_DPAD maps the
+ * touch's offset from the zone centre to D-pad flags (diagonals included),
+ * ZONE_STEER (DRIVE only) is a wide strip: the finger's x offset from the
+ * centre is the left stick X. A STEER zone is hit-tested as a RECTANGLE (rx /
+ * ry are half-extents, not ellipse radii) and is only in the table while the
+ * strip setting is on. */
 #define XBOX_IOS_ZONE_FLAG   0
 #define XBOX_IOS_ZONE_ANALOG 1
 #define XBOX_IOS_ZONE_DPAD   2
+#define XBOX_IOS_ZONE_STEER  3
 
 /* One touchable zone of the on-screen pad, in coordinates normalized to
  * the window (0..1, origin top left). The radii describe an ellipse in
@@ -69,7 +75,33 @@ int  xbox_ios_touch_enabled(void);
 void xbox_ios_touch_set_layout(int drive);
 void xbox_ios_touch_set_scale(float k);
 
-/* Text the overlay draws on zone idx ("GAS", "A", ...), NULL for none. */
+/* Drive feel switches (each also an env key read at the first use; the
+ * setters are for the settings panel and the harness):
+ *   analog pedals   NFSU2_ANALOG_PEDALS (1)  DRIVE GAS / BRAKE value from the
+ *                   finger's height: 255 in the upper 60 % of the pedal, then
+ *                   linearly down to 90 at the very bottom. 0 = flat 255.
+ *   steering strip  NFSU2_STEER (1)          the STEER zone exists in DRIVE;
+ *                   set_steer rebuilds the table and clears all fingers.
+ *   strip gain      NFSU2_STEER_SENS (1.0)   0.5..2.0; full lock needs a
+ *                   finger offset of half-width / sens from the centre.
+ *   old DRIVE       NFSU2_DRIVE_CLASSIC (0)  1 = the pre-strip DRIVE table and
+ *                   its A / B / X / Y / LB / RB labels (no STEER zone).
+ * Main thread. */
+void xbox_ios_touch_set_analog_pedals(int on);
+void xbox_ios_touch_set_steer(int on);
+void xbox_ios_touch_set_steer_sens(float k);
+void xbox_ios_touch_set_drive_classic(int on);
+
+/* Current analog value of a held zone for the overlay (idx in the active
+ * table): 0 when no finger is on it. A DRIVE pedal with analog pedals on:
+ * its level 0..1 (the byte the game reads / 255). The STEER zone: the signed
+ * steer -1..1 (0 when idle). Any other held zone: 1. */
+float xbox_ios_touch_zone_value(int idx);
+
+/* Text the overlay draws on zone idx ("GAS", "A", ...), NULL for none. In
+ * DRIVE (unless NFSU2_DRIVE_CLASSIC): GAS, BRAKE, NOS (B), E-BRAKE (A),
+ * SHIFT^ / SHIFTv (X / Y, with the U+2191 / U+2193 arrows as UTF-8), LOOK
+ * (Black), CAM (White). */
 const char *xbox_ios_touch_zone_label(int idx);
 
 /* Look of a zone, for the overlay (derived from the zone's kind / value and
@@ -90,6 +122,7 @@ enum {
     XBOX_IOS_STYLE_DPAD,
     XBOX_IOS_STYLE_MENU_BACK,
     XBOX_IOS_STYLE_MENU_START,
+    XBOX_IOS_STYLE_STEER,
     XBOX_IOS_STYLE_OTHER
 };
 int xbox_ios_touch_zone_style(int idx);   /* OTHER when idx is out of range */
@@ -108,6 +141,14 @@ unsigned xbox_ios_touch_layout_gen(void);
 /* Called with the zone index when a finger lands on a zone, on whichever
  * thread pumps SDL events. NULL clears it. */
 void xbox_ios_touch_set_press_hook(void (*hook)(int zone_idx));
+
+/* Called when ANY finger goes down and is tracked (zone, steering strip or
+ * dynamic stick), on the thread that pumps SDL events, outside the layer's
+ * lock, after the finger is recorded and before the press hook. Not called
+ * for a repeated down of a held finger, for a finger past the tracking limit
+ * or while touch is off. The overlay wakes its display link with it. NULL
+ * clears. */
+void xbox_ios_touch_set_activity_hook(void (*hook)(void));
 
 /* Tilt steering: x in -1..1 drives the left stick X while no finger holds
  * that stick; active 0 turns it off. */

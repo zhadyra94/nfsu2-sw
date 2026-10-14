@@ -153,13 +153,19 @@ static void lift_all(void)
         fup(i);
 }
 
-/* Back to a known state: touch on, PAD layout, scale 1, no tilt, no hook,
- * no fingers, 16:9 window. The setters clear all fingers by contract; the
+/* Back to a known state: touch on, PAD layout, scale 1, no tilt, no hooks,
+ * analog pedals on, steering strip on at sensitivity 1, new DRIVE table, no
+ * fingers, 16:9 window. The setters clear all fingers by contract; the
  * explicit lift keeps reset() sound even if that contract breaks. */
 static void reset(void)
 {
     xbox_ios_touch_set_press_hook(NULL);
+    xbox_ios_touch_set_activity_hook(NULL);
     xbox_ios_touch_set_enabled(1);
+    xbox_ios_touch_set_analog_pedals(1);
+    xbox_ios_touch_set_steer(1);
+    xbox_ios_touch_set_steer_sens(1.0f);
+    xbox_ios_touch_set_drive_classic(0);
     xbox_ios_touch_set_layout(0);
     xbox_ios_touch_set_scale(1.0f);
     xbox_ios_touch_set_tilt(0.0f, 0);
@@ -197,17 +203,24 @@ static const XBOX_IOS_TOUCH_ZONE *zone(int i)
     return (i >= 0 && i < n) ? &z[i] : NULL;
 }
 
-/* The test's own ellipse test, same convention as the layer: inclusive. */
+/* One zone's shape test, same convention as the layer: inclusive, an ellipse
+ * for every zone but the steering strip, which is a rectangle. */
+static int in_shape(const XBOX_IOS_TOUCH_ZONE *z, float x, float y)
+{
+    float dx = (x - z->cx) / z->rx;
+    float dy = (y - z->cy) / z->ry;
+    if (z->kind == XBOX_IOS_ZONE_STEER)
+        return fabsf(dx) <= 1.0f && fabsf(dy) <= 1.0f;
+    return dx * dx + dy * dy <= 1.0f;
+}
+
 static int zone_hit(float x, float y)
 {
     int n = 0, i;
     const XBOX_IOS_TOUCH_ZONE *z = xbox_ios_touch_zones(&n);
-    for (i = 0; i < n; i++) {
-        float dx = (x - z[i].cx) / z[i].rx;
-        float dy = (y - z[i].cy) / z[i].ry;
-        if (dx * dx + dy * dy <= 1.0f)
+    for (i = 0; i < n; i++)
+        if (in_shape(&z[i], x, y))
             return i;
-    }
     return -1;
 }
 
@@ -236,6 +249,16 @@ static int zone_by_flag(int flag)
             return i;
     }
     record_fail(__LINE__, "no FLAG zone for wButtons bit 0x%x", flag);
+    return -1;
+}
+
+/* Like zone_by_kind, but a missing zone is a result, not a failure. */
+static int zone_find_kind(int kind)
+{
+    int n = zcount(), i;
+    for (i = 0; i < n; i++)
+        if (zone(i)->kind == kind)
+            return i;
     return -1;
 }
 
@@ -319,6 +342,16 @@ static const PadButton k_pad_buttons[] = {
     { "X",  XBOX_BUTTON_X },        { "Y",  XBOX_BUTTON_Y },
     { "LB", XBOX_BUTTON_BLACK },    { "RB", XBOX_BUTTON_WHITE },
     { "LT", XBOX_BUTTON_LTRIGGER }, { "RT", XBOX_BUTTON_RTRIGGER },
+};
+
+/* DRIVE (function names, Control Type 1). The shift arrows are U+2191 / U+2193
+ * in UTF-8. */
+#define LBL_SHIFT_UP "SHIFT\xE2\x86\x91"
+#define LBL_SHIFT_DN "SHIFT\xE2\x86\x93"
+static const PadButton k_drive_buttons[] = {
+    { "E-BRAKE",    XBOX_BUTTON_A },     { "NOS",        XBOX_BUTTON_B },
+    { LBL_SHIFT_UP, XBOX_BUTTON_X },     { LBL_SHIFT_DN, XBOX_BUTTON_Y },
+    { "LOOK",       XBOX_BUTTON_BLACK }, { "CAM",        XBOX_BUTTON_WHITE },
 };
 
 /* The contract of the packet number: moves on every read; the rest of the
@@ -739,7 +772,9 @@ static void t_touch_off_side_effects(void)
     expect_sticks(&s, 0, 0, 0, 0, 0, "tilt after off/on");
 }
 
-/* 7. Layout: DRIVE has GAS / BRAKE; switching clears held fingers. */
+/* 7. Layout: DRIVE has GAS / BRAKE and the function-named buttons (changed
+ * with the DRIVE redesign: it used to look for the pad labels A / B / X / Y /
+ * LB / RB in DRIVE); switching clears held fingers. */
 static void t_layout_drive(void)
 {
     XBOX_INPUT_STATE s;
@@ -780,24 +815,33 @@ static void t_layout_drive(void)
         fup(1);
     }
 
-    /* The face buttons, shoulders, BACK/START and the d-pad survive in DRIVE. */
+    /* The face buttons and shoulders keep their buttons under the DRIVE
+     * function names (E-BRAKE = A, NOS = B, SHIFT up / down = X / Y, LOOK =
+     * Black, CAM = White); BACK / START, the d-pad and the strip are there. */
     {
         size_t k;
-        for (k = 0; k < sizeof k_pad_buttons / sizeof k_pad_buttons[0]; k++) {
-            const char *l = k_pad_buttons[k].label;
-            if (!strcmp(l, "LT") || !strcmp(l, "RT"))
-                continue;
+        int n = zcount(), i;
+        for (i = 0; i < n; i++) {
+            const char *l = xbox_ios_touch_zone_label(i);
+            CHECK(!(l && (!strcmp(l, "A") || !strcmp(l, "B") || !strcmp(l, "X") ||
+                          !strcmp(l, "Y") || !strcmp(l, "LB") || !strcmp(l, "RB"))),
+                  "DRIVE still has the pad label \"%s\"", l);
+        }
+        for (k = 0; k < sizeof k_drive_buttons / sizeof k_drive_buttons[0]; k++) {
+            const char *l = k_drive_buttons[k].label;
             z = zone(zone_by_label(l));
             if (!z)
                 continue;
+            CHECK(zone_hit(z->cx, z->cy) == zone_by_label(l), "%s centre is shadowed", l);
             fdown(1, z->cx, z->cy);
             s = rd();
-            expect_only_analog(&s, k_pad_buttons[k].button, l);
+            expect_only_analog(&s, k_drive_buttons[k].button, l);
             fup(1);
         }
         zone_by_flag(XBOX_GAMEPAD_BACK);
         zone_by_flag(XBOX_GAMEPAD_START);
         zone_by_kind(XBOX_IOS_ZONE_DPAD);
+        zone_by_kind(XBOX_IOS_ZONE_STEER);
     }
 
     /* Back to PAD restores the old table. */
@@ -1149,8 +1193,17 @@ static void t_zone_style(void)
               "DRIVE BRAKE style");
         CHECK(zone(gas) && zone(gas)->value == XBOX_BUTTON_RTRIGGER, "DRIVE GAS is not RT");
         CHECK(zone(brake) && zone(brake)->value == XBOX_BUTTON_LTRIGGER, "DRIVE BRAKE is not LT");
-        CHECK(xbox_ios_touch_zone_style(zone_by_label("A")) == XBOX_IOS_STYLE_FACE_A,
-              "DRIVE A style");
+        /* Changed with the DRIVE redesign: A is "E-BRAKE" there now. */
+        CHECK(xbox_ios_touch_zone_style(zone_by_label("E-BRAKE")) == XBOX_IOS_STYLE_FACE_A,
+              "DRIVE E-BRAKE (A) style");
+        CHECK(xbox_ios_touch_zone_style(zone_by_label("NOS")) == XBOX_IOS_STYLE_FACE_B,
+              "DRIVE NOS (B) style");
+        CHECK(xbox_ios_touch_zone_style(zone_by_label("LOOK")) == XBOX_IOS_STYLE_SHOULDER_BLACK,
+              "DRIVE LOOK (Black) style");
+        CHECK(xbox_ios_touch_zone_style(zone_by_kind(XBOX_IOS_ZONE_STEER)) == XBOX_IOS_STYLE_STEER,
+              "DRIVE strip style");
+        CHECK(xbox_ios_touch_zone_label(zone_by_kind(XBOX_IOS_ZONE_STEER)) == NULL,
+              "the strip has a label");
     }
     /* Every zone gets a real style, never OTHER, in both layouts. */
     for (int pass = 0; pass < 2; pass++) {
@@ -1273,6 +1326,765 @@ static void t_layout_gen(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* Drive feel: analog pedals, steering strip, activity hook, geometry   */
+/* ------------------------------------------------------------------ */
+
+#define PEDAL_FLAT_BYTE 255
+#define PEDAL_LOW_BYTE  90
+
+/* Finger height for fraction f of a zone (0 top .. 1 bottom). */
+static float zone_y(const XBOX_IOS_TOUCH_ZONE *z, float f)
+{
+    return z->cy - z->ry + 2.0f * z->ry * f;
+}
+
+static int analog_of(const XBOX_INPUT_STATE *s, int button)
+{
+    return s->Gamepad.bAnalogButtons[button];
+}
+
+/* One pedal: finger down at the zone centre (inside, latched from then on),
+ * then slid to each height. Expected byte for fraction f. */
+static void pedal_ramp(const char *label, int button)
+{
+    int zi = zone_by_label(label);
+    const XBOX_IOS_TOUCH_ZONE *z = zone(zi);
+    XBOX_INPUT_STATE s;
+    static const struct { float f; int want; int tol; const char *name; } pts[] = {
+        { 0.50f, 255, 0, "middle" },
+        { 0.05f, 255, 0, "top" },
+        { 0.58f, 255, 0, "just above the 40% mark" },
+        { 0.60f, 255, 1, "the 40% mark" },
+        { 0.80f, 172, 2, "80% down (half way down the ramp)" },
+        { 1.00f,  90, 1, "the very bottom" },
+        { 1.40f,  90, 1, "below the zone (latched finger)" },
+        { 0.20f, 255, 0, "back up" },
+        { -0.40f, 255, 0, "above the zone (latched finger)" },
+        { 0.70f, 214, 2, "70% down" },
+    };
+    size_t k;
+    char what[80];
+
+    if (!z)
+        return;
+    fdown(1, z->cx, z->cy);
+    for (k = 0; k < sizeof pts / sizeof pts[0]; k++) {
+        float v;
+        fmove(1, z->cx, zone_y(z, pts[k].f));
+        s = rd();
+        snprintf(what, sizeof what, "%s %s", label, pts[k].name);
+        CHECK(abs(analog_of(&s, button) - pts[k].want) <= pts[k].tol,
+              "%s: %d, want %d (+-%d)", what, analog_of(&s, button), pts[k].want, pts[k].tol);
+        v = xbox_ios_touch_zone_value(zi);
+        CHECK(fabsf(v - (float)analog_of(&s, button) / 255.0f) < 0.004f,
+              "%s: zone_value %.3f differs from the state byte %d", what, v, analog_of(&s, button));
+    }
+    /* The ramp is monotonic from the 40% mark down. */
+    {
+        int prev = 256, i;
+        for (i = 0; i <= 20; i++) {
+            float f = 0.6f + 0.4f * (float)i / 20.0f;
+            fmove(1, z->cx, zone_y(z, f));
+            s = rd();
+            CHECK(analog_of(&s, button) <= prev, "%s ramp not monotonic at f=%.2f", label, f);
+            prev = analog_of(&s, button);
+        }
+    }
+    fup(1);
+    CHECK(xbox_ios_touch_zone_value(zi) == 0.0f, "%s: zone_value %.3f after the lift",
+          label, xbox_ios_touch_zone_value(zi));
+    s = rd();
+    expect_idle(&s, "pedal lifted");
+}
+
+/* 16. Analog pedals: bottom ~90, 40% mark 255, upper part 255, follows the
+ * finger, only the DRIVE pedals, scale-independent. */
+static void t_pedal_analog(void)
+{
+    int zi, a, n;
+    XBOX_INPUT_STATE s;
+    const XBOX_IOS_TOUCH_ZONE *z;
+    reset();
+    xbox_ios_touch_set_layout(1);
+    pedal_ramp("GAS", XBOX_BUTTON_RTRIGGER);
+    pedal_ramp("BRAKE", XBOX_BUTTON_LTRIGGER);
+
+    /* Not a pedal: NOS (B) and E-BRAKE (A) stay flat 255 at the bottom. */
+    a = zone_by_label("NOS");
+    z = zone(a);
+    if (z) {
+        fdown(1, z->cx, z->cy);
+        fmove(1, z->cx, zone_y(z, 1.0f));
+        s = rd();
+        expect_only_analog(&s, XBOX_BUTTON_B, "NOS at the bottom of its zone");
+        CHECK(xbox_ios_touch_zone_value(a) == 1.0f, "NOS zone_value %.3f, want 1",
+              xbox_ios_touch_zone_value(a));
+        fup(1);
+    }
+
+    /* The ramp follows the scaled zone. */
+    xbox_ios_touch_set_scale(1.3f);
+    zi = zone_by_label("GAS");
+    z = zone(zi);
+    if (z) {
+        fdown(1, z->cx, z->cy);
+        fmove(1, z->cx, zone_y(z, 1.0f));
+        s = rd();
+        CHECK(abs(analog_of(&s, XBOX_BUTTON_RTRIGGER) - PEDAL_LOW_BYTE) <= 1,
+              "GAS bottom at scale 1.3: %d, want 90", analog_of(&s, XBOX_BUTTON_RTRIGGER));
+        fup(1);
+    }
+    xbox_ios_touch_set_scale(1.0f);
+
+    /* PAD triggers stay flat. */
+    xbox_ios_touch_set_layout(0);
+    zi = zone_by_label("RT");
+    z = zone(zi);
+    n = zcount();
+    CHECK(n > 0, "no PAD zones");
+    if (z) {
+        fdown(1, z->cx, z->cy);
+        fmove(1, z->cx, zone_y(z, 1.0f));
+        s = rd();
+        expect_only_analog(&s, XBOX_BUTTON_RTRIGGER, "PAD RT at the bottom of its zone");
+        CHECK(xbox_ios_touch_zone_value(zi) == 1.0f, "PAD RT zone_value %.3f, want 1",
+              xbox_ios_touch_zone_value(zi));
+        fup(1);
+    }
+    CHECK(xbox_ios_touch_zone_value(-1) == 0.0f && xbox_ios_touch_zone_value(zcount()) == 0.0f,
+          "zone_value out of range should be 0");
+}
+
+/* 16b. Digital switch: set_analog_pedals(0) gives today's flat 255, live and
+ * with a finger held. */
+static void t_pedal_digital(void)
+{
+    int zi;
+    const XBOX_IOS_TOUCH_ZONE *z;
+    XBOX_INPUT_STATE s;
+    reset();
+    xbox_ios_touch_set_layout(1);
+    zi = zone_by_label("GAS");
+    z = zone(zi);
+    if (!z)
+        return;
+    fdown(1, z->cx, z->cy);
+    fmove(1, z->cx, zone_y(z, 1.0f));
+    s = rd();
+    CHECK(abs(analog_of(&s, XBOX_BUTTON_RTRIGGER) - PEDAL_LOW_BYTE) <= 1, "analog GAS bottom %d",
+          analog_of(&s, XBOX_BUTTON_RTRIGGER));
+    xbox_ios_touch_set_analog_pedals(0);            /* the finger stays */
+    s = rd();
+    expect_only_analog(&s, XBOX_BUTTON_RTRIGGER, "digital GAS at the bottom (finger held across the switch)");
+    CHECK(xbox_ios_touch_zone_value(zi) == 1.0f, "digital zone_value %.3f, want 1",
+          xbox_ios_touch_zone_value(zi));
+    xbox_ios_touch_set_analog_pedals(1);
+    s = rd();
+    CHECK(abs(analog_of(&s, XBOX_BUTTON_RTRIGGER) - PEDAL_LOW_BYTE) <= 1, "analog again: %d",
+          analog_of(&s, XBOX_BUTTON_RTRIGGER));
+    fup(1);
+}
+
+/* Two fingers on one pedal read the higher value. */
+static void t_pedal_two_fingers(void)
+{
+    const XBOX_IOS_TOUCH_ZONE *z;
+    XBOX_INPUT_STATE s;
+    reset();
+    xbox_ios_touch_set_layout(1);
+    z = zone(zone_by_label("GAS"));
+    if (!z)
+        return;
+    fdown(1, z->cx, zone_y(z, 0.9f));
+    fdown(2, z->cx, zone_y(z, 0.3f));
+    s = rd();
+    CHECK(analog_of(&s, XBOX_BUTTON_RTRIGGER) == 255, "two fingers on GAS: %d, want the higher, 255",
+          analog_of(&s, XBOX_BUTTON_RTRIGGER));
+    fup(2);
+    s = rd();
+    CHECK(analog_of(&s, XBOX_BUTTON_RTRIGGER) < 255 && analog_of(&s, XBOX_BUTTON_RTRIGGER) > PEDAL_LOW_BYTE,
+          "after the high finger lifted: %d", analog_of(&s, XBOX_BUTTON_RTRIGGER));
+    lift_all();
+}
+
+static int strip_zone(void)
+{
+    return zone_by_kind(XBOX_IOS_ZONE_STEER);
+}
+
+#define LX(s) ((s).Gamepad.sThumbLX)
+
+/* 17. Steering strip: deflection from the zone centre, deadzone rescaled (no
+ * jump), clamp, Y stays 0, latch, release. */
+static void t_steer_strip(void)
+{
+    int si;
+    const XBOX_IOS_TOUCH_ZONE *z;
+    XBOX_INPUT_STATE s;
+    float half;
+    reset();
+    xbox_ios_touch_set_layout(1);
+    si = strip_zone();
+    z = zone(si);
+    if (!z)
+        return;
+    half = z->rx;                                    /* sensitivity 1 */
+    CHECK(zone_hit(z->cx, z->cy) == si, "strip centre shadowed by zone %d", zone_hit(z->cx, z->cy));
+    CHECK(xbox_ios_touch_zone_value(si) == 0.0f, "strip value %.3f with no finger",
+          xbox_ios_touch_zone_value(si));
+
+    fdown(1, z->cx, z->cy);
+    s = rd();
+    expect_idle(&s, "strip, finger at the centre");
+    CHECK(xbox_ios_touch_zone_pressed(si), "strip: zone_pressed() is 0 while held");
+
+    fmove(1, z->cx + 0.5f * half, z->cy);
+    s = rd();
+    expect_sticks(&s, (int)(32767.0f * (0.5f - 0.05f) / 0.95f), 0, 0, 0, 60, "strip, half way right");
+    CHECK(fabsf(xbox_ios_touch_zone_value(si) - 0.4737f) < 0.002f, "strip value %.4f, want 0.4737",
+          xbox_ios_touch_zone_value(si));
+    fmove(1, z->cx - 0.25f * half, z->cy);
+    s = rd();
+    expect_sticks(&s, -(int)(32767.0f * (0.25f - 0.05f) / 0.95f), 0, 0, 0, 60, "strip, quarter left");
+    CHECK(fabsf(xbox_ios_touch_zone_value(si) + 0.2105f) < 0.002f, "strip value %.4f, want -0.2105",
+          xbox_ios_touch_zone_value(si));
+
+    /* Y never moves, wherever the finger is vertically. */
+    fmove(1, z->cx + 0.5f * half, z->cy - z->ry);
+    s = rd();
+    CHECK(s.Gamepad.sThumbLY == 0 && s.Gamepad.sThumbRX == 0 && s.Gamepad.sThumbRY == 0,
+          "strip moved another axis: LY=%d RX=%d RY=%d", s.Gamepad.sThumbLY, s.Gamepad.sThumbRX,
+          s.Gamepad.sThumbRY);
+
+    /* Deadzone 0.05 of full travel, rescaled so there is no jump at its edge. */
+    fmove(1, z->cx + 0.04f * half, z->cy);
+    s = rd();
+    expect_sticks(&s, 0, 0, 0, 0, 0, "strip, inside the deadzone");
+    fmove(1, z->cx + 0.05f * half, z->cy);
+    s = rd();
+    expect_sticks(&s, 0, 0, 0, 0, 40, "strip, at the deadzone edge");
+    fmove(1, z->cx + 0.06f * half, z->cy);
+    s = rd();
+    CHECK(LX(s) > 0 && LX(s) < 600, "strip just past the deadzone: LX=%d (a jump?)", LX(s));
+    fmove(1, z->cx - 0.04f * half, z->cy);
+    s = rd();
+    expect_sticks(&s, 0, 0, 0, 0, 0, "strip, inside the deadzone on the left");
+
+    /* Full lock exactly at the half-width; clamped beyond, also off the zone. */
+    fmove(1, z->cx + half, z->cy);
+    s = rd();
+    expect_sticks(&s, STICK_FULL, 0, 0, 0, STICK_NEAR, "strip, full right");
+    fmove(1, z->cx + 3.0f * half, z->cy + 0.2f);
+    s = rd();
+    expect_sticks(&s, STICK_FULL, 0, 0, 0, 0, "strip, 3x overshoot right (clamped, latched)");
+    CHECK(xbox_ios_touch_zone_value(si) == 1.0f, "strip value %.4f, want 1", xbox_ios_touch_zone_value(si));
+    fmove(1, z->cx - 3.0f * half, z->cy);
+    s = rd();
+    expect_sticks(&s, -STICK_FULL, 0, 0, 0, 0, "strip, 3x overshoot left");
+    CHECK(xbox_ios_touch_zone_value(si) == -1.0f, "strip value %.4f, want -1", xbox_ios_touch_zone_value(si));
+
+    /* Latched: sliding onto another zone presses nothing, steering goes on. */
+    {
+        const XBOX_IOS_TOUCH_ZONE *g = zone(zone_by_label("GAS"));
+        if (g) {
+            fmove(1, g->cx, g->cy);
+            s = rd();
+            CHECK(s.Gamepad.wButtons == 0 && analog_of(&s, XBOX_BUTTON_RTRIGGER) == 0,
+                  "a strip finger pressed GAS by sliding over it");
+            CHECK(LX(s) == STICK_FULL, "strip finger over GAS: LX=%d, want full right", LX(s));
+        }
+    }
+
+    /* Release: back to 0. */
+    fup(1);
+    s = rd();
+    expect_idle(&s, "strip lifted");
+    CHECK(!xbox_ios_touch_zone_pressed(si), "strip still pressed after the lift");
+    CHECK(xbox_ios_touch_zone_value(si) == 0.0f, "strip value %.3f after the lift",
+          xbox_ios_touch_zone_value(si));
+}
+
+/* 17b. Strip sensitivity: full lock at half-width / sens; clamped 0.5..2. */
+static void t_steer_sens(void)
+{
+    int si;
+    const XBOX_IOS_TOUCH_ZONE *z;
+    XBOX_INPUT_STATE s;
+    float half;
+    reset();
+    xbox_ios_touch_set_layout(1);
+    si = strip_zone();
+    z = zone(si);
+    if (!z)
+        return;
+    half = z->rx;
+    fdown(1, z->cx, z->cy);
+
+    fmove(1, z->cx + 0.25f * half, z->cy);
+    xbox_ios_touch_set_steer_sens(2.0f);              /* live, finger held */
+    CHECK(zone(si) && zone(si)->rx == half, "the strip width moved with the sensitivity");
+    s = rd();
+    expect_sticks(&s, (int)(32767.0f * (0.5f - 0.05f) / 0.95f), 0, 0, 0, 60, "sens 2: quarter = half deflection");
+    fmove(1, z->cx + 0.5f * half, z->cy);
+    s = rd();
+    expect_sticks(&s, STICK_FULL, 0, 0, 0, STICK_NEAR, "sens 2: half the width = full lock");
+
+    xbox_ios_touch_set_steer_sens(0.5f);
+    fmove(1, z->cx + 0.5f * half, z->cy);
+    s = rd();
+    expect_sticks(&s, (int)(32767.0f * (0.25f - 0.05f) / 0.95f), 0, 0, 0, 60, "sens 0.5: half the width = quarter");
+    fmove(1, z->cx + half, z->cy);
+    s = rd();
+    expect_sticks(&s, (int)(32767.0f * (0.5f - 0.05f) / 0.95f), 0, 0, 0, 60, "sens 0.5: full width = half deflection");
+
+    xbox_ios_touch_set_steer_sens(9.0f);              /* clamps to 2 */
+    fmove(1, z->cx + 0.5f * half, z->cy);
+    s = rd();
+    expect_sticks(&s, STICK_FULL, 0, 0, 0, STICK_NEAR, "sens 9 clamps to 2");
+    xbox_ios_touch_set_steer_sens(0.01f);             /* clamps to 0.5 */
+    fmove(1, z->cx + half, z->cy);
+    s = rd();
+    expect_sticks(&s, (int)(32767.0f * (0.5f - 0.05f) / 0.95f), 0, 0, 0, 60, "sens 0.01 clamps to 0.5");
+    xbox_ios_touch_set_steer_sens(NAN);
+    fmove(1, z->cx + half, z->cy);
+    s = rd();
+    expect_sticks(&s, (int)(32767.0f * (0.5f - 0.05f) / 0.95f), 0, 0, 0, 60, "sens NaN clamps to 0.5");
+    fup(1);
+}
+
+/* 17c. The strip is hit as a rectangle, keeps its width at every size and
+ * stays on screen. */
+static void t_steer_shape(void)
+{
+    int si;
+    const XBOX_IOS_TOUCH_ZONE *z;
+    XBOX_IOS_TOUCH_ZONE base;
+    XBOX_INPUT_STATE s;
+    float lx, ty;
+    reset();
+    xbox_ios_touch_set_layout(1);
+    si = strip_zone();
+    z = zone(si);
+    if (!z)
+        return;
+    base = *z;
+    /* A point that an ellipse of the same radii would miss: the top-left
+     * corner, inset 1%. */
+    lx = base.cx - 0.99f * base.rx;
+    ty = base.cy - 0.99f * base.ry;
+    CHECK(zone_hit(lx, ty) == si, "strip corner (%.3f,%.3f) is not in the strip (zone %d)", lx, ty,
+          zone_hit(lx, ty));
+    fdown(1, lx, ty);
+    CHECK(xbox_ios_touch_zone_pressed(si), "a finger in the strip corner is not a strip finger");
+    s = rd();
+    CHECK(LX(s) < -STICK_FULL / 2, "strip corner finger: LX=%d, want a hard left", LX(s));
+    fup(1);
+    /* Just outside the rectangle is not the strip. */
+    CHECK(zone_hit(base.cx + 1.05f * base.rx, base.cy) != si, "a point 5%% outside the strip hits it");
+
+    /* Island strip (x 11-48 pt, y 133-260 pt of 852x393) stays clear. */
+    CHECK((base.cx - base.rx) * 852.0f > 48.0f ||
+          (base.cy - base.ry) * 393.0f > 260.0f, "the strip meets the Dynamic Island strip");
+
+    /* Size: the width stays; the height follows the size slider but stays on
+     * screen. */
+    xbox_ios_touch_set_scale(1.5f);
+    z = zone(strip_zone());
+    if (z) {
+        CHECK(z->rx == base.rx, "strip rx %.4f changed with the size (was %.4f)", z->rx, base.rx);
+        CHECK(z->cx - z->rx >= 0.0f && z->cx + z->rx <= 0.5f, "strip leaves x 0..0.5 at 1.5x");
+        CHECK(z->cy + z->ry <= 1.0f && z->cy - z->ry >= 0.5f, "strip leaves the screen at 1.5x (y %.3f..%.3f)",
+              z->cy - z->ry, z->cy + z->ry);
+        CHECK(z->ry > base.ry, "strip did not grow at 1.5x");
+    }
+    xbox_ios_touch_set_scale(0.7f);
+    z = zone(strip_zone());
+    if (z)
+        CHECK(z->rx == base.rx && z->ry < base.ry, "strip at 0.7x: rx %.4f ry %.4f", z->rx, z->ry);
+    xbox_ios_touch_set_scale(1.0f);
+}
+
+/* 17d. Strip off (setter): no zone, the dynamic stick as before; on again
+ * brings it back. Both toggles drop the fingers. PAD is not affected. */
+static void t_steer_disabled(void)
+{
+    int n_on, si, i;
+    float cx, cy;
+    float bx, by, kx, ky;
+    XBOX_INPUT_STATE s;
+    const XBOX_IOS_TOUCH_ZONE *z;
+    unsigned gen;
+    reset();
+    xbox_ios_touch_set_layout(1);
+    n_on = zcount();
+    si = strip_zone();
+    z = zone(si);
+    if (!z)
+        return;
+    cx = z->cx;
+    cy = z->cy;
+
+    fdown(1, cx, cy);                                 /* a strip finger across the toggle */
+    gen = xbox_ios_touch_layout_gen();
+    xbox_ios_touch_set_steer(0);
+    CHECK(xbox_ios_touch_layout_gen() != gen, "set_steer did not bump the layout generation");
+    CHECK(zcount() == n_on - 1, "zone count %d with the strip off, want %d", zcount(), n_on - 1);
+    CHECK(zone_find_kind(XBOX_IOS_ZONE_STEER) < 0, "a STEER zone is still in the table");
+    for (i = 0; i < zcount(); i++)
+        CHECK(xbox_ios_touch_zone_style(i) != XBOX_IOS_STYLE_STEER, "STEER style left in the table");
+    s = rd();
+    expect_idle(&s, "strip toggled off with a finger held");
+    fup(1);
+
+    /* The same spot is now the bare left half: a dynamic stick. */
+    require_bare(cx, cy);
+    fdown(1, cx, cy);
+    CHECK(xbox_ios_touch_stick(0, &bx, &by, &kx, &ky) == 1, "no dynamic stick finger where the strip was");
+    fmove(1, cx + STICK_RADIUS, cy);
+    s = rd();
+    expect_sticks(&s, STICK_FULL, 0, 0, 0, STICK_NEAR, "dynamic stick where the strip was");
+    fup(1);
+
+    gen = xbox_ios_touch_layout_gen();
+    xbox_ios_touch_set_steer(1);
+    CHECK(xbox_ios_touch_layout_gen() != gen, "set_steer(1) did not bump the layout generation");
+    CHECK(zcount() == n_on, "zone count %d with the strip back, want %d", zcount(), n_on);
+    CHECK(zone_find_kind(XBOX_IOS_ZONE_STEER) >= 0, "no STEER zone after set_steer(1)");
+
+    /* PAD has no strip either way. */
+    xbox_ios_touch_set_layout(0);
+    CHECK(zone_find_kind(XBOX_IOS_ZONE_STEER) < 0, "PAD has a STEER zone");
+    xbox_ios_touch_set_steer(0);
+    xbox_ios_touch_set_steer(1);
+    CHECK(zone_find_kind(XBOX_IOS_ZONE_STEER) < 0, "PAD has a STEER zone after toggling the strip");
+}
+
+/* 17e. A strip finger outranks the dynamic left stick in either order of
+ * arrival, two strip fingers: the first steers, right stick independent. */
+static void t_steer_priority(void)
+{
+    const XBOX_IOS_TOUCH_ZONE *z;
+    XBOX_INPUT_STATE s;
+    float half;
+    reset();
+    xbox_ios_touch_set_layout(1);
+    z = zone(strip_zone());
+    if (!z)
+        return;
+    half = z->rx;
+    require_bare(0.30f, 0.50f);
+    require_bare(0.60f, 0.50f);
+
+    /* Stick first (lower slot), strip second. */
+    fdown(1, 0.30f, 0.50f);
+    fmove(1, 0.30f + STICK_RADIUS, 0.50f - STICK_RADIUS / WIN_ASPECT);
+    s = rd();
+    CHECK(LX(s) > 0 && s.Gamepad.sThumbLY > 0, "setup: stick finger not driving (%d,%d)", LX(s),
+          s.Gamepad.sThumbLY);
+    fdown(2, z->cx - 0.5f * half, z->cy);
+    s = rd();
+    expect_sticks(&s, -(int)(32767.0f * (0.5f - 0.05f) / 0.95f), 0, 0, 0, 60,
+                  "stick finger first, strip second: the strip wins, Y is 0");
+    fup(2);
+    s = rd();
+    CHECK(LX(s) > 0 && s.Gamepad.sThumbLY > 0, "stick does not drive again after the strip lifted");
+    fup(1);
+
+    /* Strip first (lower slot), stick second. */
+    fdown(1, z->cx + 0.5f * half, z->cy);
+    fdown(2, 0.30f, 0.50f);
+    fmove(2, 0.30f - STICK_RADIUS, 0.50f);
+    s = rd();
+    expect_sticks(&s, (int)(32767.0f * (0.5f - 0.05f) / 0.95f), 0, 0, 0, 60,
+                  "strip first, stick second: the strip wins");
+    lift_all();
+
+    /* Two strip fingers: the first one steers; the second takes over after. */
+    fdown(1, z->cx + 0.5f * half, z->cy);
+    fdown(2, z->cx - 0.5f * half, z->cy);
+    s = rd();
+    CHECK(LX(s) > 0, "two strip fingers: LX=%d, want the first (right)", LX(s));
+    CHECK(fabsf(xbox_ios_touch_zone_value(strip_zone()) - 0.4737f) < 0.002f,
+          "strip zone_value %.3f differs from the state", xbox_ios_touch_zone_value(strip_zone()));
+    fup(1);
+    s = rd();
+    CHECK(LX(s) < 0, "after the first lifted: LX=%d, want the second (left)", LX(s));
+    lift_all();
+
+    /* The right stick is independent of the strip. */
+    fdown(1, z->cx + 0.5f * half, z->cy);
+    fdown(2, 0.60f, 0.50f);
+    fmove(2, 0.60f + STICK_RADIUS, 0.50f);
+    s = rd();
+    CHECK(abs(LX(s) - (int)(32767.0f * (0.5f - 0.05f) / 0.95f)) <= 60 && s.Gamepad.sThumbLY == 0 &&
+          abs(s.Gamepad.sThumbRX - STICK_FULL) <= STICK_NEAR && s.Gamepad.sThumbRY == 0,
+          "strip + right stick: L=(%d,%d) R=(%d,%d)", LX(s), s.Gamepad.sThumbLY, s.Gamepad.sThumbRX,
+          s.Gamepad.sThumbRY);
+    lift_all();
+}
+
+/* 17f. Tilt applies only while no finger steers: strip or stick. */
+static void t_tilt_vs_strip(void)
+{
+    const XBOX_IOS_TOUCH_ZONE *z;
+    const XBOX_IOS_TOUCH_ZONE *g;
+    XBOX_INPUT_STATE s;
+    reset();
+    xbox_ios_touch_set_layout(1);
+    z = zone(strip_zone());
+    g = zone(zone_by_label("GAS"));
+    if (!z || !g)
+        return;
+    xbox_ios_touch_set_tilt(0.5f, 1);
+    s = rd();
+    expect_sticks(&s, 16383, 0, 0, 0, 2, "tilt alone");
+
+    fdown(1, g->cx, g->cy);                           /* a pedal does not stop the tilt */
+    s = rd();
+    CHECK(LX(s) == 16383 || abs(LX(s) - 16383) <= 2, "tilt with GAS held: LX=%d", LX(s));
+    fup(1);
+
+    fdown(1, z->cx, z->cy);                           /* a resting strip finger does */
+    s = rd();
+    expect_sticks(&s, 0, 0, 0, 0, 0, "tilt vs a resting strip finger");
+    fmove(1, z->cx - z->rx, z->cy);
+    s = rd();
+    expect_sticks(&s, -STICK_FULL, 0, 0, 0, STICK_NEAR, "tilt vs a strip finger steering left");
+    fup(1);
+    s = rd();
+    expect_sticks(&s, 16383, 0, 0, 0, 2, "tilt returns after the strip finger lifts");
+    xbox_ios_touch_set_tilt(0.0f, 0);
+}
+
+/* 18. Activity hook: every tracked finger down, whatever it lands on. */
+static int s_act_calls, s_act_recorded;
+static int s_seq[64], s_seqn;
+
+static void note_seq(int what)
+{
+    if (s_seqn < 64)
+        s_seq[s_seqn++] = what;
+}
+
+static void act_hook(void)
+{
+    float bx, by, kx, ky;
+    s_act_calls++;
+    note_seq('A');
+    /* The finger is recorded before the hook runs: the layer can be queried. */
+    {
+        int n = zcount(), i, any = 0;
+        for (i = 0; i < n; i++)
+            any |= xbox_ios_touch_zone_pressed(i);
+        any |= xbox_ios_touch_stick(0, &bx, &by, &kx, &ky);
+        any |= xbox_ios_touch_stick(1, &bx, &by, &kx, &ky);
+        if (any)
+            s_act_recorded++;
+    }
+}
+
+static void seq_press_hook(int zone_idx)
+{
+    (void)zone_idx;
+    note_seq('P');
+}
+
+static void t_activity_hook(void)
+{
+    const XBOX_IOS_TOUCH_ZONE *a, *z;
+    int expect = 0;
+    reset();
+    xbox_ios_touch_set_layout(1);
+    z = zone(strip_zone());
+    a = zone(zone_by_label("GAS"));
+    if (!z || !a)
+        return;
+    require_bare(0.30f, 0.50f);
+    require_bare(0.60f, 0.50f);
+
+    s_act_calls = 0;
+    s_act_recorded = 0;
+    s_seqn = 0;
+    xbox_ios_touch_set_activity_hook(act_hook);
+    xbox_ios_touch_set_press_hook(seq_press_hook);
+
+    fdown(1, a->cx, a->cy);                           /* a zone */
+    expect++;
+    CHECK(s_act_calls == expect, "after a zone down: %d calls, want %d", s_act_calls, expect);
+    CHECK(s_seqn == 2 && s_seq[0] == 'A' && s_seq[1] == 'P',
+          "order after a zone down: %d events, first %c second %c (want activity, then press)", s_seqn,
+          s_seqn > 0 ? s_seq[0] : '-', s_seqn > 1 ? s_seq[1] : '-');
+    fdown(2, z->cx, z->cy);                           /* the steering strip */
+    expect++;
+    CHECK(s_act_calls == expect, "after a strip down: %d calls, want %d", s_act_calls, expect);
+    fdown(3, 0.30f, 0.50f);                           /* the dynamic left stick */
+    expect++;
+    CHECK(s_act_calls == expect, "after a left-stick down: %d calls, want %d", s_act_calls, expect);
+    fdown(4, 0.60f, 0.50f);                           /* the dynamic right stick */
+    expect++;
+    CHECK(s_act_calls == expect, "after a right-stick down: %d calls, want %d", s_act_calls, expect);
+    fdown(5, 0.35f, 0.45f);                           /* a waiting second left finger */
+    expect++;
+    CHECK(s_act_calls == expect, "after a waiting finger down: %d calls, want %d", s_act_calls, expect);
+    CHECK(s_act_recorded == s_act_calls, "the finger was not recorded yet in %d of %d hook calls",
+          s_act_calls - s_act_recorded, s_act_calls);
+
+    /* Not for moves, repeated downs, ups or fingers past the limit. */
+    fmove(1, a->cx, a->cy + 0.01f);
+    fdown(2, z->cx, z->cy);                           /* a repeated down of a held finger */
+    fdown(6, 0.45f, 0.45f);                           /* the sixth finger: not tracked */
+    fup(1);
+    fup(6);
+    CHECK(s_act_calls == expect, "moves / repeated down / ups / sixth finger changed the count to %d, want %d",
+          s_act_calls, expect);
+    lift_all();
+
+    /* Off means off. */
+    xbox_ios_touch_set_enabled(0);
+    fdown(1, 0.30f, 0.50f);
+    CHECK(s_act_calls == expect, "hook fired while touch was off");
+    xbox_ios_touch_set_enabled(1);
+    lift_all();
+
+    /* NULL clears it; the press hook keeps working alone. */
+    xbox_ios_touch_set_activity_hook(NULL);
+    fdown(1, a->cx, a->cy);
+    CHECK(s_act_calls == expect, "hook fired after being cleared");
+    lift_all();
+    xbox_ios_touch_set_press_hook(NULL);
+}
+
+/* 19. DRIVE geometry on an 852x393 screen: nothing overlaps, nothing meets the
+ * Dynamic Island strip or leaves the screen, the main controls are at least
+ * 44 pt. TOUCHTEST_GEOMETRY=1 prints the table. */
+static void t_drive_geometry(void)
+{
+    static const char *main_labels[] = { "GAS", "BRAKE", "NOS", "E-BRAKE" };
+    const float W = 852.0f, H = 393.0f;
+    int n, i, j, k, pass;
+    int print = getenv("TOUCHTEST_GEOMETRY") != NULL;
+
+    reset();
+    xbox_ios_touch_set_layout(1);
+    n = zcount();
+    CHECK(n == 12, "DRIVE has %d zones, want 12", n);
+
+    for (pass = 0; pass < 3; pass++) {
+        static const float scales[3] = { 1.0f, 0.7f, 1.5f };
+        xbox_ios_touch_set_scale(scales[pass]);
+        n = zcount();
+        for (i = 0; i < n; i++) {
+            const XBOX_IOS_TOUCH_ZONE *zi = zone(i);
+            const char *l = xbox_ios_touch_zone_label(i);
+            /* Own centre hits itself (not shadowed). */
+            CHECK(zone_hit(zi->cx, zi->cy) == i, "scale %.1f: zone %d centre shadowed by %d", scales[pass], i,
+                  zone_hit(zi->cx, zi->cy));
+            /* Sampled overlap with every later zone (both ways). */
+            for (j = 0; j < n; j++) {
+                const XBOX_IOS_TOUCH_ZONE *zj = zone(j);
+                int hit = 0, a, b;
+                if (j == i)
+                    continue;
+                for (a = -40; a <= 40 && !hit; a++)
+                    for (b = -40; b <= 40 && !hit; b++) {
+                        float x = zi->cx + zi->rx * (float)a / 40.0f;
+                        float y = zi->cy + zi->ry * (float)b / 40.0f;
+                        if (in_shape(zi, x, y) && in_shape(zj, x, y))
+                            hit = 1;
+                    }
+                if (scales[pass] == 1.0f)
+                    CHECK(!hit, "zones %d (%s) and %d overlap at scale 1.0", i, l ? l : "-", j);
+            }
+            /* The Dynamic Island strip, x 11-48 pt, y 133-260 pt (landscape, scale 1.0 only:
+             * the size slider is the user's own choice). */
+            if (scales[pass] == 1.0f) {
+                int a, b, hit = 0;
+                for (a = -40; a <= 40 && !hit; a++)
+                    for (b = -40; b <= 40 && !hit; b++) {
+                        float x = zi->cx + zi->rx * (float)a / 40.0f;
+                        float y = zi->cy + zi->ry * (float)b / 40.0f;
+                        if (in_shape(zi, x, y) && x * W >= 11.0f && x * W <= 48.0f &&
+                            y * H >= 133.0f && y * H <= 260.0f)
+                            hit = 1;
+                    }
+                CHECK(!hit, "zone %d (%s) meets the Dynamic Island strip", i, l ? l : "-");
+                CHECK(zi->cx - zi->rx >= 0.0f && zi->cx + zi->rx <= 1.0f &&
+                      zi->cy - zi->ry >= 0.0f && zi->cy + zi->ry <= 1.0f,
+                      "zone %d (%s) leaves the screen", i, l ? l : "-");
+            }
+            if (print && pass == 0) {
+                const char *what = zi->kind == XBOX_IOS_ZONE_STEER ? "STEER"
+                                 : zi->kind == XBOX_IOS_ZONE_DPAD ? "DPAD"
+                                 : zi->kind == XBOX_IOS_ZONE_FLAG ?
+                                       (zi->value == XBOX_GAMEPAD_BACK ? "BACK" : "START") : l;
+                printf("   geom %-9s id %2d  c %.3f,%.3f  r %.3f,%.3f  x %.3f-%.3f y %.3f-%.3f  %6.1f x %6.1f pt\n",
+                       what ? what : "?", zi->id, zi->cx, zi->cy, zi->rx, zi->ry, zi->cx - zi->rx,
+                       zi->cx + zi->rx, zi->cy - zi->ry, zi->cy + zi->ry, 2.0f * zi->rx * W, 2.0f * zi->ry * H);
+            }
+        }
+        if (scales[pass] == 1.0f) {
+            for (k = 0; k < 4; k++) {
+                const XBOX_IOS_TOUCH_ZONE *zk = zone(zone_by_label(main_labels[k]));
+                if (zk)
+                    CHECK(2.0f * zk->rx * W >= 44.0f && 2.0f * zk->ry * H >= 44.0f,
+                          "%s is %.1f x %.1f pt, want >= 44", main_labels[k], 2.0f * zk->rx * W,
+                          2.0f * zk->ry * H);
+            }
+            {
+                const XBOX_IOS_TOUCH_ZONE *zs = zone(strip_zone());
+                if (zs)
+                    CHECK(2.0f * zs->rx * W >= 44.0f && 2.0f * zs->ry * H >= 44.0f,
+                          "the strip is %.1f x %.1f pt, want >= 44", 2.0f * zs->rx * W, 2.0f * zs->ry * H);
+            }
+        }
+    }
+    xbox_ios_touch_set_scale(1.0f);
+}
+
+/* 20. Classic switch: the old DRIVE table and labels, no strip. */
+static void t_drive_classic(void)
+{
+    size_t k;
+    int i;
+    XBOX_INPUT_STATE s;
+    reset();
+    xbox_ios_touch_set_layout(1);
+    xbox_ios_touch_set_drive_classic(1);
+    CHECK(zcount() == 11, "classic DRIVE has %d zones, want 11", zcount());
+    CHECK(zone_find_kind(XBOX_IOS_ZONE_STEER) < 0, "classic DRIVE has a STEER zone");
+    for (k = 0; k < sizeof k_pad_buttons / sizeof k_pad_buttons[0]; k++) {
+        const char *l = k_pad_buttons[k].label;
+        const XBOX_IOS_TOUCH_ZONE *z;
+        if (!strcmp(l, "LT") || !strcmp(l, "RT"))
+            continue;
+        z = zone(zone_by_label(l));
+        if (!z)
+            continue;
+        fdown(1, z->cx, z->cy);
+        s = rd();
+        expect_only_analog(&s, k_pad_buttons[k].button, l);
+        fup(1);
+    }
+    for (i = 0; i < zcount(); i++)
+        CHECK(xbox_ios_touch_zone_style(i) != XBOX_IOS_STYLE_OTHER, "classic zone %d has style OTHER", i);
+    /* Pedals still honour the analog switch. */
+    {
+        const XBOX_IOS_TOUCH_ZONE *g = zone(zone_by_label("GAS"));
+        if (g) {
+            fdown(1, g->cx, g->cy);
+            fmove(1, g->cx, zone_y(g, 1.0f));
+            s = rd();
+            CHECK(abs(analog_of(&s, XBOX_BUTTON_RTRIGGER) - PEDAL_LOW_BYTE) <= 1,
+                  "classic GAS bottom %d, want 90", analog_of(&s, XBOX_BUTTON_RTRIGGER));
+            fup(1);
+        }
+    }
+    xbox_ios_touch_set_drive_classic(0);
+    CHECK(zcount() == 12, "new DRIVE has %d zones after leaving classic, want 12", zcount());
+    zone_by_label("E-BRAKE");
+}
+
+/* ------------------------------------------------------------------ */
 /* Environment defaults: need a fresh layer, so run in a forked child   */
 /* ------------------------------------------------------------------ */
 
@@ -1288,6 +2100,11 @@ static int env_child(const char *what)
     unsetenv("RECOMP_TOUCH");
     unsetenv("NFSU2_TOUCH_LAYOUT");
     unsetenv("NFSU2_TOUCH_SCALE");
+    unsetenv("NFSU2_ANALOG_PEDALS");
+    unsetenv("NFSU2_STEER");
+    unsetenv("NFSU2_STEER_SENS");
+    unsetenv("NFSU2_DRIVE_CLASSIC");
+    g_nfail_checks = 0;
 
     if (!strcmp(what, "off")) {
         setenv("RECOMP_TOUCH", "0", 1);
@@ -1316,6 +2133,88 @@ static int env_child(const char *what)
             small = zone(0)->rx;
             if (fabsf(big / small - 1.5f) > 1e-4f) fails++;
         }
+    } else if (!strcmp(what, "analog0")) {
+        /* NFSU2_ANALOG_PEDALS=0: the DRIVE pedals read a flat 255 everywhere. */
+        setenv("NFSU2_TOUCH_LAYOUT", "drive", 1);
+        setenv("NFSU2_ANALOG_PEDALS", "0", 1);
+        if (xbox_ios_touch_init() != 1) fails++;
+        {
+            int gi = zone_by_label("GAS");
+            const XBOX_IOS_TOUCH_ZONE *g = zone(gi);
+            if (g) {
+                fdown(1, g->cx, g->cy);
+                fmove(1, g->cx, zone_y(g, 1.0f));
+                s = rd();
+                CHECK(analog_of(&s, XBOX_BUTTON_RTRIGGER) == 255, "env analog off: GAS bottom %d, want 255",
+                      analog_of(&s, XBOX_BUTTON_RTRIGGER));
+                CHECK(xbox_ios_touch_zone_value(gi) == 1.0f, "env analog off: zone_value %.3f",
+                      xbox_ios_touch_zone_value(gi));
+                fup(1);
+            }
+            xbox_ios_touch_set_analog_pedals(1);                  /* the panel can turn it on */
+            g = zone(gi);
+            if (g) {
+                fdown(1, g->cx, g->cy);
+                fmove(1, g->cx, zone_y(g, 1.0f));
+                s = rd();
+                CHECK(abs(analog_of(&s, XBOX_BUTTON_RTRIGGER) - 90) <= 1, "env analog off, panel on: %d",
+                      analog_of(&s, XBOX_BUTTON_RTRIGGER));
+                fup(1);
+            }
+        }
+        fails += g_nfail_checks;
+    } else if (!strcmp(what, "analog1")) {
+        /* The default: analog on in DRIVE. */
+        setenv("NFSU2_TOUCH_LAYOUT", "drive", 1);
+        if (xbox_ios_touch_init() != 1) fails++;
+        {
+            const XBOX_IOS_TOUCH_ZONE *g = zone(zone_by_label("GAS"));
+            if (g) {
+                fdown(1, g->cx, g->cy);
+                fmove(1, g->cx, zone_y(g, 1.0f));
+                s = rd();
+                CHECK(abs(analog_of(&s, XBOX_BUTTON_RTRIGGER) - 90) <= 1, "default: GAS bottom %d, want 90",
+                      analog_of(&s, XBOX_BUTTON_RTRIGGER));
+                fup(1);
+            }
+            CHECK(zone_find_kind(XBOX_IOS_ZONE_STEER) >= 0, "default DRIVE has no strip");
+        }
+        fails += g_nfail_checks;
+    } else if (!strcmp(what, "steer0")) {
+        setenv("NFSU2_TOUCH_LAYOUT", "drive", 1);
+        setenv("NFSU2_STEER", "0", 1);
+        if (xbox_ios_touch_init() != 1) fails++;
+        CHECK(zone_find_kind(XBOX_IOS_ZONE_STEER) < 0, "env NFSU2_STEER=0: a STEER zone is in the table");
+        CHECK(zcount() == 11, "env NFSU2_STEER=0: %d zones, want 11", zcount());
+        xbox_ios_touch_set_steer(1);                              /* the panel can turn it on */
+        CHECK(zone_find_kind(XBOX_IOS_ZONE_STEER) >= 0, "panel: strip did not come back");
+        fails += g_nfail_checks;
+    } else if (!strcmp(what, "sens2")) {
+        setenv("NFSU2_TOUCH_LAYOUT", "drive", 1);
+        setenv("NFSU2_STEER_SENS", "9", 1);                       /* clamps to 2 */
+        if (xbox_ios_touch_init() != 1) fails++;
+        {
+            const XBOX_IOS_TOUCH_ZONE *z = zone(zone_find_kind(XBOX_IOS_ZONE_STEER));
+            if (z) {
+                fdown(1, z->cx, z->cy);
+                fmove(1, z->cx + 0.5f * z->rx, z->cy);
+                s = rd();
+                CHECK(abs(LX(s) - 32767) <= STICK_NEAR, "env sens 9 (-> 2): half width gives LX=%d, want full", LX(s));
+                fup(1);
+            } else {
+                fails++;
+            }
+        }
+        fails += g_nfail_checks;
+    } else if (!strcmp(what, "classic")) {
+        setenv("NFSU2_TOUCH_LAYOUT", "drive", 1);
+        setenv("NFSU2_DRIVE_CLASSIC", "1", 1);
+        if (xbox_ios_touch_init() != 1) fails++;
+        CHECK(zcount() == 11, "env classic: %d zones, want 11", zcount());
+        CHECK(zone_find_kind(XBOX_IOS_ZONE_STEER) < 0, "env classic: has a STEER zone");
+        CHECK(zone_by_label("A") >= 0 && zone_by_label("LB") >= 0 && zone_by_label("GAS") >= 0,
+              "env classic: old labels missing");
+        fails += g_nfail_checks;
     } else {
         fails = 91;
     }
@@ -1365,10 +2264,19 @@ int main(void)
     env_case("ENV   RECOMP_TOUCH=0: init reports off, state 0, panel can enable", "off");
     env_case("ENV   NFSU2_TOUCH_LAYOUT=drive selects the DRIVE zones", "drive");
     env_case("ENV   NFSU2_TOUCH_SCALE=9 clamps to 1.5", "scale");
+    env_case("ENV   default DRIVE: analog pedals and the strip are on", "analog1");
+    env_case("ENV   NFSU2_ANALOG_PEDALS=0: DRIVE pedals digital 255", "analog0");
+    env_case("ENV   NFSU2_STEER=0: no strip in DRIVE", "steer0");
+    env_case("ENV   NFSU2_STEER_SENS=9 clamps to 2", "sens2");
+    env_case("ENV   NFSU2_DRIVE_CLASSIC=1: the old DRIVE table", "classic");
 
     unsetenv("RECOMP_TOUCH");
     unsetenv("NFSU2_TOUCH_LAYOUT");
     unsetenv("NFSU2_TOUCH_SCALE");
+    unsetenv("NFSU2_ANALOG_PEDALS");
+    unsetenv("NFSU2_STEER");
+    unsetenv("NFSU2_STEER_SENS");
+    unsetenv("NFSU2_DRIVE_CLASSIC");
 
     if (SDL_Init(SDL_INIT_EVENTS) != 0) {
         fprintf(stderr, "touch_test: SDL_Init failed: %s\n", SDL_GetError());
@@ -1406,6 +2314,18 @@ int main(void)
     run_case("15   zone_style(): faces, shoulders, triggers / pedals, menu", t_zone_style, NULL);
     run_case("15b  dpad_bits(): arms held, matches the state, cleared on lift", t_dpad_bits, NULL);
     run_case("15c  layout_gen(): moves on rebuild only", t_layout_gen, NULL);
+    run_case("16   Analog pedals: ~90 at the bottom, 255 from the 40% mark up, DRIVE only", t_pedal_analog, NULL);
+    run_case("16b  Analog pedals switch: digital 255, live with a finger held", t_pedal_digital, NULL);
+    run_case("16c  Two fingers on one pedal: the higher value", t_pedal_two_fingers, NULL);
+    run_case("17   Steering strip: deflection, deadzone, clamp, Y 0, latch, release", t_steer_strip, NULL);
+    run_case("17b  Steering strip sensitivity 0.5..2, live", t_steer_sens, NULL);
+    run_case("17c  Steering strip: rectangle hit test, width fixed, on screen", t_steer_shape, NULL);
+    run_case("17d  Steering strip off: zone gone, dynamic stick back", t_steer_disabled, NULL);
+    run_case("17e  Strip outranks the dynamic stick; two strip fingers", t_steer_priority, NULL);
+    run_case("17f  Tilt is suppressed while the strip (or a stick) steers", t_tilt_vs_strip, NULL);
+    run_case("18   Activity hook: every tracked finger down, not moves / repeats / off", t_activity_hook, NULL);
+    run_case("19   DRIVE geometry on 852x393: no overlap, off the island, sizes", t_drive_geometry, NULL);
+    run_case("20   NFSU2_DRIVE_CLASSIC / set_drive_classic: the old table", t_drive_classic, NULL);
 
     reset();
     SDL_Quit();

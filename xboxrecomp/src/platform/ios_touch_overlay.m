@@ -2,7 +2,8 @@
  * the in-game settings menu (gear button).
  * Pure UIKit/QuartzCore: a transparent view whose layer holds one small CALayer
  * subtree per touch zone (built from the same table the touch layer
- * hit-tests, xinput_ios.c) plus two floating stick layers. Nothing is drawn
+ * hit-tests, xinput_ios.c; the DRIVE steering strip has a knob, the pedals an
+ * analog fill) plus two floating stick layers. Nothing is drawn
  * with drawRect: layers are rebuilt when the zone table or the bounds change
  * and updated by index when a pressed state changes. The overlay itself
  * never takes touches except the gear button (hitTest: returns nil for
@@ -32,6 +33,7 @@ typedef struct XBOX_IOS_TOUCH_ZONE_MIRROR {
 extern const void *xbox_ios_touch_zones(int *count);
 extern int xbox_ios_touch_stick(int side, float *bx, float *by, float *kx, float *ky);
 extern int xbox_ios_touch_zone_pressed(int idx);
+extern float xbox_ios_touch_zone_value(int idx);     /* pedal level 0..1, strip steer -1..1 */
 extern const char *xbox_ios_touch_zone_label(int idx);
 extern int xbox_ios_touch_zone_style(int idx);       /* ZS_* below */
 extern unsigned xbox_ios_touch_dpad_bits(void);      /* up 1, down 2, left 4, right 8 */
@@ -40,6 +42,10 @@ extern void xbox_ios_touch_set_enabled(int on);
 extern void xbox_ios_touch_set_layout(int drive);
 extern void xbox_ios_touch_set_scale(float k);
 extern void xbox_ios_touch_set_press_hook(void (*hook)(int zone_idx));
+extern void xbox_ios_touch_set_activity_hook(void (*hook)(void));   /* any finger down */
+extern void xbox_ios_touch_set_analog_pedals(int on);
+extern void xbox_ios_touch_set_steer(int on);
+extern void xbox_ios_touch_set_steer_sens(float k);
 extern void xbox_ios_touch_set_tilt(float x, int active);
 extern int nv2a_vk_fps_x10(void);
 
@@ -71,7 +77,7 @@ enum {
     ZS_FACE_A = 0, ZS_FACE_B, ZS_FACE_X, ZS_FACE_Y,
     ZS_SHOULDER_BLACK, ZS_SHOULDER_WHITE, ZS_TRIGGER_L, ZS_TRIGGER_R,
     ZS_PEDAL_GAS, ZS_PEDAL_BRAKE, ZS_DPAD, ZS_MENU_BACK, ZS_MENU_START,
-    ZS_OTHER
+    ZS_STEER, ZS_OTHER
 };
 
 static CGFloat s_cscale = 2.0;       /* screen scale, refreshed at every rebuild */
@@ -268,6 +274,10 @@ static void fit_rounded(CGFloat A, CGFloat B, CGFloat fx, CGFloat fy, CGFloat fr
 @property (nonatomic, assign) int pressed;            /* cached; -1 = unknown */
 @property (nonatomic, assign) unsigned dbits;         /* cached d-pad bits */
 @property (nonatomic, assign) CGFloat level;          /* 0..1, pedals */
+@property (nonatomic, strong) CALayer *knob;          /* steering strip: the knob */
+@property (nonatomic, assign) CGFloat travel;         /* strip: knob travel each way, pt */
+@property (nonatomic, assign) CGFloat steerPos;       /* strip: -1..1 */
+@property (nonatomic, assign) CGFloat value;          /* last analog value applied; -2 = none yet */
 @end
 
 @implementation Nfsu2Ctl
@@ -282,12 +292,37 @@ static void fit_rounded(CGFloat A, CGFloat B, CGFloat fx, CGFloat fy, CGFloat fr
     self.levelFill.frame = CGRectMake(0.0, h * (1.0 - v), w, h * v);
 }
 
+/* The strip's knob: v = -1..1 across the track. Callers wrap this in a
+ * CATransaction (no actions while following a finger, short at release). */
+- (void)setSteerPos:(CGFloat)v
+{
+    v = v < -1.0 ? -1.0 : v > 1.0 ? 1.0 : v;
+    _steerPos = v;
+    if (!self.knob)
+        return;
+    self.knob.position = CGPointMake(self.size.width / 2.0 + v * self.travel,
+                                     self.size.height / 2.0);
+}
+
+/* Follow the zone's analog value (pedal level or strip steer). */
+- (void)setAnalogValue:(CGFloat)v
+{
+    self.value = v;
+    if (self.style == ZS_STEER)
+        [self setSteerPos:v];
+    else
+        [self setLevel:v];
+}
+
 /* Callers wrap this in a CATransaction (short duration, or no actions). */
 - (void)applyPressed:(int)p dpad:(unsigned)bits
 {
     self.pressed = p;
     self.dbits = bits;
-    if (self.style == ZS_DPAD) {
+    if (self.style == ZS_STEER) {
+        self.pressFill.opacity = p ? 1.0f : 0.0f;
+        self.knob.opacity = p ? 1.0f : 0.6f;     /* no shrink: the track stays put */
+    } else if (self.style == ZS_DPAD) {
         NSUInteger k;
         for (k = 0; k < self.arms.count; k++) {
             CALayer *a = [self.arms objectAtIndex:k];
@@ -315,7 +350,13 @@ static Nfsu2Ctl *build_ctl(int idx, const XBOX_IOS_TOUCH_ZONE_MIRROR *z, CGFloat
     BOOL menu = (style == ZS_MENU_BACK || style == ZS_MENU_START);
     BOOL face = (style <= ZS_FACE_Y);
     BOOL shoulder = (style == ZS_SHOULDER_BLACK || style == ZS_SHOULDER_WHITE);
-    BOOL circle = (face || shoulder);
+    BOOL steer = (style == ZS_STEER);
+    /* DRIVE names its buttons by function ("E-BRAKE", "NOS", "SHIFT"): a label
+     * of three or more characters does not fit a circle, so that face button
+     * is drawn as a pill. */
+    const char *lbl0 = xbox_ios_touch_zone_label(idx);
+    BOOL wide = (face && lbl0 && strlen(lbl0) > 2);
+    BOOL circle = ((face && !wide) || shoulder);
     UIColor *accent = nil;
     UIColor *white = [UIColor colorWithWhite:1.0 alpha:0.92];
     CGPoint pts[12];
@@ -338,6 +379,13 @@ static Nfsu2Ctl *build_ctl(int idx, const XBOX_IOS_TOUCH_ZONE_MIRROR *z, CGFloat
         r = w / 2.0;
     } else if (pedal) {
         fit_rounded(A, B, 1.0, 1.0, 0.25, &w, &h, &r);
+    } else if (steer) {
+        /* The zone is a rectangle: a pill 60 % of its height, full width. */
+        w = 2.0 * A;
+        h = 2.0 * B * 0.6;
+        r = h / 2.0;
+    } else if (wide) {
+        fit_rounded(A, B, 1.0, 0.80, 0.5, &w, &h, &r);
     } else if (trigger) {
         fit_rounded(A, B, 0.72, 1.0, 0.5, &w, &h, &r);
     } else {
@@ -391,6 +439,8 @@ static Nfsu2Ctl *build_ctl(int idx, const XBOX_IOS_TOUCH_ZONE_MIRROR *z, CGFloat
         pf.cornerRadius = r;
         if (face)
             set_bg(pf, [accent colorWithAlphaComponent:0.35]);
+        else if (steer)
+            set_bg(pf, [UIColor colorWithWhite:1.0 alpha:0.10]);
         else if (pedal)
             set_bg(pf, [UIColor colorWithWhite:1.0 alpha:0.22]);
         else
@@ -409,7 +459,7 @@ static Nfsu2Ctl *build_ctl(int idx, const XBOX_IOS_TOUCH_ZONE_MIRROR *z, CGFloat
         clip.hidden = YES;
         CALayer *lf = [CALayer layer];
         lf.frame = CGRectMake(0.0, h, w, 0.0);
-        set_bg(lf, [accent colorWithAlphaComponent:0.40]);
+        set_bg(lf, [accent colorWithAlphaComponent:0.35]);
         [clip addSublayer:lf];
         [root addSublayer:clip];
         c.levelClip = clip;
@@ -503,6 +553,54 @@ static Nfsu2Ctl *build_ctl(int idx, const XBOX_IOS_TOUCH_ZONE_MIRROR *z, CGFloat
         [root addSublayer:ring];
     }
 
+    /* Steering strip: centre mark, a chevron at each end and the knob. The
+     * knob follows xbox_ios_touch_zone_value(); it rests at the centre. */
+    if (steer) {
+        CAShapeLayer *marks = [CAShapeLayer layer];
+        UIBezierPath *mp = [UIBezierPath bezierPath];
+        CGFloat cy0 = h / 2.0, ch = h * 0.16, cx0 = r * 0.85, kd = h * 0.78;
+        CALayer *knob = [CALayer layer];
+        CAGradientLayer *kg = [CAGradientLayer layer];
+        UIColor *black = [UIColor blackColor];
+
+        [mp moveToPoint:CGPointMake(w / 2.0, h * 0.22)];
+        [mp addLineToPoint:CGPointMake(w / 2.0, h * 0.78)];
+        [mp moveToPoint:CGPointMake(cx0 + ch * 0.6, cy0 - ch)];
+        [mp addLineToPoint:CGPointMake(cx0, cy0)];
+        [mp addLineToPoint:CGPointMake(cx0 + ch * 0.6, cy0 + ch)];
+        [mp moveToPoint:CGPointMake(w - cx0 - ch * 0.6, cy0 - ch)];
+        [mp addLineToPoint:CGPointMake(w - cx0, cy0)];
+        [mp addLineToPoint:CGPointMake(w - cx0 - ch * 0.6, cy0 + ch)];
+        marks.frame = R;
+        marks.contentsScale = s_cscale;
+        set_path(marks, mp);
+        marks.fillColor = NULL;
+        set_stroke(marks, [UIColor colorWithWhite:1.0 alpha:0.28]);
+        marks.lineWidth = 2.0;
+        marks.lineCap = kCALineCapRound;
+        marks.lineJoin = kCALineJoinRound;
+        [root addSublayer:marks];
+
+        knob.bounds = CGRectMake(0.0, 0.0, kd, kd);
+        knob.position = CGPointMake(w / 2.0, h / 2.0);
+        set_shadow(knob, [UIBezierPath bezierPathWithOvalInRect:knob.bounds], black);
+        knob.shadowOpacity = 0.35f;
+        knob.shadowRadius = 4.0;
+        knob.shadowOffset = CGSizeMake(0.0, 2.0);
+        knob.opacity = 0.6f;
+        kg.frame = knob.bounds;
+        kg.contentsScale = s_cscale;
+        kg.cornerRadius = kd / 2.0;
+        kg.masksToBounds = YES;
+        set_border(kg, [UIColor colorWithWhite:1.0 alpha:0.85], 1.5);
+        set_gradient(kg, [UIColor colorWithWhite:1.0 alpha:0.70],
+                         [UIColor colorWithWhite:1.0 alpha:0.38]);
+        [knob addSublayer:kg];
+        [root addSublayer:knob];
+        c.knob = knob;
+        c.travel = fmax((w - kd) / 2.0 - 4.0, 1.0);
+    }
+
     /* D-pad: four arm highlights, lit by xbox_ios_touch_dpad_bits(). */
     if (cross) {
         CGFloat c0 = w / 2.0, L = 0.93 * c0, t = 0.32 * c0, ar = 0.12 * c0;
@@ -529,7 +627,7 @@ static Nfsu2Ctl *build_ctl(int idx, const XBOX_IOS_TOUCH_ZONE_MIRROR *z, CGFloat
 
     /* Label or icon, rendered once. */
     {
-        const char *lbl = xbox_ios_touch_zone_label(idx);
+        const char *lbl = lbl0;
         UIImage *li NS_VALID_UNTIL_END_OF_SCOPE = nil;
         CGFloat ly = h / 2.0;
         if (menu) {
@@ -539,7 +637,9 @@ static Nfsu2Ctl *build_ctl(int idx, const XBOX_IOS_TOUCH_ZONE_MIRROR *z, CGFloat
                 li = text_image(back ? @"BACK" : @"START", h * 0.34, w * 0.86, white);
         } else if (lbl) {
             NSString *s = [NSString stringWithUTF8String:lbl];
-            if (face)
+            if (wide)
+                li = text_image(s, h * 0.40, w * 0.84, accent);
+            else if (face)
                 li = text_image(s, w * 0.46, w * 0.70, accent);
             else if (shoulder)
                 li = text_image(s, w * 0.30, w * 0.72, white);
@@ -568,6 +668,7 @@ static Nfsu2Ctl *build_ctl(int idx, const XBOX_IOS_TOUCH_ZONE_MIRROR *z, CGFloat
     c.ring = ring;
     c.pressed = -1;
     c.dbits = 0xFFFFFFFFu;
+    c.value = -2.0;
     return c;
 }
 
@@ -796,6 +897,8 @@ static Nfsu2Ctl *build_ctl(int idx, const XBOX_IOS_TOUCH_ZONE_MIRROR *z, CGFloat
         Nfsu2Ctl *c = [_ctls objectAtIndex:i];
         int p = xbox_ios_touch_zone_pressed(c.zoneIdx) ? 1 : 0;
         unsigned db = (c.style == ZS_DPAD) ? dbits : 0u;
+        BOOL analog = (c.style == ZS_PEDAL_GAS || c.style == ZS_PEDAL_BRAKE ||
+                       c.style == ZS_STEER);
         if (p)
             active = YES;
         if (p != c.pressed || db != c.dbits) {
@@ -805,6 +908,20 @@ static Nfsu2Ctl *build_ctl(int idx, const XBOX_IOS_TOUCH_ZONE_MIRROR *z, CGFloat
                 open = YES;
             }
             [c applyPressed:p dpad:db];
+            if (analog && !p)
+                [c setAnalogValue:0.0];   /* fill drains / knob returns to centre, eased */
+        }
+        if (analog && p) {
+            /* Pedal level and strip knob follow the finger every tick, with
+             * no implicit animation (it would trail the thumb). Only a value
+             * that moved is written. */
+            CGFloat v = (CGFloat)xbox_ios_touch_zone_value(c.zoneIdx);
+            if (fabs(v - c.value) > 0.004) {
+                [CATransaction begin];   /* nests inside the eased one, if open */
+                [CATransaction setDisableActions:YES];
+                [c setAnalogValue:v];
+                [CATransaction commit];
+            }
         }
     }
     if (open)
@@ -841,9 +958,17 @@ static void refresh_shapes(void)
 /* ── Update loop: display link, paused while idle ──
  * Touch state changes on the SDL thread and there is no change callback, so:
  * the link (30 fps) runs only while a zone is held or a stick is driven, and
- * pauses after 3 idle ticks. While it is paused a 20 Hz timer calls the same
- * sync (a few lock-protected scans) and unpauses the link on the first sign
- * of activity. A zone press also wakes it at once through the press hook. */
+ * pauses after 3 idle ticks. It wakes through three paths, together every way
+ * the touch state or the visibility can change while it is paused:
+ *   1. the touch layer's activity hook: ANY finger down (zone, steering strip,
+ *      dynamic stick), posted to the main thread at once;
+ *   2. ios_touch_overlay_set_visible -> applyVisibility -> setShapesHidden:NO
+ *      (a pad or keyboard leaves), which syncs and wakes;
+ *   3. apply_live (the panel: touch on, layout, size, strip): syncs at once.
+ * A finger's later moves and its lift need no wake: the finger that went down
+ * woke the link and it keeps ticking while anything is held. The old 20 Hz
+ * NSTimer that polled the touch state while the link slept is gone; it comes
+ * back with NFSU2_OVERLAY_WATCH=1 in nfsu2_env.txt (next launch). */
 static CADisplayLink *s_link;
 static NSTimer *s_watch;
 static int s_idle_ticks;
@@ -867,12 +992,28 @@ static void haptic_fire_main(void)
     }
 }
 
-/* Main thread: show the press at once, wake the update loop, then the haptic. */
-static void touch_hook_main(void)
+/* Main thread: any finger down. Show the touch at once, wake the update loop.
+ * Posted before the press hook's block, so the control is lit when the
+ * haptic fires. */
+static void touch_activity_main(void)
 {
     if (s_ov)
         (void)[s_ov syncControls];
     overlay_wake();
+}
+
+/* Runs on whichever thread pumps SDL events (often not main). */
+static void touch_activity_hook(void)
+{
+    if ([NSThread isMainThread])
+        touch_activity_main();
+    else
+        dispatch_async(dispatch_get_main_queue(), ^{ touch_activity_main(); });
+}
+
+/* Main thread: the haptic for a zone press. */
+static void touch_hook_main(void)
+{
     if (__atomic_load_n(&s_haptics_on, __ATOMIC_RELAXED))
         haptic_fire_main();
 }
@@ -892,6 +1033,12 @@ static void touch_press_hook(int zone_idx)
 static CMMotionManager *s_motion;
 static float s_tilt_sens = 1.0f;
 static int s_tilt_flip;               /* NFSU2_TILT_FLIP=1: swap the sign */
+/* "Centre now": the roll angle (degrees, asin of gravity along the device's
+ * long axis, before the orientation sign) taken as neutral. Main thread only
+ * (the motion handler runs on the main queue). 0 = today's behaviour. */
+static double s_tilt_centre_deg;      /* NFSU2_TILT_CENTRE, -60..60, 1 decimal */
+static double s_tilt_last_deg;        /* latest sample */
+static int s_tilt_have_sample;        /* s_tilt_last_deg is valid (tilt running) */
 
 static void tilt_update(CMDeviceMotion *m)
 {
@@ -910,7 +1057,12 @@ static void tilt_update(CMDeviceMotion *m)
     if (s_tilt_flip)
         sign = -sign;
     gy = gy > 1.0 ? 1.0 : gy < -1.0 ? -1.0 : gy;
-    n = sign * asin(gy) / 0.5235988 * (double)s_tilt_sens;   /* 30 degrees */
+    s_tilt_last_deg = asin(gy) * (180.0 / M_PI);
+    s_tilt_have_sample = 1;
+    /* The neutral offset is in the device frame, so it survives a flip of the
+     * landscape orientation (the sign multiplies the difference). */
+    n = sign * (asin(gy) - s_tilt_centre_deg * (M_PI / 180.0))
+        / 0.5235988 * (double)s_tilt_sens;                    /* 30 degrees */
     a = fabs(n);
     if (a < 0.04) {
         n = 0.0;
@@ -926,7 +1078,25 @@ static void tilt_stop(void)
 {
     if (s_motion && s_motion.deviceMotionActive)
         [s_motion stopDeviceMotionUpdates];
+    s_tilt_have_sample = 0;
     xbox_ios_touch_set_tilt(0.0f, 0);
+}
+
+/* "Centre now": the current angle becomes the neutral. Needs tilt running
+ * (there is no sample otherwise); returns NO then. Saved with one decimal. */
+static BOOL tilt_centre_now(void)
+{
+    char buf[24];
+    double d;
+
+    if (!s_tilt_have_sample)
+        return NO;
+    d = s_tilt_last_deg;
+    d = d > 60.0 ? 60.0 : d < -60.0 ? -60.0 : d;
+    snprintf(buf, sizeof buf, "%.1f", d);
+    s_tilt_centre_deg = atof(buf);        /* what the file will say */
+    nfsu2_cfg_set("NFSU2_TILT_CENTRE", buf);
+    return YES;
 }
 
 static void tilt_start(void)
@@ -953,9 +1123,10 @@ static void tilt_start(void)
 
 /* ── Settings table ── */
 
-enum { IK_HEAD, IK_SWITCH, IK_SLIDER, IK_SEG };
+enum { IK_HEAD, IK_SWITCH, IK_SLIDER, IK_SEG, IK_BUTTON };
 enum { ACT_NONE, ACT_FPS, ACT_TOUCH, ACT_LAYOUT, ACT_SCALE, ACT_ALPHA,
-       ACT_HAPTICS, ACT_TILT, ACT_TILTSENS, ACT_KEYBOARD, ACT_RUMBLE };
+       ACT_HAPTICS, ACT_TILT, ACT_TILTSENS, ACT_KEYBOARD, ACT_RUMBLE,
+       ACT_ANALOG, ACT_STEER, ACT_STEERSENS, ACT_TILTCENTRE };
 
 typedef struct {
     int         kind;
@@ -981,12 +1152,23 @@ static const PanelItem s_items[] = {
       .lo = 0.7f, .hi = 1.5f, .def = 1.0f, .decimals = 2, .act = ACT_SCALE },
     { .kind = IK_SLIDER, .title = "Opacity", .key = "NFSU2_OVERLAY_ALPHA",
       .lo = 0.2f, .hi = 0.8f, .def = 0.55f, .decimals = 2, .act = ACT_ALPHA },
+    /* Drive layout: pedal value from the finger's height; the steering strip
+     * (a switch back to the dynamic stick) and its gain. */
+    { .kind = IK_SWITCH, .title = "Analog pedals", .key = "NFSU2_ANALOG_PEDALS",
+      .on = "1", .off = "0", .def_on = 1, .act = ACT_ANALOG },
+    { .kind = IK_SWITCH, .title = "Steering strip (Drive layout)", .key = "NFSU2_STEER",
+      .on = "1", .off = "0", .def_on = 1, .act = ACT_STEER },
+    { .kind = IK_SLIDER, .title = "Steering sensitivity", .key = "NFSU2_STEER_SENS",
+      .lo = 0.5f, .hi = 2.0f, .def = 1.0f, .decimals = 2, .act = ACT_STEERSENS },
     { .kind = IK_SWITCH, .title = "Haptics", .key = "NFSU2_HAPTICS",
       .on = "1", .off = "0", .def_on = 1, .act = ACT_HAPTICS },
     { .kind = IK_SWITCH, .title = "Tilt steering", .key = "NFSU2_TILT",
       .on = "1", .off = "0", .def_on = 0, .act = ACT_TILT },
     { .kind = IK_SLIDER, .title = "Tilt sensitivity", .key = "NFSU2_TILT_SENS",
       .lo = 0.5f, .hi = 2.0f, .def = 1.0f, .decimals = 2, .act = ACT_TILTSENS },
+    /* Needs Tilt steering on: stores the current angle as straight ahead. */
+    { .kind = IK_BUTTON, .title = "Centre tilt now", .key = "NFSU2_TILT_CENTRE",
+      .act = ACT_TILTCENTRE },
     { .kind = IK_SWITCH, .title = "Keyboard", .key = "NFSU2_KEYBOARD",
       .on = "1", .off = "0", .def_on = 1, .act = ACT_KEYBOARD },
     { .kind = IK_SWITCH, .title = "Rumble", .key = "RECOMP_RUMBLE",
@@ -1102,6 +1284,16 @@ static void apply_live(int act, int on, float fv, const char *sv)
     case ACT_TILTSENS:
         s_tilt_sens = fv;
         break;
+    case ACT_ANALOG:
+        xbox_ios_touch_set_analog_pedals(on);
+        break;
+    case ACT_STEER:
+        xbox_ios_touch_set_steer(on);      /* rebuilds the table, clears fingers */
+        (void)[s_ov syncControls];         /* strip appears / goes now */
+        break;
+    case ACT_STEERSENS:
+        xbox_ios_touch_set_steer_sens(fv);
+        break;
     case ACT_KEYBOARD:
         xbox_input_set_keyboard(on);
         break;
@@ -1128,6 +1320,15 @@ static UILabel *panel_label(NSString *text, CGRect frame, CGFloat size,
 static NSString *ns(const char *c)
 {
     return [NSString stringWithUTF8String:c ? c : ""];
+}
+
+/* Caption of a button row, with the stored value where there is one. */
+static NSString *button_title(int act)
+{
+    if (act == ACT_TILTCENTRE)
+        return [NSString stringWithFormat:@"Centre tilt now (offset %.1f°)",
+                                          s_tilt_centre_deg];
+    return @"";
 }
 
 static void format_slider(const PanelItem *it, float v, char *buf, size_t n)
@@ -1185,6 +1386,17 @@ static CGFloat panel_add_item(int idx, CGFloat y, CGFloat w)
                                     UIControlEventTouchCancel)];
         [s_panel addSubview:sl];
         return y + 54;
+    }
+    if (it->kind == IK_BUTTON) {
+        UIButton *bt = [UIButton buttonWithType:UIButtonTypeSystem];
+        bt.frame = CGRectMake(12, y + 2, w - 24, 32);
+        [bt setTitle:button_title(it->act) forState:UIControlStateNormal];
+        bt.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+        bt.tag = idx + 1;
+        [bt addTarget:s_target action:@selector(buttonTapped:)
+                  forControlEvents:UIControlEventTouchUpInside];
+        [s_panel addSubview:bt];
+        return y + 40;
     }
     /* IK_SEG */
     {
@@ -1331,6 +1543,19 @@ static void panel_hide(void)
     apply_live(it->act, 1, (float)atof(buf), NULL);
 }
 
+- (void)buttonTapped:(UIButton *)bt
+{
+    int idx = (int)bt.tag - 1;
+    if (idx < 0 || idx >= ITEM_COUNT)
+        return;
+    if (s_items[idx].act == ACT_TILTCENTRE) {
+        if (tilt_centre_now())
+            [bt setTitle:button_title(ACT_TILTCENTRE) forState:UIControlStateNormal];
+        else
+            [bt setTitle:@"Turn on Tilt steering first" forState:UIControlStateNormal];
+    }
+}
+
 - (void)segChanged:(UISegmentedControl *)sg
 {
     int idx = (int)sg.tag - 1;
@@ -1371,7 +1596,8 @@ static void panel_hide(void)
 
 - (void)wakeWatch
 {
-    /* Low-rate poll while the link is paused. */
+    /* NFSU2_OVERLAY_WATCH=1 only: the old low-rate poll while the link is
+     * paused. The activity hook makes it unnecessary. */
     if (s_link && s_link.paused && s_ov && [s_ov syncControls])
         overlay_wake();
 }
@@ -1425,14 +1651,23 @@ static void build_fps_and_gear(void)
     [dl addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
     s_link = dl;
 
-    NSTimer *wt = [NSTimer timerWithTimeInterval:0.05
-                                          target:s_target
-                                        selector:@selector(wakeWatch)
-                                        userInfo:nil
-                                         repeats:YES];
-    wt.tolerance = 0.02;
-    [[NSRunLoop mainRunLoop] addTimer:wt forMode:NSRunLoopCommonModes];
-    s_watch = wt;
+    /* The 20 Hz watcher is off: touch_activity_hook wakes the link on every
+     * finger down. NFSU2_OVERLAY_WATCH=1 brings it back. */
+    {
+        const char *wv = nfsu2_cfg_get("NFSU2_OVERLAY_WATCH");
+        if (!wv || !*wv)
+            wv = getenv("NFSU2_OVERLAY_WATCH");
+        if (wv && *wv == '1') {
+            NSTimer *wt = [NSTimer timerWithTimeInterval:0.05
+                                                  target:s_target
+                                                selector:@selector(wakeWatch)
+                                                userInfo:nil
+                                                 repeats:YES];
+            wt.tolerance = 0.02;
+            [[NSRunLoop mainRunLoop] addTimer:wt forMode:NSRunLoopCommonModes];
+            s_watch = wt;
+        }
+    }
 }
 
 /* Called from main.c (iOS) after the renderer init. uiwindow is the SDL
@@ -1504,7 +1739,24 @@ void ios_touch_overlay_install(void *uiwindow)
         s_haptic_gen = [[UIImpactFeedbackGenerator alloc]
                            initWithStyle:UIImpactFeedbackStyleLight];
         [s_haptic_gen prepare];
+        xbox_ios_touch_set_activity_hook(touch_activity_hook);
         xbox_ios_touch_set_press_hook(touch_press_hook);
+        /* Drive-feel settings: the layer already read its env defaults; a
+         * stored value wins here. */
+        v = nfsu2_cfg_get("NFSU2_ANALOG_PEDALS");
+        if (v && *v)
+            xbox_ios_touch_set_analog_pedals(!(*v == '0'));
+        v = nfsu2_cfg_get("NFSU2_STEER_SENS");
+        if (v && *v)
+            xbox_ios_touch_set_steer_sens((float)atof(v));
+        v = nfsu2_cfg_get("NFSU2_STEER");
+        if (v && *v)
+            xbox_ios_touch_set_steer(!(*v == '0'));
+        v = nfsu2_cfg_get("NFSU2_TILT_CENTRE");
+        if (v && *v) {
+            double d = atof(v);
+            s_tilt_centre_deg = d > 60.0 ? 60.0 : d < -60.0 ? -60.0 : d;
+        }
         v = nfsu2_cfg_get("NFSU2_TILT");
         if (v && *v == '1')
             tilt_start();
