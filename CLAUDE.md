@@ -15,8 +15,10 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   (`nv2a_shader_vk`); keep the GL output unchanged.
 - Never commit game data (disc, `default.xbe`, `switch_sd/`) or generated C
   (`gen/`). Ask before committing or pushing anything.
-- The Switch build reads the **unpacked** disc at `sdmc:/switch/nfsu2x/game/`,
-  never the ISO.
+- The Switch build reads the **unpacked** disc at `sdmc:/switch/nfsu2x/game/`.
+  Since v23 every build can also run from a disc image (XISO or Redump) in
+  the game dir or at `NFSU2_ISO=<path>` (`xbox_xiso.c`; `NFSU2_ISO=0` off);
+  the Switch image path (shared fd + lseek + bounce buffer) is untested.
 - Don't launch or kill Eden unless the user asked for an Eden check; check
   `tasklist.exe | grep -i eden` first. Eden's `sdmc\switch` is a junction to
   `nfsu2-xbox\switch_sd\switch`, so an Eden run overwrites the log
@@ -766,6 +768,113 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   are slow).
 - Regen from the worktree needs `tools/{disasm,func_id,abi_analysis}/output`
   — symlinked from the main checkout (don't commit the links).
+
+## iOS findings (branch ios-feasibility, v13–v23, 2026-10)
+
+Cross-port notes (workspace, tools, test harness, CI, what carries over to
+the NFSU1 port) are in `../docs/PORTING_PLAYBOOK.md`. Device-log checklist:
+`../V23_DEVICE_CHECKLIST.md`. Analysis vs bep1s69/nfsmw-ios (GPLv3: ideas
+only, never files): `../IOS_IMPROVEMENT_MAP.md`.
+
+- **Build:** CI only (`ios-app.yml` in the CI repo, macos-14): SDL 2.30.9,
+  glslang 15.1.0 + SPIRV-Tools, MoltenVK 1.4.2 framework, Vulkan-Headers
+  1.3.296, lifted code from release asset `gen3.tar.zst`, unsigned IPA for
+  SideStore/LiveContainer, Info.plist written with PlistBuddy. A fail-fast
+  step runs `xcrun -sdk iphoneos clang -fsyntax-only` on the .m files and
+  main.c before the long steps; ios-deps, MoltenVK, headers and ccache are
+  cached (ccache saved even when the build fails). Linux cannot build the
+  IPA. Local checks: `gcc -fsyntax-only -DNFSU2_IOS=1` on C files, Linux
+  GL/Vulkan builds, the lavapipe harness (playbook).
+- **Threads:** main thread = SDL/UIKit loop (main.c iOS `main`), eager
+  renderer init on it (surface/swapchain need UIKit), game on a 16 MB
+  pthread, Vulkan only from the executor (`vk_flip`, `flush_frame_wait`).
+  QoS USER_INTERACTIVE on game + ack threads (`RECOMP_QOS=0` off).
+- **Settings:** `Documents/nfsu2_env.txt` (or `$NFSU2_GAME_DIR`), loaded by
+  `cfg_load` BEFORE `SDL_CreateWindow`, every key exported once with
+  `setenv(k, v, 0)`. `s_cfg` key buffer is 64 bytes
+  (`MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS` is 36 chars; 32 truncated it and
+  the A/B silently did nothing). The gear panel (`ios_touch_overlay.m`)
+  writes through `nfsu2_cfg_set`: updates `s_cfg` + rewrites the file
+  (tmp + rename, unknown lines kept). It must NOT `setenv`: the executor
+  calls `getenv` every flip (`gamma_lut_active`) and setenv can realloc
+  environ under it. Live items apply through setters; others "next launch".
+- **iOS defaults** (main.c, before any thread starts; a file key wins):
+  `RECOMP_GL_SCALE=2`, `MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS=0`,
+  `RECOMP_FRAME_LAG=1`, `RECOMP_QUIET=1` (stderr is unbuffered to
+  `Documents/nfsu2_log.txt`, every line a write).
+- **MoltenVK facts (v1.4.2 source):** reads `MVK_CONFIG_*` once, lazily, via
+  NSProcessInfo; SDL's iOS Vulkan loader already calls
+  `vkEnumerateInstanceExtensionProperties` inside `SDL_CreateWindow`, so env
+  must be set before the window. Default synchronous submits encode inside
+  `vkQueueSubmit` and wait for `nextDrawable` there (our frame cb clears and
+  blits into the swapchain image). Async queue QoS = USER_INITIATED unless
+  `VK_EXT_global_priority` HIGH (-> USER_INTERACTIVE; `NFSU2_VK_QUEUE_HIGH=0`
+  off). `vkQueueWaitIdle` waits for the async jobs (presents included), then
+  commits and waits on a Metal buffer: a drain that must run while
+  foreground. Present modes: FIFO only on Apple GPU family (IMMEDIATE is a
+  runtime Mac1-family check; M-series iPads unverified -- log
+  `[VK] swapchain ... present mode`). `invariant gl_Position` is honoured
+  (`preserveInvariance` from `isPositionInvariant`). No
+  `VK_EXT_vertex_input_dynamic_state` (per-layout pipelines). More than 64
+  device extensions (scan mallocs all). `textureCompressionBC` =
+  `supportsBCTextureCompression`: false on A16 and older iPhones -> DXT goes
+  through the CPU decoder. Push constants crash at draw time (v18), no
+  triangle fans (v33 fan->list), index 65535 is the restart marker (v21),
+  Metal wants 4-byte vertex offsets/strides (`[VK] MISALIGNED` log, v20).
+- **Background (A3, v22):** SDL2 maps WillResignActive -> FOCUS_LOST +
+  MINIMIZED + SDL_APP_WILLENTERBACKGROUND and calls event watchers
+  synchronously inside the UIKit callback, holding its watcher lock. main.c's
+  watch calls `nv2a_vk_background_handshake(300)`; the executor parks before
+  every submit (`ios_park_point`), drains with `vkQueueWaitIdle` only while
+  the deadline holds, then acks; a late request parks with no Vulkan call.
+  Logs `[ios] background handshake: parked in N ms | TIMED OUT`, `[ios]
+  park/unpark`. `NFSU2_BG_HANDSHAKE=0` = flag only.
+- **Swapchain (A1, v22):** a SUBOPTIMAL acquire/present requests a rebuild
+  at the next flip, at most 2 per streak and 500 ms apart; streak resets on
+  an explicit SIZE_CHANGED rebuild or a frame whose acquire AND present
+  both returned SUCCESS (async submits can move the report). Log `[VK]
+  swapchain suboptimal -> rebuild n/2`, `stays suboptimal`.
+  `RECOMP_VK_SC_LIMIT=0` = old behaviour.
+- **Measurement (always on, 10 s):** `[ios-vk]` flips, submit/present
+  avg/max ms, suboptimal/rebuilds, present mode, MVK sync; `[ios-vk2]`
+  passes/frame, upload-split and layout-split passes/frame, uploads and
+  KB/frame, `mem left` (os_proc_available_memory). Thermal state logged on
+  change; FPS label adds "· HOT" at serious.
+- **Tile-GPU passes (v23):** a pass that opens with a full clear begins
+  with LOAD_OP_CLEAR instead of LOAD + `vkCmdClearAttachments` (MoltenVK
+  draws a quad for that) -- `RECOMP_VK_CLEAR_LOAD` (iOS default on, else
+  off; 2 = alternate frames for A/B). Texture uploads for textures not yet
+  sampled this frame can go into a pre command buffer submitted before the
+  frame, so they stop splitting passes -- `RECOMP_VK_HOIST` (default off
+  everywhere; panel toggle). Lavapipe: menu/race A/B within animation noise,
+  no new validation VUIDs; up to ~3 folded clears and ~1.2 hoisted uploads
+  per race frame. Still open: no mip levels (`mipLevels = 1`, `maxLod = 0`)
+  and no anisotropy.
+- **Disc image (v23):** `xbox_xiso.c` mounts an XDVDFS image (bases 0x0,
+  0xFD90, 0x30600, 0xFD90000, 0x18300000) when the game dir has no
+  default.xbe but has a `*.iso`, or `NFSU2_ISO=<path>`. D:\ /
+  `\Device\CdRom0` paths are served from it (pread, per-handle positions,
+  read hook kept, writes refused with STATUS_ACCESS_DENIED); saves stay in
+  the game dir's UDATA. Identity check in main.c: title ID 0x4541005A or a
+  clean fatal; SHA-256 mismatch only warns. Linux: boots NFSU2.iso to the
+  same menus as the folder; NFSU1.iso refused; PC CD falls back to folder.
+- **Input:** touch layer `xinput_ios.c` (PAD preset unchanged, DRIVE preset
+  with GAS/BRAKE pedals, size 0.7-1.5, layout switch clears fingers),
+  overlay `ios_touch_overlay.m` draws from the same table; touch off really
+  off (`xbox_ios_touch_state` returns nothing). Keyboard: SDL 2.30 owns the
+  GCKeyboard `keyChangedHandler` (sets it + its own queue on every connect),
+  so the game thread reads `SDL_GetKeyboardState` (GCKeyCode == SDL
+  scancode); `ios_keyboard.m` only tracks connect/disconnect. Haptics via a
+  press hook (light impact), tilt via CMMotionManager (off by default,
+  `NFSU2_TILT_FLIP=1` swaps sign), rumble via SDL (`RECOMP_RUMBLE=0`).
+- **Audio:** SDL default category is Playback + MixWithOthers (ignores the
+  mute switch); SDL handles interruptions. `SDL_AUDIO_CATEGORY=playback`
+  stops mixing with other apps.
+- **Guest RAM:** `anon_map_fd` uses an unlinked file in `$TMPDIR`
+  (shm_open is refused in the sandbox). nfsmw-ios uses a Mach memory entry
+  instead; no symptom seen here.
+- **Device verification pending:** everything in v22/v23 (no device log on
+  this machine yet).
 
 ## Status (2026-09-28)
 
