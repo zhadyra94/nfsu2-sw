@@ -28,8 +28,9 @@
  *
  * DRIVE adds two things on top of the zones: analog pedals (GAS / BRAKE read
  * lower as the thumb slides down the pedal, NFSU2_ANALOG_PEDALS) and a
- * steering strip (a wide zone whose finger x is the left stick X,
- * NFSU2_STEER / NFSU2_STEER_SENS). Both, the old DRIVE table
+ * steering strip (a zone whose finger x is the left stick X, relative to the
+ * touch-down point by default; NFSU2_STEER / NFSU2_STEER_SENS /
+ * NFSU2_STEER_MODE / NFSU2_STEER_CURVE). Both, the old DRIVE table
  * (NFSU2_DRIVE_CLASSIC) and the activity hook for the overlay are described in
  * xinput_ios.h.
  *
@@ -118,8 +119,11 @@ static const XBOX_IOS_TOUCH_ZONE s_zones_pad[] = {
  * pair on the right edge, LOOK (Black) and CAM (White) small near the top
  * right, BACK / START in the top corners, a small d-pad (menus, free roam)
  * top left. The steering strip (XBOX_IOS_ZONE_STEER, a RECTANGLE: rx / ry are
- * half-extents, see zone_at) fills the lower left. The rest of the left half
- * is still the dynamic left stick, so menus keep working by stick.
+ * half-extents, see zone_at) sits in the lower left, x 0.06-0.28 (51-239 pt,
+ * 187 pt wide on 852 pt): the touch-down point inside it is "straight ahead"
+ * (relative mode), so it only has to be big enough to land a thumb on. The
+ * rest of the left half is still the dynamic left stick, so menus keep working
+ * by stick.
  *
  * Checked numerically on 852x393 (harness case "DRIVE geometry"): no two
  * zones overlap, the strip starts at x = 51 pt so it clears the Dynamic Island
@@ -138,7 +142,7 @@ static const XBOX_IOS_TOUCH_ZONE s_zones_drive[] = {
     { 10,  0.955f, 0.272f, 0.032f, 0.066f, XBOX_IOS_ZONE_ANALOG, XBOX_BUTTON_X      },  /* SHIFT up */
     { 11,  0.955f, 0.425f, 0.032f, 0.066f, XBOX_IOS_ZONE_ANALOG, XBOX_BUTTON_Y      },  /* SHIFT down */
     {  3,  0.190f, 0.300f, 0.040f, 0.087f, XBOX_IOS_ZONE_DPAD,   0                  },
-    { 12,  0.240f, 0.790f, 0.180f, 0.170f, XBOX_IOS_ZONE_STEER,  0                  },
+    { 12,  0.170f, 0.790f, 0.110f, 0.170f, XBOX_IOS_ZONE_STEER,  0                  },
 };
 #define DRIVE_NEW_COUNT ((int)(sizeof s_zones_drive / sizeof s_zones_drive[0]))
 
@@ -202,10 +206,13 @@ static float s_zone_shift[ZONE_MAX];  /* safe-area x shift per active zone */
 static int   s_drive_classic;         /* NFSU2_DRIVE_CLASSIC (0 default) */
 static int   s_steer_on = 1;          /* NFSU2_STEER: the strip exists in DRIVE */
 static float s_steer_sens = 1.0f;     /* NFSU2_STEER_SENS, 0.5..2.0 */
+static int   s_steer_rel = 1;         /* NFSU2_STEER_MODE: 1 relative, 0 absolute */
+static float s_steer_curve = 1.35f;   /* NFSU2_STEER_CURVE, 1.0..2.0 (relative mode) */
 static int   s_analog_pedals = 1;     /* NFSU2_ANALOG_PEDALS */
 
-/* The strip keeps its width at every size setting (steering gain follows
- * its half-width, so the size slider must not change the feel); its height
+/* The strip keeps its width at every size setting (in absolute mode the
+ * steering gain follows its half-width, so the size slider must not change the
+ * feel); its height
  * follows the slider but never leaves the screen: half-height <= 0.19, which
  * keeps the bottom edge at or above y = 0.98 from its centre 0.79. */
 #define STEER_RY_MAX 0.19f
@@ -474,6 +481,19 @@ static float steer_sens_clamp(float k)
     return !(k >= 0.5f) ? 0.5f : k > 2.0f ? 2.0f : k;
 }
 
+#define STEER_CURVE_DEF 1.35f
+
+static float steer_curve_clamp(float c)
+{
+    return !(c >= 1.0f) ? 1.0f : c > 2.0f ? 2.0f : c;   /* NaN gives 1.0 */
+}
+
+/* "absolute" (any case) = 0; anything else, including unset, relative = 1. */
+static int steer_mode_parse(const char *v)
+{
+    return !(v && strcasecmp(v, "absolute") == 0);
+}
+
 static void touch_prefs_once(void)
 {
     static SDL_SpinLock s_prefs_spin;
@@ -498,6 +518,9 @@ static void touch_prefs_once(void)
         s_drive_classic = env_switch("NFSU2_DRIVE_CLASSIC", 0);
         v = getenv("NFSU2_STEER_SENS");
         s_steer_sens = (v && *v) ? steer_sens_clamp((float)atof(v)) : 1.0f;
+        s_steer_rel = steer_mode_parse(getenv("NFSU2_STEER_MODE"));
+        v = getenv("NFSU2_STEER_CURVE");
+        s_steer_curve = (v && *v) ? steer_curve_clamp((float)atof(v)) : STEER_CURVE_DEF;
         for (i = 0; i < TOUCH_MAX_FINGERS; i++)
             s_finger[i].id = -1;
         s_lock = SDL_CreateMutex();
@@ -581,6 +604,37 @@ void xbox_ios_touch_set_steer_sens(float k)
     k = steer_sens_clamp(k);
     SDL_LockMutex(s_lock);
     s_steer_sens = k;
+    SDL_UnlockMutex(s_lock);
+}
+
+/* Steering mode (NFSU2_STEER_MODE): 1 relative (default), 0 absolute. No
+ * rebuild, no finger is dropped: the next poll reads a held finger by the other
+ * rule (its touch-down point is already recorded). */
+void xbox_ios_touch_set_steer_mode(int relative)
+{
+    touch_prefs_once();
+    SDL_LockMutex(s_lock);
+    s_steer_rel = relative ? 1 : 0;
+    SDL_UnlockMutex(s_lock);
+}
+
+int xbox_ios_touch_get_steer_mode(void)
+{
+    int r;
+    touch_prefs_once();
+    SDL_LockMutex(s_lock);
+    r = s_steer_rel;
+    SDL_UnlockMutex(s_lock);
+    return r;
+}
+
+/* Response curve (NFSU2_STEER_CURVE), clamped 1.0..2.0, NaN gives 1.0. */
+void xbox_ios_touch_set_steer_curve(float c)
+{
+    touch_prefs_once();
+    c = steer_curve_clamp(c);
+    SDL_LockMutex(s_lock);
+    s_steer_curve = c;
     SDL_UnlockMutex(s_lock);
 }
 
@@ -939,22 +993,44 @@ static BYTE pedal_byte(const XBOX_IOS_TOUCH_ZONE *z, float y)
     return (BYTE)(n > 255 ? 255 : n < 0 ? 0 : n);
 }
 
-/* Steering strip: signed -1..1 from the finger's x. Full travel is the
- * zone's half-width divided by the sensitivity (so at 2.0 the thumb needs
- * half the distance; at 0.5, full lock is out of reach on the left edge --
- * the strip cannot be wider than the screen). 5 % deadzone, rescaled so
- * travel starts at zero. Called with s_lock held. */
-#define STEER_DEADZONE 0.05f
+/* Steering strip: signed -1..1 from a finger's x. Called with s_lock held.
+ *
+ * Relative (default): the touch-down x (sx) is straight ahead. The deflection
+ * is d = (x - sx) / travel with travel = STEER_REL_TRAVEL of the window width
+ * (0.075, about 64 pt on an 852 pt screen) divided by the sensitivity, clamped
+ * to +-1 (a finger that goes on past full lock, or off the strip, stays at
+ * full lock). A deadzone of 4 % of travel is rescaled away (no jump), then the
+ * response curve out = sign(d) * |d|^NFSU2_STEER_CURVE gives fine control near
+ * the centre (1.0 = linear). The strip's own size plays no part.
+ *
+ * Absolute (NFSU2_STEER_MODE=absolute, the first version): the zone centre is
+ * straight ahead and full travel is the zone's half-width divided by the
+ * sensitivity (at 2.0 the thumb needs half the distance; at 0.5, full lock is
+ * out of reach on the left edge -- the strip cannot be wider than the
+ * screen). 5 % deadzone, rescaled. No curve: this is the old behaviour. */
+#define STEER_DEADZONE      0.05f
+#define STEER_REL_TRAVEL    0.075f
+#define STEER_REL_DEADZONE  0.04f
 
-static float steer_value(const XBOX_IOS_TOUCH_ZONE *z, float x)
+static float steer_value(const XBOX_IOS_TOUCH_ZONE *z, const TouchFinger *f)
 {
-    float v = (x - z->cx) / (z->rx / s_steer_sens);
-    float a = fabsf(v);
-    if (!(a >= STEER_DEADZONE))
-        return 0.0f;
-    a = (a - STEER_DEADZONE) / (1.0f - STEER_DEADZONE);
+    float v, a, dz;
+
+    if (s_steer_rel) {
+        v = (f->x - f->sx) / (STEER_REL_TRAVEL / s_steer_sens);
+        dz = STEER_REL_DEADZONE;
+    } else {
+        v = (f->x - z->cx) / (z->rx / s_steer_sens);
+        dz = STEER_DEADZONE;
+    }
+    a = fabsf(v);
+    if (!(a >= dz))
+        return 0.0f;                               /* also NaN */
     if (a > 1.0f)
         a = 1.0f;
+    a = (a - dz) / (1.0f - dz);
+    if (s_steer_rel && s_steer_curve > 1.0f)
+        a = powf(a, s_steer_curve);
     return v < 0.0f ? -a : a;
 }
 
@@ -985,7 +1061,7 @@ static void fold_finger(const TouchFinger *f, float aspect, WORD *flags,
         }
         case XBOX_IOS_ZONE_STEER:
             if (!*have_steer) {
-                lstick[0] = steer_value(z, f->x);
+                lstick[0] = steer_value(z, f);
                 lstick[1] = 0.0f;
                 *have_steer = 1;
                 *have_l = 1;
@@ -1324,7 +1400,7 @@ float xbox_ios_touch_zone_value(int idx)
             if (f->id < 0 || f->role != ROLE_ZONE(idx))
                 continue;
             if (z->kind == XBOX_IOS_ZONE_STEER) {
-                best = steer_value(z, f->x);
+                best = steer_value(z, f);
                 break;
             }
             /* The game sees the byte; report the same quantized value. */
@@ -1335,6 +1411,42 @@ float xbox_ios_touch_zone_value(int idx)
     }
     SDL_UnlockMutex(s_lock);
     return best;
+}
+
+/* Relative-mode indicator for the overlay: the first finger on strip zone idx
+ * (the one that steers). *down_x is its touch-down x and *knob_x that x plus
+ * the finger's offset clamped to full travel, both normalized to the window.
+ * Returns 1 in relative mode while such a finger is held; 0 otherwise
+ * (absolute mode, no finger, not a strip), with the outputs untouched. The
+ * knob is linear in the finger (the curve is not applied): it marks where the
+ * finger is, capped where the steering is at full lock. */
+int xbox_ios_touch_steer_knob(int idx, float *down_x, float *knob_x)
+{
+    int i, found = 0;
+
+    touch_prefs_once();
+    SDL_LockMutex(s_lock);
+    if (s_steer_rel && idx >= 0 && idx < s_zone_n &&
+        s_zones[idx].kind == XBOX_IOS_ZONE_STEER) {
+        float travel = STEER_REL_TRAVEL / s_steer_sens;
+        for (i = 0; i < TOUCH_MAX_FINGERS; i++) {
+            const TouchFinger *f = &s_finger[i];
+            float d;
+            if (f->id < 0 || f->role != ROLE_ZONE(idx))
+                continue;
+            d = f->x - f->sx;
+            if (!(d >= -travel))
+                d = d < 0.0f ? -travel : 0.0f;     /* NaN gives 0 */
+            else if (d > travel)
+                d = travel;
+            if (down_x) *down_x = f->sx;
+            if (knob_x) *knob_x = f->sx + d;
+            found = 1;
+            break;
+        }
+    }
+    SDL_UnlockMutex(s_lock);
+    return found;
 }
 
 /* Look of zone idx (active table order) for the overlay: one of the

@@ -28,8 +28,9 @@
  * XBOX_BUTTON_* index, pressed = 255; the DRIVE pedals read lower when the
  * thumb slides down the pedal, see NFSU2_ANALOG_PEDALS), ZONE_DPAD maps the
  * touch's offset from the zone centre to D-pad flags (diagonals included),
- * ZONE_STEER (DRIVE only) is a wide strip: the finger's x offset from the
- * centre is the left stick X. A STEER zone is hit-tested as a RECTANGLE (rx /
+ * ZONE_STEER (DRIVE only) is a strip: the finger's x is the left stick X,
+ * relative to where it touched down (default) or to the strip's centre
+ * (NFSU2_STEER_MODE=absolute). A STEER zone is hit-tested as a RECTANGLE (rx /
  * ry are half-extents, not ellipse radii) and is only in the table while the
  * strip setting is on. */
 #define XBOX_IOS_ZONE_FLAG   0
@@ -134,14 +135,30 @@ void  xbox_ios_touch_set_tablet_scale(float k);
  *                   linearly down to 90 at the very bottom. 0 = flat 255.
  *   steering strip  NFSU2_STEER (1)          the STEER zone exists in DRIVE;
  *                   set_steer rebuilds the table and clears all fingers.
- *   strip gain      NFSU2_STEER_SENS (1.0)   0.5..2.0; full lock needs a
- *                   finger offset of half-width / sens from the centre.
+ *   strip mode      NFSU2_STEER_MODE (relative)  relative | absolute (any case).
+ *                   Relative: the touch-down x inside the strip is straight
+ *                   ahead; d = (x - x_down) / travel, travel = 0.075 of the
+ *                   window width / sens (64 pt on 852 pt at sens 1), clamped
+ *                   to +-1, 4 % of travel deadzone rescaled away, then the
+ *                   curve below. The finger keeps steering outside the strip.
+ *                   Absolute: the strip centre is straight ahead and full lock
+ *                   is at half-width / sens from it (5 % deadzone, no curve).
+ *                   set_steer_mode does not rebuild the table or drop fingers.
+ *   strip gain      NFSU2_STEER_SENS (1.0)   0.5..2.0; divides the travel
+ *                   (relative) or the half-width (absolute).
+ *   strip curve     NFSU2_STEER_CURVE (1.35) 1.0..2.0 (NaN: 1.0); relative mode
+ *                   only: out = sign(d) * |d|^curve after the deadzone, so the
+ *                   middle of the travel is gentler (1.0 = linear). Absolute
+ *                   mode ignores it, so it stays today's behaviour.
  *   old DRIVE       NFSU2_DRIVE_CLASSIC (0)  1 = the pre-strip DRIVE table and
  *                   its A / B / X / Y / LB / RB labels (no STEER zone).
  * Main thread. */
 void xbox_ios_touch_set_analog_pedals(int on);
 void xbox_ios_touch_set_steer(int on);
 void xbox_ios_touch_set_steer_sens(float k);
+void xbox_ios_touch_set_steer_mode(int relative);    /* 1 relative, 0 absolute */
+int  xbox_ios_touch_get_steer_mode(void);
+void xbox_ios_touch_set_steer_curve(float c);
 void xbox_ios_touch_set_drive_classic(int on);
 
 /* Current analog value of a held zone for the overlay (idx in the active
@@ -149,6 +166,13 @@ void xbox_ios_touch_set_drive_classic(int on);
  * its level 0..1 (the byte the game reads / 255). The STEER zone: the signed
  * steer -1..1 (0 when idle). Any other held zone: 1. */
 float xbox_ios_touch_zone_value(int idx);
+
+/* Relative steering indicator for the overlay: for the strip zone idx with a
+ * finger held, in relative mode only, returns 1 and gives that finger's
+ * touch-down x and the knob x (touch-down x + the finger's offset clamped to
+ * +-travel, travel = 0.075 / sens), both normalized to the window. Returns 0
+ * (outputs untouched) in absolute mode, with no finger, or for another zone. */
+int xbox_ios_touch_steer_knob(int idx, float *down_x, float *knob_x);
 
 /* Text the overlay draws on zone idx ("GAS", "A", ...), NULL for none. In
  * DRIVE (unless NFSU2_DRIVE_CLASSIC): GAS, BRAKE, NOS (B), E-BRAKE (A),

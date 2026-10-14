@@ -154,7 +154,8 @@ static void lift_all(void)
 }
 
 /* Back to a known state: touch on, PAD layout, scale 1, no tilt, no hooks,
- * analog pedals on, steering strip on at sensitivity 1, new DRIVE table, no
+ * analog pedals on, steering strip on at sensitivity 1 in the shipping mode
+ * (relative, curve 1.35), new DRIVE table, no
  * geometry overrides, no safe area, aspect unknown, round shape on, tablet
  * factor 1.0, no fingers, 16:9 window. The setters clear all fingers by contract; the
  * explicit lift keeps reset() sound even if that contract breaks. */
@@ -166,6 +167,8 @@ static void reset(void)
     xbox_ios_touch_set_analog_pedals(1);
     xbox_ios_touch_set_steer(1);
     xbox_ios_touch_set_steer_sens(1.0f);
+    xbox_ios_touch_set_steer_mode(1);
+    xbox_ios_touch_set_steer_curve(1.35f);
     xbox_ios_touch_set_drive_classic(0);
     xbox_ios_touch_layout_reset(1);
     xbox_ios_touch_layout_reset(0);
@@ -1639,8 +1642,9 @@ static int strip_zone(void)
 
 #define LX(s) ((s).Gamepad.sThumbLX)
 
-/* 17. Steering strip: deflection from the zone centre, deadzone rescaled (no
- * jump), clamp, Y stays 0, latch, release. */
+/* 17. Steering strip, ABSOLUTE mode (the first version, kept as an option):
+ * deflection from the zone centre, deadzone rescaled (no jump), clamp, Y stays
+ * 0, latch, release. The relative default is cases 17g..17k. */
 static void t_steer_strip(void)
 {
     int si;
@@ -1648,6 +1652,7 @@ static void t_steer_strip(void)
     XBOX_INPUT_STATE s;
     float half;
     reset();
+    xbox_ios_touch_set_steer_mode(0);
     xbox_ios_touch_set_layout(1);
     si = strip_zone();
     z = zone(si);
@@ -1729,7 +1734,7 @@ static void t_steer_strip(void)
           xbox_ios_touch_zone_value(si));
 }
 
-/* 17b. Strip sensitivity: full lock at half-width / sens; clamped 0.5..2. */
+/* 17b. Strip sensitivity (absolute): full lock at half-width / sens; clamped 0.5..2. */
 static void t_steer_sens(void)
 {
     int si;
@@ -1737,6 +1742,7 @@ static void t_steer_sens(void)
     XBOX_INPUT_STATE s;
     float half;
     reset();
+    xbox_ios_touch_set_steer_mode(0);
     xbox_ios_touch_set_layout(1);
     si = strip_zone();
     z = zone(si);
@@ -1787,6 +1793,7 @@ static void t_steer_shape(void)
     XBOX_INPUT_STATE s;
     float lx, ty;
     reset();
+    xbox_ios_touch_set_steer_mode(0);        /* the corner finger sits far from the centre */
     xbox_ios_touch_set_layout(1);
     si = strip_zone();
     z = zone(si);
@@ -1892,6 +1899,7 @@ static void t_steer_priority(void)
     XBOX_INPUT_STATE s;
     float half;
     reset();
+    xbox_ios_touch_set_steer_mode(0);
     xbox_ios_touch_set_layout(1);
     z = zone(strip_zone());
     if (!z)
@@ -1972,13 +1980,378 @@ static void t_tilt_vs_strip(void)
     fdown(1, z->cx, z->cy);                           /* a resting strip finger does */
     s = rd();
     expect_sticks(&s, 0, 0, 0, 0, 0, "tilt vs a resting strip finger");
-    fmove(1, z->cx - z->rx, z->cy);
+    fmove(1, z->cx - 0.075f, z->cy);                 /* full lock, either mode */
     s = rd();
     expect_sticks(&s, -STICK_FULL, 0, 0, 0, STICK_NEAR, "tilt vs a strip finger steering left");
     fup(1);
     s = rd();
     expect_sticks(&s, 16383, 0, 0, 0, 2, "tilt returns after the strip finger lifts");
     xbox_ios_touch_set_tilt(0.0f, 0);
+}
+
+/* ---- Relative steering (the default): cases 17g..17j ---- */
+
+#define REL_TRAVEL 0.075f                 /* of the window width at sens 1; contract in xinput_ios.c */
+#define REL_TOL    40                     /* stick units */
+
+/* Expected LX for a finger offset of `frac` x travel in relative mode: clamp,
+ * 4 % deadzone rescaled, then |d|^curve. */
+static int rel_lx(float frac, float curve)
+{
+    float a = fabsf(frac);
+    if (a < 0.04f)
+        return 0;
+    if (a > 1.0f)
+        a = 1.0f;
+    a = (a - 0.04f) / 0.96f;
+    a = powf(a, curve);
+    return (int)(32767.0f * (frac < 0.0f ? -a : a));
+}
+
+static int rel_lx_ok(int lx, float frac, float curve)
+{
+    return abs(lx - rel_lx(frac, curve)) <= REL_TOL;
+}
+
+/* 17g. Relative steering: the touch-down point is straight ahead wherever it
+ * lands in the strip; +travel is full lock; half travel with the default curve
+ * 1.35 is about 0.5^1.35; the deadzone is rescaled; the finger keeps steering
+ * outside the strip; lifting gives 0. */
+static void t_steer_rel(void)
+{
+    int si;
+    const XBOX_IOS_TOUCH_ZONE *z;
+    XBOX_INPUT_STATE s;
+    float x0, y0, dn = -1.0f, kn = -1.0f, v;
+    int lx_half;
+
+    reset();
+    xbox_ios_touch_set_layout(1);
+    CHECK(xbox_ios_touch_get_steer_mode() == 1, "default steer mode is not relative");
+    si = strip_zone();
+    z = zone(si);
+    if (!z)
+        return;
+    CHECK(xbox_ios_touch_steer_knob(si, &dn, &kn) == 0, "steer_knob() is 1 with no finger");
+    x0 = z->cx + 0.8f * z->rx;                       /* far right inside the strip */
+    y0 = z->cy;
+    CHECK(zone_hit(x0, y0) == si, "setup: (%.3f,%.3f) is not in the strip", x0, y0);
+
+    fdown(1, x0, y0);
+    s = rd();
+    expect_idle(&s, "relative: landing off-centre is straight ahead");
+    CHECK(xbox_ios_touch_zone_value(si) == 0.0f, "relative: value %.4f at touch-down",
+          xbox_ios_touch_zone_value(si));
+    CHECK(xbox_ios_touch_zone_pressed(si), "relative: strip not pressed");
+    CHECK(xbox_ios_touch_steer_knob(si, &dn, &kn) == 1 && fabsf(dn - x0) < 1e-6f && fabsf(kn - x0) < 1e-6f,
+          "steer_knob at touch-down: %.5f %.5f, want %.5f twice", dn, kn, x0);
+    CHECK(xbox_ios_touch_steer_knob(si == 0 ? 1 : 0, &dn, &kn) == 0, "steer_knob() answers for a non-strip zone");
+
+    /* +travel is full lock; the knob query follows the finger. */
+    fmove(1, x0 + REL_TRAVEL, y0);
+    s = rd();
+    expect_sticks(&s, STICK_FULL, 0, 0, 0, STICK_NEAR, "relative: +travel");
+    v = xbox_ios_touch_zone_value(si);
+    CHECK(v > 0.999f && v <= 1.0f, "relative: value %.4f at +travel, want 1", v);
+    CHECK(xbox_ios_touch_steer_knob(si, &dn, &kn) == 1 && fabsf(kn - (x0 + REL_TRAVEL)) < 1e-5f,
+          "steer_knob at +travel: %.5f, want %.5f", kn, x0 + REL_TRAVEL);
+
+    /* Half travel with curve 1.35: deadzone-rescaled, then ^1.35 (about 0.5^1.35). */
+    fmove(1, x0 + 0.5f * REL_TRAVEL, y0);
+    s = rd();
+    lx_half = rel_lx(0.5f, 1.35f);
+    expect_sticks(&s, lx_half, 0, 0, 0, REL_TOL, "relative: half travel, curve 1.35");
+    CHECK(fabsf(xbox_ios_touch_zone_value(si) - (float)lx_half / 32767.0f) < 0.002f,
+          "relative: zone_value %.4f differs from the state %d", xbox_ios_touch_zone_value(si), LX(s));
+    CHECK(fabsf((float)LX(s) / 32767.0f - powf(0.5f, 1.35f)) < 0.03f,
+          "relative: half travel %.4f is not about 0.5^1.35 = %.4f", (float)LX(s) / 32767.0f, powf(0.5f, 1.35f));
+    fmove(1, x0 - 0.25f * REL_TRAVEL, y0);
+    s = rd();
+    expect_sticks(&s, rel_lx(-0.25f, 1.35f), 0, 0, 0, REL_TOL, "relative: quarter travel left");
+
+    /* Y never moves. */
+    fmove(1, x0 + 0.5f * REL_TRAVEL, y0 - z->ry);
+    s = rd();
+    CHECK(s.Gamepad.sThumbLY == 0 && s.Gamepad.sThumbRX == 0 && s.Gamepad.sThumbRY == 0,
+          "relative: another axis moved (LY=%d RX=%d RY=%d)", s.Gamepad.sThumbLY, s.Gamepad.sThumbRX,
+          s.Gamepad.sThumbRY);
+
+    /* Deadzone: 4 % of travel, rescaled (no jump at its edge). */
+    fmove(1, x0 + 0.03f * REL_TRAVEL, y0);
+    s = rd();
+    expect_sticks(&s, 0, 0, 0, 0, 0, "relative: inside the deadzone (right)");
+    fmove(1, x0 - 0.03f * REL_TRAVEL, y0);
+    s = rd();
+    expect_sticks(&s, 0, 0, 0, 0, 0, "relative: inside the deadzone (left)");
+    fmove(1, x0 + 0.05f * REL_TRAVEL, y0);
+    s = rd();
+    CHECK(LX(s) >= 0 && LX(s) < 150, "relative: just past the deadzone LX=%d (a jump?)", LX(s));
+    fmove(1, x0 + 0.06f * REL_TRAVEL, y0);
+    s = rd();
+    CHECK(LX(s) > 0 && LX(s) < 600, "relative: 6%% of travel LX=%d (a jump?)", LX(s));
+
+    /* Overshoot clamps; the knob stops at full travel. */
+    fmove(1, x0 + 3.0f * REL_TRAVEL, y0);
+    s = rd();
+    expect_sticks(&s, STICK_FULL, 0, 0, 0, STICK_NEAR, "relative: 3x overshoot right");
+    CHECK(xbox_ios_touch_steer_knob(si, &dn, &kn) == 1 && fabsf(kn - dn - REL_TRAVEL) < 1e-5f,
+          "steer_knob overshoot: knob - down = %.5f, want %.5f", kn - dn, REL_TRAVEL);
+
+    /* Latched: outside the strip, over another zone and at the screen edge. */
+    {
+        const XBOX_IOS_TOUCH_ZONE *g = zone(zone_by_label("GAS"));
+        if (g) {
+            fmove(1, g->cx, g->cy);
+            s = rd();
+            CHECK(s.Gamepad.wButtons == 0 && analog_of(&s, XBOX_BUTTON_RTRIGGER) == 0,
+                  "a relative strip finger pressed GAS by sliding over it");
+            CHECK(LX(s) == STICK_FULL, "relative: finger over GAS LX=%d, want full right", LX(s));
+        }
+    }
+    fmove(1, 0.0f, 0.05f);                           /* far left of the strip, top of the screen */
+    s = rd();
+    expect_sticks(&s, -STICK_FULL, 0, 0, 0, 0, "relative: finger at the screen's left edge");
+    CHECK(xbox_ios_touch_zone_pressed(si), "relative: the strip let go of a finger outside it");
+
+    /* The same offset gives the same value wherever the finger landed. */
+    fup(1);
+    fdown(2, z->cx - 0.9f * z->rx, y0);
+    fmove(2, z->cx - 0.9f * z->rx + 0.5f * REL_TRAVEL, y0);
+    s = rd();
+    expect_sticks(&s, lx_half, 0, 0, 0, REL_TOL, "relative: same offset from another landing point");
+    fmove(2, z->cx - 0.9f * z->rx, y0);
+    s = rd();
+    expect_sticks(&s, 0, 0, 0, 0, 0, "relative: back at the touch-down point");
+
+    /* Release. */
+    fup(2);
+    s = rd();
+    expect_idle(&s, "relative: strip lifted");
+    CHECK(xbox_ios_touch_zone_value(si) == 0.0f, "relative: value %.4f after the lift", xbox_ios_touch_zone_value(si));
+    CHECK(xbox_ios_touch_steer_knob(si, &dn, &kn) == 0, "steer_knob() is 1 after the lift");
+
+    /* Absolute mode has no indicator. */
+    xbox_ios_touch_set_steer_mode(0);
+    CHECK(xbox_ios_touch_get_steer_mode() == 0, "get_steer_mode after set(0)");
+    fdown(3, x0, y0);
+    CHECK(xbox_ios_touch_steer_knob(si, &dn, &kn) == 0, "steer_knob() is 1 in absolute mode");
+    fup(3);
+}
+
+/* 17h. Relative sensitivity: travel is 0.075 / sens (clamped 0.5..2), live. */
+static void t_steer_rel_sens(void)
+{
+    int si;
+    const XBOX_IOS_TOUCH_ZONE *z;
+    XBOX_INPUT_STATE s;
+    float x0, y0, dn, kn;
+
+    reset();
+    xbox_ios_touch_set_layout(1);
+    si = strip_zone();
+    z = zone(si);
+    if (!z)
+        return;
+    x0 = z->cx;
+    y0 = z->cy;
+    fdown(1, x0, y0);
+
+    xbox_ios_touch_set_steer_sens(2.0f);              /* live, finger held: travel 0.0375 */
+    fmove(1, x0 + 0.5f * REL_TRAVEL / 2.0f, y0);
+    s = rd();
+    expect_sticks(&s, rel_lx(0.5f, 1.35f), 0, 0, 0, REL_TOL, "rel sens 2: half of 0.0375");
+    fmove(1, x0 + REL_TRAVEL / 2.0f, y0);
+    s = rd();
+    expect_sticks(&s, STICK_FULL, 0, 0, 0, STICK_NEAR, "rel sens 2: 0.0375 = full lock");
+    fmove(1, x0 + REL_TRAVEL, y0);
+    xbox_ios_touch_steer_knob(si, &dn, &kn);
+    CHECK(fabsf(kn - dn - REL_TRAVEL / 2.0f) < 1e-5f, "rel sens 2: knob travel %.5f, want %.5f", kn - dn,
+          REL_TRAVEL / 2.0f);
+
+    xbox_ios_touch_set_steer_sens(0.5f);              /* travel 0.15 */
+    fmove(1, x0 + 0.5f * REL_TRAVEL * 2.0f, y0);
+    s = rd();
+    expect_sticks(&s, rel_lx(0.5f, 1.35f), 0, 0, 0, REL_TOL, "rel sens 0.5: half of 0.15");
+    fmove(1, x0 + REL_TRAVEL, y0);                    /* 0.075 is only half travel now */
+    s = rd();
+    expect_sticks(&s, rel_lx(0.5f, 1.35f), 0, 0, 0, REL_TOL, "rel sens 0.5: 0.075 is half travel");
+    fmove(1, x0 + REL_TRAVEL * 2.0f, y0);
+    s = rd();
+    expect_sticks(&s, STICK_FULL, 0, 0, 0, STICK_NEAR, "rel sens 0.5: 0.15 = full lock");
+    xbox_ios_touch_steer_knob(si, &dn, &kn);
+    CHECK(fabsf(kn - dn - REL_TRAVEL * 2.0f) < 1e-5f, "rel sens 0.5: knob travel %.5f", kn - dn);
+
+    xbox_ios_touch_set_steer_sens(9.0f);              /* clamps to 2 */
+    fmove(1, x0 + REL_TRAVEL / 2.0f, y0);
+    s = rd();
+    expect_sticks(&s, STICK_FULL, 0, 0, 0, STICK_NEAR, "rel sens 9 clamps to 2");
+    xbox_ios_touch_set_steer_sens(0.01f);             /* clamps to 0.5 */
+    fmove(1, x0 + REL_TRAVEL, y0);
+    s = rd();
+    expect_sticks(&s, rel_lx(0.5f, 1.35f), 0, 0, 0, REL_TOL, "rel sens 0.01 clamps to 0.5");
+    xbox_ios_touch_set_steer_sens(NAN);
+    fmove(1, x0 + REL_TRAVEL, y0);
+    s = rd();
+    expect_sticks(&s, rel_lx(0.5f, 1.35f), 0, 0, 0, REL_TOL, "rel sens NaN clamps to 0.5");
+    fup(1);
+}
+
+/* 17i. Response curve: 1.0 = linear, 2.0 = squared, clamped 1.0..2.0 (NaN 1.0),
+ * relative mode only; absolute ignores it; the mode switches live. */
+static void t_steer_curve(void)
+{
+    int si, k;
+    const XBOX_IOS_TOUCH_ZONE *z;
+    XBOX_INPUT_STATE s;
+    float x0, y0;
+    int lin, def;
+    static const float fr[4] = { 0.25f, 0.5f, 0.75f, 1.0f };
+
+    reset();
+    xbox_ios_touch_set_layout(1);
+    si = strip_zone();
+    z = zone(si);
+    if (!z)
+        return;
+    x0 = z->cx;
+    y0 = z->cy;
+    fdown(1, x0, y0);
+
+    xbox_ios_touch_set_steer_curve(1.0f);             /* linear */
+    for (k = 0; k < 4; k++) {
+        float a = (fr[k] - 0.04f) / 0.96f;
+        fmove(1, x0 + fr[k] * REL_TRAVEL, y0);
+        s = rd();
+        CHECK(abs(LX(s) - (int)(32767.0f * a)) <= REL_TOL, "curve 1.0 at %.2f travel: LX=%d, want %d", fr[k],
+              LX(s), (int)(32767.0f * a));
+    }
+    fmove(1, x0 + 0.5f * REL_TRAVEL, y0);
+    s = rd();
+    lin = LX(s);
+    xbox_ios_touch_set_steer_curve(1.35f);
+    s = rd();
+    def = LX(s);
+    CHECK(def < lin - 1000, "curve 1.35 (%d) is not gentler than linear (%d) at half travel", def, lin);
+    xbox_ios_touch_set_steer_curve(2.0f);
+    for (k = 0; k < 4; k++) {
+        float a = (fr[k] - 0.04f) / 0.96f;
+        fmove(1, x0 + fr[k] * REL_TRAVEL, y0);
+        s = rd();
+        CHECK(abs(LX(s) - (int)(32767.0f * a * a)) <= REL_TOL, "curve 2.0 at %.2f travel: LX=%d, want %d", fr[k],
+              LX(s), (int)(32767.0f * a * a));
+    }
+    CHECK(xbox_ios_touch_zone_value(si) > 0.999f, "curve 2.0: full lock value %.4f", xbox_ios_touch_zone_value(si));
+    fmove(1, x0 - 0.5f * REL_TRAVEL, y0);
+    s = rd();
+    CHECK(LX(s) < 0 && abs(LX(s) + rel_lx(0.5f, 2.0f)) <= REL_TOL, "curve 2.0 is not symmetric: LX=%d", LX(s));
+
+    xbox_ios_touch_set_steer_curve(9.0f);             /* clamps to 2.0 */
+    fmove(1, x0 + 0.5f * REL_TRAVEL, y0);
+    s = rd();
+    expect_sticks(&s, rel_lx(0.5f, 2.0f), 0, 0, 0, REL_TOL, "curve 9 clamps to 2.0");
+    xbox_ios_touch_set_steer_curve(0.2f);             /* clamps to 1.0 */
+    s = rd();
+    expect_sticks(&s, lin, 0, 0, 0, 1, "curve 0.2 clamps to 1.0");
+    xbox_ios_touch_set_steer_curve(2.0f);
+    xbox_ios_touch_set_steer_curve(NAN);              /* NaN gives 1.0 */
+    s = rd();
+    expect_sticks(&s, lin, 0, 0, 0, 1, "curve NaN gives 1.0");
+
+    /* Absolute mode: no curve (today's behaviour), and the held finger is read
+     * by the other rule at once: its offset from the strip centre. */
+    xbox_ios_touch_set_steer_curve(2.0f);
+    xbox_ios_touch_set_steer_mode(0);
+    s = rd();
+    expect_sticks(&s, (int)(32767.0f * (0.5f * REL_TRAVEL / z->rx - 0.05f) / 0.95f), 0, 0, 0, 60,
+                  "mode switched to absolute with a finger held: curve ignored");
+    xbox_ios_touch_set_steer_mode(1);
+    s = rd();
+    expect_sticks(&s, rel_lx(0.5f, 2.0f), 0, 0, 0, REL_TOL, "mode back to relative with the finger held");
+    fup(1);
+    xbox_ios_touch_set_steer_curve(1.35f);
+}
+
+/* 17j. Relative steering does not depend on the strip: its size, its place
+ * (override, safe area) or the Size setting. The setters move no generation
+ * and drop no finger. Two strip fingers each keep their own touch-down point. */
+static void t_steer_rel_indep(void)
+{
+    int si, pass;
+    const XBOX_IOS_TOUCH_ZONE *z;
+    XBOX_INPUT_STATE s;
+    unsigned gen;
+    float x0, y0;
+
+    reset();
+    xbox_ios_touch_set_layout(1);
+
+    for (pass = 0; pass < 4; pass++) {
+        reset();
+        xbox_ios_touch_set_layout(1);
+        si = strip_zone();
+        if (pass == 1)
+            xbox_ios_touch_set_scale(1.5f);
+        else if (pass == 2)
+            xbox_ios_touch_set_safe_area(0.0692f, 0.0692f);
+        else if (pass == 3)
+            xbox_ios_touch_zone_set_geom(si, 0.30f, 0.75f, 0.30f, 0.15f);   /* a wide user override */
+        z = zone(strip_zone());
+        if (!z)
+            return;
+        x0 = z->cx + 0.3f * z->rx;
+        y0 = z->cy;
+        fdown(1, x0, y0);
+        fmove(1, x0 + 0.5f * REL_TRAVEL, y0);
+        s = rd();
+        expect_sticks(&s, rel_lx(0.5f, 1.35f), 0, 0, 0, REL_TOL, pass == 0 ? "indep: preset" :
+                      pass == 1 ? "indep: size 1.5" : pass == 2 ? "indep: safe area" : "indep: wide override");
+        fmove(1, x0 + REL_TRAVEL, y0);
+        s = rd();
+        expect_sticks(&s, STICK_FULL, 0, 0, 0, STICK_NEAR, "indep: full lock");
+        fup(1);
+    }
+
+    reset();
+    xbox_ios_touch_set_layout(1);
+    z = zone(strip_zone());
+    if (!z)
+        return;
+    x0 = z->cx;
+    y0 = z->cy;
+    fdown(1, x0, y0);
+    fmove(1, x0 + REL_TRAVEL, y0);
+    gen = xbox_ios_touch_layout_gen();
+    xbox_ios_touch_set_steer_mode(0);
+    xbox_ios_touch_set_steer_mode(1);
+    xbox_ios_touch_set_steer_curve(1.7f);
+    xbox_ios_touch_set_steer_curve(1.35f);
+    CHECK(xbox_ios_touch_layout_gen() == gen, "the mode / curve setters moved the layout generation");
+    CHECK(xbox_ios_touch_zone_pressed(strip_zone()), "the mode / curve setters dropped the strip finger");
+    s = rd();
+    expect_sticks(&s, STICK_FULL, 0, 0, 0, STICK_NEAR, "finger still at full lock after the setters");
+    fup(1);
+
+    /* Two strip fingers: each keeps its own touch-down point. */
+    fdown(1, x0 - 0.04f, y0);
+    fdown(2, x0 + 0.04f, y0);
+    fmove(1, x0 - 0.04f + 0.5f * REL_TRAVEL, y0);
+    fmove(2, x0 + 0.04f - REL_TRAVEL, y0);
+    s = rd();
+    expect_sticks(&s, rel_lx(0.5f, 1.35f), 0, 0, 0, REL_TOL, "two strip fingers: the first steers");
+    fup(1);
+    s = rd();
+    expect_sticks(&s, -STICK_FULL, 0, 0, 0, STICK_NEAR, "two strip fingers: the second takes over from its own point");
+    fup(2);
+
+    /* A strip finger still outranks a dynamic stick finger. */
+    require_bare(0.30f, 0.50f);
+    fdown(1, 0.30f, 0.50f);
+    fmove(1, 0.30f + STICK_RADIUS, 0.50f - STICK_RADIUS / WIN_ASPECT);
+    fdown(2, x0, y0);
+    fmove(2, x0 + 0.5f * REL_TRAVEL, y0);
+    s = rd();
+    expect_sticks(&s, rel_lx(0.5f, 1.35f), 0, 0, 0, REL_TOL, "relative strip outranks the dynamic stick");
+    lift_all();
 }
 
 /* 18. Activity hook: every tracked finger down, whatever it lands on. */
@@ -2158,8 +2531,15 @@ static void t_drive_geometry(void)
             {
                 const XBOX_IOS_TOUCH_ZONE *zs = zone(strip_zone());
                 if (zs)
+                {
                     CHECK(2.0f * zs->rx * W >= 44.0f && 2.0f * zs->ry * H >= 44.0f,
                           "the strip is %.1f x %.1f pt, want >= 44", 2.0f * zs->rx * W, 2.0f * zs->ry * H);
+                    /* Narrow on purpose (relative steering needs a landing area, not a
+                     * wheel): about 0.22 of the width, bottom left. */
+                    CHECK(2.0f * zs->rx > 0.20f && 2.0f * zs->rx < 0.24f && zs->cx < 0.25f && zs->cy > 0.7f,
+                          "the strip is %.3f wide at (%.3f,%.3f), want ~0.22 wide, bottom left", 2.0f * zs->rx,
+                          zs->cx, zs->cy);
+                }
             }
         }
     }
@@ -2228,6 +2608,8 @@ static int env_child(const char *what)
     unsetenv("NFSU2_ANALOG_PEDALS");
     unsetenv("NFSU2_STEER");
     unsetenv("NFSU2_STEER_SENS");
+    unsetenv("NFSU2_STEER_MODE");
+    unsetenv("NFSU2_STEER_CURVE");
     unsetenv("NFSU2_DRIVE_CLASSIC");
     g_nfail_checks = 0;
 
@@ -2315,7 +2697,30 @@ static int env_child(const char *what)
         CHECK(zone_find_kind(XBOX_IOS_ZONE_STEER) >= 0, "panel: strip did not come back");
         fails += g_nfail_checks;
     } else if (!strcmp(what, "sens2")) {
+        /* Relative (the default): travel is 0.075 / 2 after the clamp. */
         setenv("NFSU2_TOUCH_LAYOUT", "drive", 1);
+        setenv("NFSU2_STEER_SENS", "9", 1);                       /* clamps to 2 */
+        if (xbox_ios_touch_init() != 1) fails++;
+        {
+            const XBOX_IOS_TOUCH_ZONE *z = zone(zone_find_kind(XBOX_IOS_ZONE_STEER));
+            if (z) {
+                fdown(1, z->cx, z->cy);
+                fmove(1, z->cx + 0.5f * REL_TRAVEL / 2.0f, z->cy);
+                s = rd();
+                CHECK(rel_lx_ok(LX(s), 0.5f, 1.35f), "env sens 9 (-> 2): half of 0.0375 gives LX=%d, want %d", LX(s),
+                      rel_lx(0.5f, 1.35f));
+                fmove(1, z->cx + REL_TRAVEL / 2.0f, z->cy);
+                s = rd();
+                CHECK(abs(LX(s) - 32767) <= STICK_NEAR, "env sens 9 (-> 2): 0.0375 gives LX=%d, want full", LX(s));
+                fup(1);
+            } else {
+                fails++;
+            }
+        }
+        fails += g_nfail_checks;
+    } else if (!strcmp(what, "sens2abs")) {
+        setenv("NFSU2_TOUCH_LAYOUT", "drive", 1);
+        setenv("NFSU2_STEER_MODE", "absolute", 1);
         setenv("NFSU2_STEER_SENS", "9", 1);                       /* clamps to 2 */
         if (xbox_ios_touch_init() != 1) fails++;
         {
@@ -2324,7 +2729,75 @@ static int env_child(const char *what)
                 fdown(1, z->cx, z->cy);
                 fmove(1, z->cx + 0.5f * z->rx, z->cy);
                 s = rd();
-                CHECK(abs(LX(s) - 32767) <= STICK_NEAR, "env sens 9 (-> 2): half width gives LX=%d, want full", LX(s));
+                CHECK(abs(LX(s) - 32767) <= STICK_NEAR, "env abs sens 9 (-> 2): half width gives LX=%d, want full", LX(s));
+                fup(1);
+            } else {
+                fails++;
+            }
+        }
+        fails += g_nfail_checks;
+    } else if (!strcmp(what, "mode_default") || !strcmp(what, "mode_junk")) {
+        /* Unset or not "absolute": relative, curve 1.35. */
+        setenv("NFSU2_TOUCH_LAYOUT", "drive", 1);
+        if (!strcmp(what, "mode_junk"))
+            setenv("NFSU2_STEER_MODE", "sideways", 1);
+        if (xbox_ios_touch_init() != 1) fails++;
+        {
+            const XBOX_IOS_TOUCH_ZONE *z = zone(zone_find_kind(XBOX_IOS_ZONE_STEER));
+            CHECK(xbox_ios_touch_get_steer_mode() == 1, "env %s: mode is not relative", what);
+            if (z) {
+                float x0 = z->cx + 0.8f * z->rx;
+                fdown(1, x0, z->cy);
+                s = rd();
+                CHECK(LX(s) == 0, "env %s: landing off-centre gives LX=%d, want 0", what, LX(s));
+                fmove(1, x0 + 0.5f * REL_TRAVEL, z->cy);
+                s = rd();
+                CHECK(rel_lx_ok(LX(s), 0.5f, 1.35f), "env %s: half travel LX=%d, want %d (curve 1.35)", what, LX(s),
+                      rel_lx(0.5f, 1.35f));
+                fup(1);
+            } else {
+                fails++;
+            }
+        }
+        fails += g_nfail_checks;
+    } else if (!strcmp(what, "mode_abs")) {
+        setenv("NFSU2_TOUCH_LAYOUT", "drive", 1);
+        setenv("NFSU2_STEER_MODE", "ABSOLUTE", 1);                /* case-insensitive */
+        if (xbox_ios_touch_init() != 1) fails++;
+        {
+            const XBOX_IOS_TOUCH_ZONE *z = zone(zone_find_kind(XBOX_IOS_ZONE_STEER));
+            CHECK(xbox_ios_touch_get_steer_mode() == 0, "env absolute: mode is not absolute");
+            if (z) {
+                fdown(1, z->cx + 0.5f * z->rx, z->cy);
+                s = rd();
+                CHECK(abs(LX(s) - (int)(32767.0f * (0.5f - 0.05f) / 0.95f)) <= 60,
+                      "env absolute: landing at half width gives LX=%d", LX(s));
+                xbox_ios_touch_set_steer_mode(1);                 /* the panel can switch it */
+                s = rd();
+                CHECK(LX(s) == 0, "panel: relative with the finger held gives LX=%d, want 0", LX(s));
+                fup(1);
+            } else {
+                fails++;
+            }
+        }
+        fails += g_nfail_checks;
+    } else if (!strcmp(what, "curve9") || !strcmp(what, "curve_bad")) {
+        /* 9 clamps to 2.0; text that is not a number is 0, which clamps to 1.0. */
+        float want_curve = !strcmp(what, "curve9") ? 2.0f : 1.0f;
+        setenv("NFSU2_TOUCH_LAYOUT", "drive", 1);
+        setenv("NFSU2_STEER_CURVE", !strcmp(what, "curve9") ? "9" : "abc", 1);
+        if (xbox_ios_touch_init() != 1) fails++;
+        {
+            const XBOX_IOS_TOUCH_ZONE *z = zone(zone_find_kind(XBOX_IOS_ZONE_STEER));
+            if (z) {
+                fdown(1, z->cx, z->cy);
+                fmove(1, z->cx + 0.5f * REL_TRAVEL, z->cy);
+                s = rd();
+                CHECK(rel_lx_ok(LX(s), 0.5f, want_curve), "env curve (%s): half travel LX=%d, want %d", what, LX(s),
+                      rel_lx(0.5f, want_curve));
+                xbox_ios_touch_set_steer_curve(1.35f);            /* the panel can change it */
+                s = rd();
+                CHECK(rel_lx_ok(LX(s), 0.5f, 1.35f), "panel curve 1.35 after env: LX=%d", LX(s));
                 fup(1);
             } else {
                 fails++;
@@ -2836,6 +3309,7 @@ static void t_geom_on_screen(void)
         /* A finger on the new strip steers; the old preset spot no longer does. */
         {
             XBOX_INPUT_STATE s;
+            xbox_ios_touch_set_steer_mode(0);        /* absolute: the offset from the centre */
             fdown(1, 0.45f + 0.20f, 0.50f);
             s = rd();
             CHECK(s.Gamepad.sThumbLX > 5000, "strip finger right of centre: LX=%d", s.Gamepad.sThumbLX);
@@ -3003,6 +3477,7 @@ static void t_safe_hit(void)
     float bx, by;
 
     reset();
+    xbox_ios_touch_set_steer_mode(0);        /* the strip part is about the absolute gain */
     a = zone_by_label("A");
     if (a < 0)
         return;
@@ -3196,6 +3671,31 @@ static void t_safe_overlap(void)
                       zone(i)->id, xbox_ios_touch_zone_label(i) ? xbox_ios_touch_zone_label(i) : "-",
                       zone(j)->id, xbox_ios_touch_zone_label(j) ? xbox_ios_touch_zone_label(j) : "-", -g);
             }
+        if (print && lay == 1) {                          /* the strip with the insets, and its nearest neighbour */
+            int si = zone_find_kind(XBOX_IOS_ZONE_STEER), nb = -1;
+            float ming = 1e9f, ming0;
+            XBOX_IOS_TOUCH_ZONE zsv, zs0;
+            const XBOX_IOS_TOUCH_ZONE *zs = si >= 0 ? &zsv : NULL;
+            if (si >= 0)
+                zsv = *zone(si);                          /* the table is rebuilt below */
+            for (j = 0; zs && j < n; j++)
+                if (j != si && zone_gap_pt(si, j, W, H) < ming) {
+                    ming = zone_gap_pt(si, j, W, H);
+                    nb = j;
+                }
+            xbox_ios_touch_set_safe_area(0.0f, 0.0f);
+            if (si >= 0)
+                zs0 = *zone(si);
+            ming0 = 1e9f;
+            for (j = 0; zs && j < zcount(); j++)
+                if (j != si && zone_gap_pt(si, j, W, H) < ming0)
+                    ming0 = zone_gap_pt(si, j, W, H);
+            if (zs)
+                printf("   STRIP with insets: x %.1f-%.1f pt; nearest zone id %d at %.1f pt (%.1f pt without insets: x %.1f-%.1f pt)\n",
+                       (zs->cx - zs->rx) * W, (zs->cx + zs->rx) * W, nb >= 0 ? zone(nb)->id : -1, ming, ming0,
+                       (zs0.cx - zs0.rx) * W, (zs0.cx + zs0.rx) * W);
+            xbox_ios_touch_set_safe_area(inset, inset);
+        }
         if (print && wi >= 0)
             printf("   %-13s shift left +%.1f pt, right -%.1f pt; smallest gap %.1f pt (id %d / id %d), %.1f pt without insets\n",
                    names[lay], shl * W, shr * W, worst, zone(wi)->id, zone(wj)->id, w0);
@@ -3465,7 +3965,13 @@ int main(void)
     env_case("ENV   default DRIVE: analog pedals and the strip are on", "analog1");
     env_case("ENV   NFSU2_ANALOG_PEDALS=0: DRIVE pedals digital 255", "analog0");
     env_case("ENV   NFSU2_STEER=0: no strip in DRIVE", "steer0");
-    env_case("ENV   NFSU2_STEER_SENS=9 clamps to 2", "sens2");
+    env_case("ENV   NFSU2_STEER_SENS=9 clamps to 2 (relative travel)", "sens2");
+    env_case("ENV   NFSU2_STEER_MODE=absolute + SENS=9: old strip gain", "sens2abs");
+    env_case("ENV   default steer mode is relative, curve 1.35", "mode_default");
+    env_case("ENV   NFSU2_STEER_MODE=sideways falls back to relative", "mode_junk");
+    env_case("ENV   NFSU2_STEER_MODE=ABSOLUTE (any case); panel can switch", "mode_abs");
+    env_case("ENV   NFSU2_STEER_CURVE=9 clamps to 2.0; panel can change", "curve9");
+    env_case("ENV   NFSU2_STEER_CURVE=abc clamps to 1.0", "curve_bad");
     env_case("ENV   NFSU2_DRIVE_CLASSIC=1: the old DRIVE table", "classic");
 
     unsetenv("RECOMP_TOUCH");
@@ -3474,6 +3980,8 @@ int main(void)
     unsetenv("NFSU2_ANALOG_PEDALS");
     unsetenv("NFSU2_STEER");
     unsetenv("NFSU2_STEER_SENS");
+    unsetenv("NFSU2_STEER_MODE");
+    unsetenv("NFSU2_STEER_CURVE");
     unsetenv("NFSU2_DRIVE_CLASSIC");
 
     if (SDL_Init(SDL_INIT_EVENTS) != 0) {
@@ -3522,6 +4030,10 @@ int main(void)
     run_case("17d  Steering strip off: zone gone, dynamic stick back", t_steer_disabled, NULL);
     run_case("17e  Strip outranks the dynamic stick; two strip fingers", t_steer_priority, NULL);
     run_case("17f  Tilt is suppressed while the strip (or a stick) steers", t_tilt_vs_strip, NULL);
+    run_case("17g  Relative steering: touch-down = straight, +travel = full lock, curve, deadzone, latch, release", t_steer_rel, NULL);
+    run_case("17h  Relative steering sensitivity: travel 0.075 / sens, clamped 0.5..2, live", t_steer_rel_sens, NULL);
+    run_case("17i  Steering curve: 1.0 linear, 2.0 squared, clamps, absolute ignores it, live mode switch", t_steer_curve, NULL);
+    run_case("17j  Relative steering ignores strip size / place; setters keep fingers; two strip fingers", t_steer_rel_indep, NULL);
     run_case("18   Activity hook: every tracked finger down, not moves / repeats / off", t_activity_hook, NULL);
     run_case("19   DRIVE geometry on 852x393: no overlap, off the island, sizes", t_drive_geometry, NULL);
     run_case("20   NFSU2_DRIVE_CLASSIC / set_drive_classic: the old table", t_drive_classic, NULL);

@@ -54,6 +54,12 @@ extern void xbox_ios_touch_set_activity_hook(void (*hook)(void));   /* any finge
 extern void xbox_ios_touch_set_analog_pedals(int on);
 extern void xbox_ios_touch_set_steer(int on);
 extern void xbox_ios_touch_set_steer_sens(float k);
+extern void xbox_ios_touch_set_steer_mode(int relative);   /* NFSU2_STEER_MODE: 1 relative, 0 absolute */
+extern int  xbox_ios_touch_get_steer_mode(void);
+extern void xbox_ios_touch_set_steer_curve(float c);       /* NFSU2_STEER_CURVE 1.0..2.0 */
+/* Relative steering: 1 while a finger holds strip zone idx; its touch-down x and
+ * the knob x (touch-down + offset clamped to full travel), normalized to the window. */
+extern int  xbox_ios_touch_steer_knob(int idx, float *down_x, float *knob_x);
 extern void xbox_ios_touch_set_tilt(float x, int active);
 /* Screen adaptation (xinput_ios.c): the overlay feeds them from the window. */
 extern void  xbox_ios_touch_set_safe_area(float left, float right);   /* fractions of the width */
@@ -404,6 +410,11 @@ static void fit_rounded(CGFloat A, CGFloat B, CGFloat fx, CGFloat fy, CGFloat fr
 @property (nonatomic, assign) unsigned dbits;         /* cached d-pad bits */
 @property (nonatomic, assign) CGFloat level;          /* 0..1, pedals */
 @property (nonatomic, strong) CALayer *knob;          /* steering strip: the knob */
+@property (nonatomic, strong) CALayer *marks;         /* strip: centre mark and chevrons */
+@property (nonatomic, assign) BOOL relative;          /* strip built for relative steering */
+@property (nonatomic, assign) CGFloat leftX;          /* strip: left edge in overlay points */
+@property (nonatomic, assign) CGFloat kd;             /* strip: knob diameter, pt */
+@property (nonatomic, assign) CGFloat knobX;          /* relative: last knob x placed (local pt) */
 @property (nonatomic, assign) CGFloat travel;         /* strip: knob travel each way, pt */
 @property (nonatomic, assign) CGFloat steerPos;       /* strip: -1..1 */
 @property (nonatomic, assign) CGFloat value;          /* last analog value applied; -2 = none yet */
@@ -433,14 +444,30 @@ static void fit_rounded(CGFloat A, CGFloat B, CGFloat fx, CGFloat fy, CGFloat fr
                                      self.size.height / 2.0);
 }
 
-/* Follow the zone's analog value (pedal level or strip steer). */
+/* Relative strip: the knob at local x (pt), kept inside the track. Callers wrap
+ * this in a CATransaction with the actions disabled. */
+- (void)setKnobLocalX:(CGFloat)x
+{
+    CGFloat r = self.kd / 2.0 + 2.0, w = self.size.width;
+    x = x > w - r ? w - r : x;
+    x = x < r ? r : x;
+    _knobX = x;
+    if (self.knob)
+        self.knob.position = CGPointMake(x, self.size.height / 2.0);
+}
+
+/* Follow the zone's analog value (pedal level or strip steer). A relative strip
+ * has no centred knob: its knob is placed from the touch-down point
+ * (setKnobLocalX), so the value only gets recorded. */
 - (void)setAnalogValue:(CGFloat)v
 {
     self.value = v;
-    if (self.style == ZS_STEER)
-        [self setSteerPos:v];
-    else
+    if (self.style == ZS_STEER) {
+        if (!self.relative)
+            [self setSteerPos:v];
+    } else {
         [self setLevel:v];
+    }
 }
 
 /* Callers wrap this in a CATransaction (short duration, or no actions). */
@@ -450,7 +477,12 @@ static void fit_rounded(CGFloat A, CGFloat B, CGFloat fx, CGFloat fy, CGFloat fr
     self.dbits = bits;
     if (self.style == ZS_STEER) {
         self.pressFill.opacity = p ? 1.0f : 0.0f;
-        self.knob.opacity = p ? 1.0f : 0.6f;     /* no shrink: the track stays put */
+        if (self.relative) {
+            self.knob.opacity = p ? 1.0f : 0.0f;     /* the indicator exists only while held */
+            self.marks.opacity = p ? 0.0f : 1.0f;    /* "drag here" only when idle */
+        } else {
+            self.knob.opacity = p ? 1.0f : 0.6f;     /* no shrink: the track stays put */
+        }
     } else if (self.style == ZS_DPAD) {
         NSUInteger k;
         for (k = 0; k < self.arms.count; k++) {
@@ -815,29 +847,54 @@ static Nfsu2Ctl *build_ctl(int idx, const XBOX_IOS_TOUCH_ZONE_MIRROR *z, CGFloat
         [root addSublayer:ring];
     }
 
-    /* Steering strip: centre mark, a chevron at each end and the knob. The
-     * knob follows xbox_ios_touch_zone_value(); it rests at the centre. */
+    /* Steering strip. Absolute: centre mark, a chevron at each end and a knob
+     * that follows xbox_ios_touch_zone_value() and rests at the centre.
+     * Relative: a faint "drag here" mark in the middle (a ring between two small
+     * chevrons) while idle; once a finger is down the mark fades and a smaller
+     * knob floats at the touch-down point plus the deflection
+     * (xbox_ios_touch_steer_knob). */
     if (steer) {
+        BOOL rel = (xbox_ios_touch_get_steer_mode() != 0);
         CAShapeLayer *marks = [CAShapeLayer layer];
         UIBezierPath *mp = [UIBezierPath bezierPath];
-        CGFloat cy0 = h / 2.0, ch = h * 0.16, cx0 = r * 0.85, kd = h * 0.78;
+        CGFloat cy0 = h / 2.0, ch = h * 0.16, cx0 = r * 0.85, kd = rel ? h * 0.50 : h * 0.78;
         CALayer *knob = [CALayer layer];
         CAGradientLayer *kg = [CAGradientLayer layer];
         UIColor *black = [UIColor blackColor];
 
-        [mp moveToPoint:CGPointMake(w / 2.0, h * 0.22)];
-        [mp addLineToPoint:CGPointMake(w / 2.0, h * 0.78)];
-        [mp moveToPoint:CGPointMake(cx0 + ch * 0.6, cy0 - ch)];
-        [mp addLineToPoint:CGPointMake(cx0, cy0)];
-        [mp addLineToPoint:CGPointMake(cx0 + ch * 0.6, cy0 + ch)];
-        [mp moveToPoint:CGPointMake(w - cx0 - ch * 0.6, cy0 - ch)];
-        [mp addLineToPoint:CGPointMake(w - cx0, cy0)];
-        [mp addLineToPoint:CGPointMake(w - cx0 - ch * 0.6, cy0 + ch)];
+        if (rel) {
+            CGFloat ring_r = h * 0.13, gap = h * 0.30;   /* chevron offset from the centre */
+            CGFloat chh = h * 0.12;
+            int k;
+            for (k = 0; k <= 24; k++) {          /* the ring as a closed polyline */
+                CGFloat ang = 2.0 * M_PI * (CGFloat)k / 24.0;
+                CGPoint pt = CGPointMake(w / 2.0 + ring_r * cos(ang), cy0 + ring_r * sin(ang));
+                if (k == 0)
+                    [mp moveToPoint:pt];
+                else
+                    [mp addLineToPoint:pt];
+            }
+            [mp moveToPoint:CGPointMake(w / 2.0 - gap + chh * 0.6, cy0 - chh)];
+            [mp addLineToPoint:CGPointMake(w / 2.0 - gap, cy0)];
+            [mp addLineToPoint:CGPointMake(w / 2.0 - gap + chh * 0.6, cy0 + chh)];
+            [mp moveToPoint:CGPointMake(w / 2.0 + gap - chh * 0.6, cy0 - chh)];
+            [mp addLineToPoint:CGPointMake(w / 2.0 + gap, cy0)];
+            [mp addLineToPoint:CGPointMake(w / 2.0 + gap - chh * 0.6, cy0 + chh)];
+        } else {
+            [mp moveToPoint:CGPointMake(w / 2.0, h * 0.22)];
+            [mp addLineToPoint:CGPointMake(w / 2.0, h * 0.78)];
+            [mp moveToPoint:CGPointMake(cx0 + ch * 0.6, cy0 - ch)];
+            [mp addLineToPoint:CGPointMake(cx0, cy0)];
+            [mp addLineToPoint:CGPointMake(cx0 + ch * 0.6, cy0 + ch)];
+            [mp moveToPoint:CGPointMake(w - cx0 - ch * 0.6, cy0 - ch)];
+            [mp addLineToPoint:CGPointMake(w - cx0, cy0)];
+            [mp addLineToPoint:CGPointMake(w - cx0 - ch * 0.6, cy0 + ch)];
+        }
         marks.frame = R;
         marks.contentsScale = s_cscale;
         set_path(marks, mp);
         marks.fillColor = NULL;
-        set_stroke(marks, [UIColor colorWithWhite:1.0 alpha:0.28]);
+        set_stroke(marks, [UIColor colorWithWhite:1.0 alpha:rel ? 0.22 : 0.28]);
         marks.lineWidth = 2.0;
         marks.lineCap = kCALineCapRound;
         marks.lineJoin = kCALineJoinRound;
@@ -849,7 +906,7 @@ static Nfsu2Ctl *build_ctl(int idx, const XBOX_IOS_TOUCH_ZONE_MIRROR *z, CGFloat
         knob.shadowOpacity = 0.35f;
         knob.shadowRadius = 4.0;
         knob.shadowOffset = CGSizeMake(0.0, 2.0);
-        knob.opacity = 0.6f;
+        knob.opacity = rel ? 0.0f : 0.6f;
         kg.frame = knob.bounds;
         kg.contentsScale = s_cscale;
         kg.cornerRadius = kd / 2.0;
@@ -860,6 +917,11 @@ static Nfsu2Ctl *build_ctl(int idx, const XBOX_IOS_TOUCH_ZONE_MIRROR *z, CGFloat
         [knob addSublayer:kg];
         [root addSublayer:knob];
         c.knob = knob;
+        c.marks = marks;
+        c.relative = rel;
+        c.kd = kd;
+        c.knobX = -1.0e9;
+        c.leftX = z->cx * W - w / 2.0;
         c.travel = fmax((w - kd) / 2.0 - 4.0, 1.0);
     }
 
@@ -1380,6 +1442,7 @@ static void path_add_rect(UIBezierPath *p, CGRect r)
 - (BOOL)syncControls
 {
     CGSize sz = self.bounds.size;
+    CGFloat W = sz.width;
     BOOL active = NO, open = NO;
     unsigned dbits;
     NSUInteger i, n;
@@ -1407,10 +1470,30 @@ static void path_add_rect(UIBezierPath *p, CGRect r)
                 open = YES;
             }
             [c applyPressed:p dpad:db];
-            if (analog && !p)
-                [c setAnalogValue:0.0];   /* fill drains / knob returns to centre, eased */
+            if (analog && !p) {
+                if (c.style == ZS_STEER && c.relative) {
+                    c.value = 0.0;
+                    c.knobX = -1.0e9;     /* fades out where it is; the next touch re-places it */
+                } else {
+                    [c setAnalogValue:0.0];   /* fill drains / knob returns to centre, eased */
+                }
+            }
         }
-        if (analog && p) {
+        if (analog && p && c.style == ZS_STEER && c.relative) {
+            /* The floating indicator: placed from the touch-down point, keyed on
+             * its own position (the deflection can read 0 at a fresh touch while
+             * the knob has to jump there), never animated. */
+            float dn, kn;
+            if (xbox_ios_touch_steer_knob(c.zoneIdx, &dn, &kn)) {
+                CGFloat lx = (CGFloat)kn * W - c.leftX;
+                if (fabs(lx - c.knobX) > 0.25) {
+                    [CATransaction begin];
+                    [CATransaction setDisableActions:YES];
+                    [c setKnobLocalX:lx];
+                    [CATransaction commit];
+                }
+            }
+        } else if (analog && p) {
             /* Pedal level and strip knob follow the finger every tick, with
              * no implicit animation (it would trail the thumb). Only a value
              * that moved is written. */
@@ -2068,7 +2151,8 @@ enum { IK_HEAD, IK_SWITCH, IK_SLIDER, IK_SEG, IK_BUTTON, IK_SUB };
 enum { ACT_NONE, ACT_FPS, ACT_TOUCH, ACT_LAYOUT, ACT_SCALE, ACT_ALPHA,
        ACT_HAPTICS, ACT_TILT, ACT_TILTSENS, ACT_KEYBOARD, ACT_RUMBLE,
        ACT_ANALOG, ACT_STEER, ACT_STEERSENS, ACT_TILTCENTRE, ACT_EDITLAYOUT,
-       ACT_CAPTIONS, ACT_AUTOLAYOUT, ACT_SAFE, ACT_TABLET, ACT_HAPSTRENGTH };
+       ACT_CAPTIONS, ACT_AUTOLAYOUT, ACT_SAFE, ACT_TABLET, ACT_HAPSTRENGTH,
+       ACT_STEERMODE, ACT_STEERCURVE };
 
 typedef struct {
     int         kind;
@@ -2123,8 +2207,17 @@ static const PanelItem s_items[] = {
       .on = "1", .off = "0", .def_on = 1, .act = ACT_ANALOG },
     { .kind = IK_SWITCH, .title = "Steering strip (Drive layout)", .key = "NFSU2_STEER",
       .on = "1", .off = "0", .def_on = 1, .act = ACT_STEER },
+    /* Relative: the touch-down point in the strip is straight ahead and a short
+     * drag (0.075 of the screen width / sensitivity) is full lock. Absolute: the
+     * strip centre is straight ahead (the first version). */
+    { .kind = IK_SEG, .title = "Steering mode", .key = "NFSU2_STEER_MODE",
+      .labels = "Relative|Absolute", .values = "relative|absolute", .def_val = "relative",
+      .act = ACT_STEERMODE },
     { .kind = IK_SLIDER, .title = "Steering sensitivity", .key = "NFSU2_STEER_SENS",
       .lo = 0.5f, .hi = 2.0f, .def = 1.0f, .decimals = 2, .act = ACT_STEERSENS },
+    /* 1.0 = linear; higher is gentler around the centre (relative mode). */
+    { .kind = IK_SLIDER, .title = "Steering curve", .key = "NFSU2_STEER_CURVE",
+      .lo = 1.0f, .hi = 2.0f, .def = 1.35f, .decimals = 2, .act = ACT_STEERCURVE },
     { .kind = IK_SWITCH, .title = "Tilt steering", .key = "NFSU2_TILT",
       .on = "1", .off = "0", .def_on = 0, .act = ACT_TILT },
     { .kind = IK_SLIDER, .title = "Tilt sensitivity", .key = "NFSU2_TILT_SENS",
@@ -2312,6 +2405,14 @@ static void apply_live(int act, int on, float fv, const char *sv)
         break;
     case ACT_STEERSENS:
         xbox_ios_touch_set_steer_sens(fv);
+        break;
+    case ACT_STEERMODE:
+        xbox_ios_touch_set_steer_mode(!(sv && strcasecmp(sv, "absolute") == 0));
+        s_style_epoch++;                   /* the strip is drawn differently: relayed by syncControls */
+        (void)[s_ov syncControls];
+        break;
+    case ACT_STEERCURVE:
+        xbox_ios_touch_set_steer_curve(fv);
         break;
     case ACT_KEYBOARD:
         xbox_input_set_keyboard(on);
@@ -2973,6 +3074,12 @@ void ios_touch_overlay_install(void *uiwindow)
         v = nfsu2_cfg_get("NFSU2_STEER_SENS");
         if (v && *v)
             xbox_ios_touch_set_steer_sens((float)atof(v));
+        v = nfsu2_cfg_get("NFSU2_STEER_MODE");
+        if (v && *v)
+            xbox_ios_touch_set_steer_mode(strcasecmp(v, "absolute") != 0);
+        v = nfsu2_cfg_get("NFSU2_STEER_CURVE");
+        if (v && *v)
+            xbox_ios_touch_set_steer_curve((float)atof(v));
         v = nfsu2_cfg_get("NFSU2_STEER");
         if (v && *v)
             xbox_ios_touch_set_steer(!(*v == '0'));
