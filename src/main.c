@@ -18,6 +18,10 @@
 #else
 #  include <signal.h>
 #  include <unistd.h>
+/* POSIX, unconditional: NFSU2_IOS is only defined further down (from
+ * __APPLE__ macros), so an #ifdef NFSU2_IOS here skipped the header on real
+ * iOS builds while command-line -DNFSU2_IOS=1 checks on Linux saw it. */
+#  include <sys/stat.h>
 #endif
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,9 +29,6 @@
 #include <string.h>
 #include <errno.h>
 #include <signal.h>
-#ifdef NFSU2_IOS
-#include <sys/stat.h>
-#endif
 
 #include <xbox/xboxrecomp.h>
 
