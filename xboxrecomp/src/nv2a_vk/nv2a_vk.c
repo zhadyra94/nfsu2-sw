@@ -59,6 +59,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if defined(NFSU2_IOS) && defined(__APPLE__)
+#  include <os/proc.h>          /* os_proc_available_memory(), iOS 13+ */
+#endif
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -309,6 +312,15 @@ static VkSurf    *s_last;
 static int         s_in_render;
 static VkSurf     *s_rt;
 static VkDepthBuf *s_rt_depth;
+#ifdef NFSU2_IOS
+/* Measurement only ([ios-vk2]): render passes and what split them. On a
+ * tile GPU every split stores and reloads colour+depth. Executor only.
+ * s_ios_split_by: 1 = tex_upload ended a live pass, 2 = image_to_general
+ * did; the next real begin_rendering counts it and clears it. */
+static uint32_t s_ios_passes, s_ios_up_splits, s_ios_lay_splits, s_ios_uploads;
+static uint64_t s_ios_up_bytes;
+static int      s_ios_split_by;
+#endif
 
 static void barrier_all(void)
 {
@@ -374,6 +386,12 @@ static void begin_rendering(VkSurf *s, VkDepthBuf *d)
 
     if (s_in_render && s_rt == s && s_rt_depth == d)
         return;
+#ifdef NFSU2_IOS
+    s_ios_passes++;
+    if (s_ios_split_by == 1) s_ios_up_splits++;
+    else if (s_ios_split_by == 2) s_ios_lay_splits++;
+    s_ios_split_by = 0;
+#endif
     end_rendering();
     barrier_all();
     ca.imageView = s->view;
@@ -408,6 +426,10 @@ static void begin_rendering(VkSurf *s, VkDepthBuf *d)
 static void image_to_general(VkImage img, VkImageAspectFlags aspect)
 {
     VkImageMemoryBarrier b = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+#ifdef NFSU2_IOS
+    if (s_in_render)
+        s_ios_split_by = 2;
+#endif
     end_rendering();
     b.srcAccessMask = 0;
     b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
@@ -777,6 +799,12 @@ static void tex_upload(VkTex *t, const void *src, uint32_t bytes, uint32_t row_t
     if (!dst)
         return;
     memcpy(dst, src, bytes);
+#ifdef NFSU2_IOS
+    s_ios_uploads++;
+    s_ios_up_bytes += bytes;
+    if (s_in_render)
+        s_ios_split_by = 1;
+#endif
     end_rendering();
     barrier_all();
     memset(&rg, 0, sizeof rg);
@@ -1553,7 +1581,8 @@ static VkProg *prog_get(const Nv2aRawBatch *b, const Nv2aPshKey *pk)
 static int s_dyn_vertex_input;
 
 /* iOS: set by main.c when the app is backgrounded/hidden; vk_flip skips
- * acquire/present while it holds (Metal blocks present in background). */
+ * acquire/present while it holds (Metal blocks present in background).
+ * Main thread writes, executor reads: __atomic access only. */
 static int s_ios_bg;
 
 /* Guest-flip rate, tenths of fps, sampled in vk_flip. Read by the on-screen
@@ -1915,10 +1944,56 @@ static VkImage gamma_pass(VkSurf *s)
     return s_gtmp.image;
 }
 
+/* Main thread stores, the executor takes it with an exchange. */
 static int s_sc_dirty;
-void nv2a_vk_set_background(int bg) { s_ios_bg = bg; }
-int nfsu2_ios_background(void) { return s_ios_bg; }
-void nv2a_vk_mark_swapchain_dirty(void) { s_sc_dirty = 1; }
+void nv2a_vk_set_background(int bg) { __atomic_store_n(&s_ios_bg, bg, __ATOMIC_RELEASE); }
+int nfsu2_ios_background(void) { return __atomic_load_n(&s_ios_bg, __ATOMIC_ACQUIRE); }
+void nv2a_vk_mark_swapchain_dirty(void) { __atomic_store_n(&s_sc_dirty, 1, __ATOMIC_RELEASE); }
+
+#ifdef NFSU2_IOS
+/* Background handshake (main.c's SDL event watch -> executor). iOS kills an
+ * app that commits GPU work after it is backgrounded, and with async
+ * MoltenVK submits "executor parked" no longer means "GPU idle". The main
+ * thread bumps s_bg_req and waits for s_bg_ack; the executor drains the
+ * queue at its next park point, then acks. Deadline is in hz_now() ns. */
+static uint32_t s_bg_req, s_bg_ack;
+static uint64_t s_bg_deadline;
+
+int nv2a_vk_background_handshake(int timeout_ms)
+{
+    uint64_t t0, dl;
+    uint32_t gen;
+    if (__atomic_load_n(&s_state, __ATOMIC_ACQUIRE) <= 0 || s_headless) {
+        /* No executor to park (or nothing to drain): flag only. */
+        nv2a_vk_set_background(1);
+        return 1;
+    }
+    t0 = hz_now();
+    dl = t0 + (uint64_t)(timeout_ms > 0 ? timeout_ms : 0) * 1000000ull;
+    /* Deadline first, then the request: the executor reads them in the
+     * reverse order and must never see a new request with an old deadline. */
+    __atomic_store_n(&s_bg_deadline, dl, __ATOMIC_RELEASE);
+    gen = __atomic_add_fetch(&s_bg_req, 1, __ATOMIC_ACQ_REL);
+    nv2a_vk_set_background(1);
+    for (;;) {
+        uint64_t now;
+        struct timespec ts = { 0, 1000 * 1000 };
+        /* Signed difference: a later request may already be acked. */
+        if ((int32_t)(__atomic_load_n(&s_bg_ack, __ATOMIC_ACQUIRE) - gen) >= 0) {
+            fprintf(stderr, "[ios] background handshake: parked in %u ms\n",
+                    (unsigned)((hz_now() - t0) / 1000000ull));
+            return 1;
+        }
+        now = hz_now();
+        if (now >= dl) {
+            fprintf(stderr, "[ios] background handshake: TIMED OUT after %u ms (executor busy)\n",
+                    (unsigned)((now - t0) / 1000000ull));
+            return 0;
+        }
+        nanosleep(&ts, NULL);
+    }
+}
+#endif
 
 /* iOS diag: 0x1 init-tried, 0x2 init-ok, 0x4 headless, 0x8 dyn-vi present. */
 int nv2a_vk_diag(void)
@@ -2289,6 +2364,17 @@ static void prewarm(void)
 
 /* ── Context ──────────────────────────────────────────────────────── */
 
+#ifdef NFSU2_IOS
+/* Swapchain rebuild accounting. Executor thread only. */
+static int      s_sc_limit = -1;          /* RECOMP_VK_SC_LIMIT=0: old behaviour */
+static int      s_sc_streak;              /* suboptimal rebuilds since the last reset */
+static int      s_sc_want;                /* rebuild requested for the next flip */
+static int      s_sc_limit_logged;
+static uint64_t s_sc_last_rebuild_ns;
+static int      s_ios_present_mode;
+static uint32_t s_ios_suboptimal, s_ios_rebuilds;
+#endif
+
 static int create_swapchain(void)
 {
     VkSurfaceCapabilitiesKHR caps;
@@ -2344,8 +2430,48 @@ static int create_swapchain(void)
     vkGetSwapchainImagesKHR(s_dev, s_swapchain, &s_sc_count, s_sc_images);
     fprintf(stderr, "  [VK] swapchain %ux%u, %u images, format %d, present mode %d\n",
             s_sc_extent.width, s_sc_extent.height, s_sc_count, s_sc_format, mode);
+#ifdef NFSU2_IOS
+    s_ios_present_mode = (int)mode;
+#endif
     return 1;
 }
+
+/* Executor only. Idle the device and rebuild; the time feeds the
+ * suboptimal limiter (iOS) and the [ios-vk] line. */
+static void sc_rebuild(void)
+{
+    vkDeviceWaitIdle(s_dev);
+    create_swapchain();
+#ifdef NFSU2_IOS
+    s_sc_last_rebuild_ns = hz_now();
+    s_ios_rebuilds++;
+#endif
+}
+
+#ifdef NFSU2_IOS
+/* VK_SUBOPTIMAL_KHR from acquire or present. On iPad with Display Zoom the
+ * layer can stay suboptimal for good, and an immediate rebuild per report
+ * is a full rebuild every frame. Request ONE rebuild at the next flip, at
+ * most twice per streak and not within 500 ms of the last rebuild. */
+static void sc_note_suboptimal(void)
+{
+    s_ios_suboptimal++;
+    if (s_sc_want)
+        return;
+    if (s_sc_streak >= 2) {
+        if (!s_sc_limit_logged) {
+            s_sc_limit_logged = 1;
+            fprintf(stderr, "[VK] swapchain stays suboptimal after 2 rebuilds; keeping it (%ux%u)\n",
+                    s_sc_extent.width, s_sc_extent.height);
+        }
+        return;
+    }
+    if (hz_now() - s_sc_last_rebuild_ns < 500000000ull)
+        return;
+    s_sc_streak++;
+    s_sc_want = 1;
+}
+#endif
 
 static int ready_impl(void);
 
@@ -2395,8 +2521,13 @@ static int ready_impl(void)
     VkPhysicalDeviceExtendedDynamicStateFeaturesEXT feds =
         { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT };
     VkPhysicalDeviceFeatures have;
-    const char *dext[4];
+    const char *dext[8];
     uint32_t ndext = 0;
+#ifdef NFSU2_IOS
+    VkDeviceQueueGlobalPriorityCreateInfoEXT gpi =
+        { VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_EXT };
+    int have_gprio = 0, want_gprio = 0;
+#endif
     const char *layers[1];
     uint32_t nlayers = 0;
 
@@ -2586,26 +2717,69 @@ static int ready_impl(void)
         uint32_t nd = 0;
         vkEnumerateDeviceExtensionProperties(s_pd, NULL, &nd, NULL);
         if (nd) {
-            VkExtensionProperties props[64];
-            uint32_t nq = nd < 64 ? nd : 64;
-            vkEnumerateDeviceExtensionProperties(s_pd, NULL, &nq, props);
-            for (uint32_t di = 0; di < nq; di++)
-                if (!strcmp(props[di].extensionName,
-                            VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME))
-                    s_dyn_vertex_input = 1;
+            /* All of them: MoltenVK lists more than 64, and a fixed array
+             * silently dropped the rest. */
+            VkExtensionProperties *props = malloc(nd * sizeof *props);
+            if (props) {
+                uint32_t nq = nd;
+                vkEnumerateDeviceExtensionProperties(s_pd, NULL, &nq, props);
+                for (uint32_t di = 0; di < nq; di++) {
+                    if (!strcmp(props[di].extensionName,
+                                VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME))
+                        s_dyn_vertex_input = 1;
+#ifdef NFSU2_IOS
+                    if (!strcmp(props[di].extensionName,
+                                VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME))
+                        have_gprio = 1;
+#endif
+                }
+                free(props);
+            }
         }
         fprintf(stderr, "[VKINIT] dynamic vertex input: %s\n",
                 s_dyn_vertex_input ? "yes" : "NO - per-layout pipelines"); fflush(stderr);
         if (s_dyn_vertex_input)
             dext[ndext++] = VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME;
     }
+#ifdef NFSU2_IOS
+    {
+        /* MoltenVK maps HIGH to QOS_CLASS_USER_INTERACTIVE for its async
+         * dispatch queue (default USER_INITIATED). Added LAST: the retry
+         * below drops it by ndext--. */
+        const char *e = getenv("NFSU2_VK_QUEUE_HIGH");
+        if (e && e[0] == '0') {
+            fprintf(stderr, "[VKINIT] queue priority: default (NFSU2_VK_QUEUE_HIGH=0)\n");
+        } else if (!have_gprio) {
+            fprintf(stderr, "[VKINIT] queue priority: default (VK_EXT_global_priority not listed)\n");
+        } else {
+            gpi.globalPriority = VK_QUEUE_GLOBAL_PRIORITY_HIGH_EXT;
+            qci.pNext = &gpi;
+            dext[ndext++] = VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME;
+            want_gprio = 1;
+            fprintf(stderr, "[VKINIT] queue priority: high (VK_EXT_global_priority)\n");
+        }
+        fflush(stderr);
+    }
+#endif
     dci.pNext = &f2;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
     dci.enabledExtensionCount = ndext;
     dci.ppEnabledExtensionNames = dext;
     (void)feds;
-    if (vkCreateDevice(s_pd, &dci, NULL, &s_dev) != VK_SUCCESS) {
+    VkResult dev_r = vkCreateDevice(s_pd, &dci, NULL, &s_dev);
+#ifdef NFSU2_IOS
+    if (dev_r != VK_SUCCESS && want_gprio) {
+        fprintf(stderr, "[VKINIT] vkCreateDevice with high queue priority failed (%d); retrying without\n",
+                (int)dev_r);
+        s_dev = VK_NULL_HANDLE;
+        qci.pNext = NULL;
+        ndext--;
+        dci.enabledExtensionCount = ndext;
+        dev_r = vkCreateDevice(s_pd, &dci, NULL, &s_dev);
+    }
+#endif
+    if (dev_r != VK_SUCCESS) {
         LOGE("vkCreateDevice failed (needs push descriptors, dynamic vertex input, Vulkan 1.3)\n");
         return 0;
     }
@@ -2733,6 +2907,56 @@ static int ready_impl(void)
     return 1;
 }
 
+#ifdef NFSU2_IOS
+/* Executor, immediately before EVERY vkQueueSubmit. iOS kills an app that
+ * commits GPU work in the background, so while bg holds no submit may pass.
+ * With async MoltenVK submits "executor parked" does not mean "GPU idle":
+ * on a handshake request in time, drain with vkQueueWaitIdle (it waits for
+ * MoltenVK's async submits and presents, then commits and waits on a Metal
+ * buffer, so it must run while the app is still foreground), then ack. Late
+ * or without a request: no Vulkan call at all. */
+static void ios_park_point(void)
+{
+    uint64_t t0;
+    uint32_t req;
+    int drained = 0;
+    if (!nfsu2_ios_background())
+        return;
+    t0 = hz_now();
+    req = __atomic_load_n(&s_bg_req, __ATOMIC_ACQUIRE);
+    if (req != __atomic_load_n(&s_bg_ack, __ATOMIC_ACQUIRE)
+        && t0 < __atomic_load_n(&s_bg_deadline, __ATOMIC_ACQUIRE)) {
+        vkQueueWaitIdle(s_queue);
+        drained = 1;
+    }
+    if (!drained)
+        fprintf(stderr, "[ios] park: no drain (late or no handshake)\n");
+    /* Ack a late request too, so it does not look pending in the loop. */
+    __atomic_store_n(&s_bg_ack, req, __ATOMIC_RELEASE);
+    fprintf(stderr, "[ios] park: executor parked (%s)\n", drained ? "queue drained" : "not drained");
+    /* File I/O after the ack: it must not eat the main thread's budget. */
+    if (s_pipes_unsaved) {
+        pcache_save();
+        s_pipes_unsaved = 0;
+    }
+    while (nfsu2_ios_background()) {
+        struct timespec ts = { 0, 20 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+        /* A second event (DIDENTERBACKGROUND after WILLENTERBACKGROUND)
+         * must not time out while we are already parked. */
+        req = __atomic_load_n(&s_bg_req, __ATOMIC_ACQUIRE);
+        if (req != __atomic_load_n(&s_bg_ack, __ATOMIC_ACQUIRE)) {
+            if (!drained && hz_now() < __atomic_load_n(&s_bg_deadline, __ATOMIC_ACQUIRE)) {
+                vkQueueWaitIdle(s_queue);
+                drained = 1;
+            }
+            __atomic_store_n(&s_bg_ack, req, __ATOMIC_RELEASE);
+        }
+    }
+    fprintf(stderr, "[ios] unpark after %u ms\n", (unsigned)((hz_now() - t0) / 1000000ull));
+}
+#endif
+
 /* Submit what is recorded and wait for it, then keep recording in the same
  * frame (ring full). */
 static void flush_frame_wait(void)
@@ -2744,6 +2968,9 @@ static void flush_frame_wait(void)
     vkEndCommandBuffer(s_cb);
     si.commandBufferCount = 1;
     si.pCommandBuffers = &s_cb;
+#ifdef NFSU2_IOS
+    ios_park_point();
+#endif
     vkQueueSubmit(s_queue, 1, &si, s_f->fence);
     vkWaitForFences(s_dev, 1, &s_f->fence, VK_TRUE, UINT64_MAX);
     vkResetFences(s_dev, 1, &s_f->fence);
@@ -3833,6 +4060,11 @@ static void vk_flip(void)
     int have_image = 0;
     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
     VkPipelineStageFlags ws = VK_PIPELINE_STAGE_TRANSFER_BIT;
+#ifdef NFSU2_IOS
+    int acq_ok = 0;                 /* this frame's acquire returned VK_SUCCESS */
+    uint64_t t_sub = 0, t_pre = 0;
+    int presented = 0;
+#endif
 
     if (!ready())
         return;
@@ -3945,16 +4177,39 @@ static void vk_flip(void)
     VT("flip %u: surface %08X drew %d, acquiring\n", s_frame, s ? s->va : 0, s_drew_any);
     if (!s_headless && !nfsu2_ios_background()) {
         VkResult rr;
-        if (s_sc_dirty) {
-            vkDeviceWaitIdle(s_dev);
-            create_swapchain();
-            s_sc_dirty = 0;
+        /* Exchange: a rotation marked while we rebuild is not lost. */
+        int dirty = __atomic_exchange_n(&s_sc_dirty, 0, __ATOMIC_ACQ_REL);
+#ifdef NFSU2_IOS
+        if (s_sc_limit < 0) {
+            const char *e = getenv("RECOMP_VK_SC_LIMIT");
+            s_sc_limit = !(e && e[0] == '0');
         }
+        if (dirty || s_sc_want) {
+            int explicit_dirty = dirty;
+            if (!explicit_dirty)
+                fprintf(stderr, "[VK] swapchain suboptimal -> rebuild %d/2\n", s_sc_streak);
+            s_sc_want = 0;
+            sc_rebuild();
+            if (explicit_dirty) {            /* rotation / SIZE_CHANGED: new extent, new streak */
+                s_sc_streak = 0;
+                s_sc_limit_logged = 0;
+            }
+        }
+#else
+        if (dirty)
+            sc_rebuild();
+#endif
         rr = vkAcquireNextImageKHR(s_dev, s_swapchain, UINT64_MAX, s_f->acquired,
                                             VK_NULL_HANDLE, &idx);
+#ifdef NFSU2_IOS
+        acq_ok = rr == VK_SUCCESS;
+        if (rr == VK_SUBOPTIMAL_KHR && s_sc_limit)
+            sc_note_suboptimal();
+        else if (rr == VK_SUBOPTIMAL_KHR)
+            s_ios_suboptimal++;
+#endif
         if (rr == VK_ERROR_OUT_OF_DATE_KHR) {
-            vkDeviceWaitIdle(s_dev);
-            create_swapchain();
+            sc_rebuild();
         } else if (rr == VK_SUCCESS || rr == VK_SUBOPTIMAL_KHR) {
             VkImage dst = s_sc_images[idx];
             VT("flip %u: acquired image %u\n", s_frame, idx);
@@ -4020,10 +4275,15 @@ static void vk_flip(void)
                                  VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL, 1, &b);
         }
     }
+#ifdef NFSU2_IOS
     /* iOS: a backgrounded app may not submit GPU work at all. Park here
      * (renderer thread) until the app is foreground again; the guest's
-     * vblank pacing simply stops for that time. Save the pipeline cache
-     * once on the way in: this is the moment I/O is free. */
+     * vblank pacing simply stops for that time. The park drains the queue
+     * for the background handshake and saves the pipeline cache once on
+     * the way in: this is the moment I/O is free. */
+    ios_park_point();
+#else
+    /* Non-iOS: nothing sets the flag; kept as it was. */
     if (nfsu2_ios_background() && s_pipes_unsaved) {
         pcache_save();
         s_pipes_unsaved = 0;
@@ -4032,6 +4292,7 @@ static void vk_flip(void)
         struct timespec ts = { 0, 20 * 1000 * 1000 };
         nanosleep(&ts, NULL);
     }
+#endif
     VT("flip %u: submit (image %d)\n", s_frame, have_image);
     vkEndCommandBuffer(s_cb);
     si.commandBufferCount = 1;
@@ -4043,11 +4304,17 @@ static void vk_flip(void)
         si.signalSemaphoreCount = 1;
         si.pSignalSemaphores = &s_f->rendered;
     }
+#ifdef NFSU2_IOS
+    t_sub = hz_now();
+#endif
     if (vkQueueSubmit(s_queue, 1, &si, s_f->fence) != VK_SUCCESS) {
         LOGE("vkQueueSubmit failed - frame fence will not signal\n");
         s_f->submitted = 0;
     } else
         s_f->submitted = 1;
+#ifdef NFSU2_IOS
+    t_sub = hz_now() - t_sub;
+#endif
     if (have_image && s_f->submitted) {
         VkPresentInfoKHR pi = { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
         VkResult pr;
@@ -4057,12 +4324,86 @@ static void vk_flip(void)
         pi.pSwapchains = &s_swapchain;
         pi.pImageIndices = &idx;
         VT("flip %u: vkQueuePresentKHR\n", s_frame);
+#ifdef NFSU2_IOS
+        t_pre = hz_now();
+#endif
         pr = vkQueuePresentKHR(s_queue, &pi);
-        if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) {
-            vkDeviceWaitIdle(s_dev);
-            create_swapchain();
+#ifdef NFSU2_IOS
+        t_pre = hz_now() - t_pre;
+        presented = 1;
+        if (pr == VK_ERROR_OUT_OF_DATE_KHR) {
+            sc_rebuild();
+        } else if (pr == VK_SUBOPTIMAL_KHR) {
+            if (s_sc_limit)
+                sc_note_suboptimal();
+            else {
+                s_ios_suboptimal++;
+                sc_rebuild();
+            }
+        } else if (pr == VK_SUCCESS && acq_ok) {
+            /* One SUCCESS is not enough: async MoltenVK submits can move the
+             * suboptimal report between acquire and present. Both clean in
+             * one frame ends the streak. */
+            s_sc_streak = 0;
+            s_sc_limit_logged = 0;
+        }
+#else
+        if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR)
+            sc_rebuild();
+#endif
+    }
+#ifdef NFSU2_IOS
+    {
+        /* Always-on 10 s line: where do the executor's flips go (submit
+         * and present are where MoltenVK may wait for a drawable)? */
+        static uint64_t win_start, sub_sum, sub_max, pre_sum, pre_max;
+        static uint32_t flips, npre, sub_base, reb_base;
+        uint64_t now = hz_now();
+        if (!win_start) {
+            win_start = now;
+            sub_base = s_ios_suboptimal;
+            reb_base = s_ios_rebuilds;
+        }
+        flips++;
+        sub_sum += t_sub;
+        if (t_sub > sub_max) sub_max = t_sub;
+        if (presented) {
+            npre++;
+            pre_sum += t_pre;
+            if (t_pre > pre_max) pre_max = t_pre;
+        }
+        if (now - win_start >= 10000000000ull) {
+            const char *mvk = getenv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS");
+            fprintf(stderr, "[ios-vk] 10 s: %u flips, submit avg %.2f max %.2f ms, "
+                    "present avg %.2f max %.2f ms, suboptimal %u, rebuilds %u, "
+                    "present mode %d, MVK sync %s\n",
+                    flips, flips ? sub_sum / 1e6 / flips : 0.0, sub_max / 1e6,
+                    npre ? pre_sum / 1e6 / npre : 0.0, pre_max / 1e6,
+                    s_ios_suboptimal - sub_base, s_ios_rebuilds - reb_base,
+                    s_ios_present_mode, mvk ? mvk : "unset");
+            /* Second line, same window: render-pass splits per flip. */
+            {
+                double nf = flips ? (double)flips : 1.0;
+                unsigned long long mem_mb = 0;
+#ifdef __APPLE__
+                mem_mb = (unsigned long long)(os_proc_available_memory() >> 20);
+#endif
+                fprintf(stderr, "[ios-vk2] 10 s: passes/frame %.1f, upload-split passes/frame %.1f, "
+                        "layout-split passes/frame %.1f, uploads/frame %.1f, upload KB/frame %.1f, "
+                        "mem left %llu MB\n",
+                        s_ios_passes / nf, s_ios_up_splits / nf, s_ios_lay_splits / nf,
+                        s_ios_uploads / nf, s_ios_up_bytes / 1024.0 / nf, mem_mb);
+                s_ios_passes = s_ios_up_splits = s_ios_lay_splits = s_ios_uploads = 0;
+                s_ios_up_bytes = 0;
+            }
+            win_start = now;
+            flips = npre = 0;
+            sub_sum = sub_max = pre_sum = pre_max = 0;
+            sub_base = s_ios_suboptimal;
+            reb_base = s_ios_rebuilds;
         }
     }
+#endif
     {
         static uint64_t last_save;
         uint64_t now = hz_now();

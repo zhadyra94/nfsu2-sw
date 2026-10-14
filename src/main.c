@@ -103,8 +103,10 @@ const char *SDL_GetError(void);
 int SDL_WaitEvent(void *event);
 void SDL_RaiseWindow(void *window);
 /* Settings: Documents/nfsu2_env.txt, KEY=VALUE (Switch nfsu2x_env.txt format). */
-static struct { char key[32]; char val[64]; } s_cfg[64];   /* 64: cfg_load
- * reads up to 64 lines; a 17th line used to overflow the 16-entry array */
+static struct { char key[64]; char val[64]; } s_cfg[64];   /* 64: cfg_load
+ * reads up to 64 lines; a 17th line used to overflow the 16-entry array.
+ * key[64]: MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS is 36 characters and a
+ * 32-byte key exported a truncated name MoltenVK never reads. */
 static int s_cfg_n;
 static const char *cfg_get(const char *k)
 {
@@ -186,12 +188,16 @@ struct sdl_syswm_info {
     } info;
 };
 int SDL_GetWindowWMInfo(void *window, struct sdl_syswm_info *info);
+/* SDL_EventFilter is int (*)(void *userdata, SDL_Event *event); the event
+ * pointer is opaque here and its type is the first Uint32. */
+void SDL_AddEventWatch(int (*filter)(void *userdata, void *event), void *userdata);
 /* SDL_hints.h / SDL_video.h / SDL_syswm.h values */
 #define SDL_HINT_ORIENTATIONS "SDL_IOS_ORIENTATIONS"
 #define SDL_WINDOWEVENT 0x200
 #define SDL_QUIT 0x100
 #define SDL_SYSWM_UIKIT 5   /* SDL_syswm.h: UNKNOWN0 WINDOWS1 X11-2 DIRECTFB3 COCOA4 UIKIT5 */
 #define SDL_APP_WILLENTERBACKGROUND 0x103
+#define SDL_APP_DIDENTERBACKGROUND 0x104
 #define SDL_APP_DIDENTERFOREGROUND 0x106
 /* SDL_WindowEvent: type, timestamp, windowID, event, padding, data1, data2 */
 struct sdl_winev { uint32_t type, ts; uint32_t win; uint8_t ev; int pad; int d1, d2; };
@@ -508,6 +514,32 @@ static void *ios_diag_thread(void *arg)
     return NULL;
 }
 
+/* Background handshake. SDL2 calls event watchers synchronously inside
+ * UIKit's callback (SDL_OnApplicationWillResignActive / DidEnterBackground)
+ * while it holds its watcher lock. iOS kills an app that commits GPU work
+ * after it is backgrounded, and the poll loop below only sees the window
+ * events after that callback has returned. So the watcher parks the
+ * executor and drains the GPU here, but the wait must stay bounded
+ * (300 ms): a watchdog also kills an app that blocks in the callback.
+ * NFSU2_BG_HANDSHAKE=0: only set the flag (old behaviour; the executor then
+ * parks without a drain). Check the type first; no other SDL calls here. */
+static int s_bg_handshake = 1;
+
+static int ios_bg_watch(void *userdata, void *event)
+{
+    extern int nv2a_vk_background_handshake(int timeout_ms);
+    extern void nv2a_vk_set_background(int bg);
+    uint32_t type = *(uint32_t *)event;
+    (void)userdata;
+    if (type != SDL_APP_WILLENTERBACKGROUND && type != SDL_APP_DIDENTERBACKGROUND)
+        return 1;
+    if (s_bg_handshake)
+        nv2a_vk_background_handshake(300);
+    else
+        nv2a_vk_set_background(1);
+    return 1;
+}
+
 int main(int argc, char **argv)
 {
     pthread_attr_t attr;
@@ -519,7 +551,7 @@ int main(int argc, char **argv)
     /* Redirect the log FIRST so main-thread init output is captured. */
     ios_log_to_documents();
     setvbuf(stderr, NULL, _IONBF, 0);
-    fprintf(stderr, "nfsu2: build v20 (-O2 release, scale 2, QoS, stick visuals, overlay polish)\n");
+    fprintf(stderr, "nfsu2: build v22 (MoltenVK async submits + high-priority queue, background drain handshake, suboptimal swapchain limiter)\n");
     fprintf(stderr, "nfsu2: HOME=%s TMPDIR=%s\n",
             getenv("CFFIXED_USER_HOME") ? getenv("CFFIXED_USER_HOME") : "(unset)",
             getenv("TMPDIR") ? getenv("TMPDIR") : "(unset)");
@@ -541,6 +573,38 @@ int main(int argc, char **argv)
         ss.ss_flags = 0;
         sigaltstack(&ss, NULL);
     }
+    /* Env and cwd BEFORE SDL_CreateWindow: SDL's iOS Vulkan loader calls
+     * vkEnumerateInstanceExtensionProperties inside SDL_CreateWindow, and
+     * MoltenVK reads its MVK_CONFIG_* environment once, on first use. A
+     * setenv after that is ignored. */
+    {
+        /* Relative cache paths (progcache.bin, vkspirv.bin,
+         * vkpipecache.bin) resolve against the cwd, which is read-only
+         * on iOS. chdir into Documents so they persist across launches;
+         * NFSU2_GAME_DIR overrides still win inside game_main. */
+        const char *gd = getenv("NFSU2_GAME_DIR");
+        const char *docs = NSTemporaryDirectory_path("Documents");
+        if (chdir(gd && gd[0] ? gd : docs) == 0) {
+            /* Settings live right there: nfsu2_env.txt. */
+            char cfgp[1100];
+            snprintf(cfgp, sizeof cfgp, "%s/nfsu2_env.txt", gd && gd[0] ? gd : docs);
+            cfg_load(cfgp);
+            /* Default render scale 2 on iOS (A17 has the fill rate;
+             * 480p upscaled looks soft). cfg_load's setenv bridge
+             * ran first, so an explicit key always wins. */
+            if (!getenv("RECOMP_GL_SCALE"))
+                setenv("RECOMP_GL_SCALE", "2", 0);
+            fprintf(stderr, "nfsu2: cwd %s (caches persist)\n",
+                    gd && gd[0] ? gd : docs);
+        }
+        /* Async queue submits: the default (1) encodes inside
+         * vkQueueSubmit on the calling thread, which then waits for the
+         * CAMetalLayer drawable. Overwrite 0: a key in nfsu2_env.txt
+         * wins; =1 restores synchronous submits for A/B. */
+        setenv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS", "0", 0);
+        fprintf(stderr, "nfsu2: MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS=%s\n",
+                getenv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS"));
+    }
     {
         extern void nv2a_vk_set_window(void *win);
         SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
@@ -559,27 +623,6 @@ int main(int argc, char **argv)
             fprintf(stderr, "nfsu2: FATAL no window; refusing off-main fallback\n");
         else {
             extern int nv2a_vk_init_on_main(void);
-            /* Relative cache paths (progcache.bin, vkspirv.bin,
-             * vkpipecache.bin) resolve against the cwd, which is read-only
-             * on iOS. chdir into Documents so they persist across launches;
-             * NFSU2_GAME_DIR overrides still win inside game_main. */
-            {
-                const char *gd = getenv("NFSU2_GAME_DIR");
-                const char *docs = NSTemporaryDirectory_path("Documents");
-                if (chdir(gd && gd[0] ? gd : docs) == 0) {
-                    /* Settings live right there: nfsu2_env.txt. */
-                    char cfgp[1100];
-                    snprintf(cfgp, sizeof cfgp, "%s/nfsu2_env.txt", gd && gd[0] ? gd : docs);
-                    cfg_load(cfgp);
-                    /* Default render scale 2 on iOS (A17 has the fill rate;
-                     * 480p upscaled looks soft). cfg_load's setenv bridge
-                     * ran first, so an explicit key always wins. */
-                    if (!getenv("RECOMP_GL_SCALE"))
-                        setenv("RECOMP_GL_SCALE", "2", 0);
-                    fprintf(stderr, "nfsu2: cwd %s (caches persist)\n",
-                            gd && gd[0] ? gd : docs);
-                }
-            }
             fprintf(stderr, "nfsu2: eager renderer init on main thread\n");
             int ok = nv2a_vk_init_on_main();
             fprintf(stderr, "nfsu2: eager init %s\n", ok ? "ok" : "FAILED (headless)");
@@ -597,6 +640,14 @@ int main(int argc, char **argv)
                 fprintf(stderr, "nfsu2: touch overlay unavailable (syswm=%u)\n", smi.subsystem);
             }
         }
+    }
+    {
+        /* After the renderer's eager init, before the game thread starts. */
+        const char *hs = getenv("NFSU2_BG_HANDSHAKE");
+        s_bg_handshake = !(hs && hs[0] == '0');
+        SDL_AddEventWatch(ios_bg_watch, NULL);
+        fprintf(stderr, "nfsu2: background handshake %s\n",
+                s_bg_handshake ? "on" : "off (flag only)");
     }
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 16u * 1024 * 1024);
@@ -690,7 +741,7 @@ static int game_main(void)
 #ifdef NFSU2_IOS
     ios_log_to_documents();
     setvbuf(stderr, NULL, _IONBF, 0);
-    fprintf(stderr, "nfsu2: build v20 (-O2 release, scale 2, QoS, stick visuals, overlay polish)\n");
+    fprintf(stderr, "nfsu2: build v22 (MoltenVK async submits + high-priority queue, background drain handshake, suboptimal swapchain limiter)\n");
     fprintf(stderr, "nfsu2: HOME=%s CFFIXED_USER_HOME=%s TMPDIR=%s\n",
             getenv("HOME") ? getenv("HOME") : "(unset)",
             getenv("CFFIXED_USER_HOME") ? getenv("CFFIXED_USER_HOME") : "(unset)",
