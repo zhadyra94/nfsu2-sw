@@ -125,6 +125,7 @@ static XBOX_IOS_TOUCH_ZONE s_zones[ZONE_MAX];
 static int   s_zone_n;
 static int   s_drive;                 /* 0 PAD, 1 DRIVE */
 static float s_scale = 1.0f;          /* NFSU2_TOUCH_SCALE, 0.7..1.5 */
+static unsigned s_layout_gen;         /* bumped by every rebuild (__atomic) */
 
 static void zones_rebuild_locked(void)
 {
@@ -136,6 +137,7 @@ static void zones_rebuild_locked(void)
         s_zones[i].ry *= s_scale;
     }
     s_zone_n = n;
+    __atomic_add_fetch(&s_layout_gen, 1u, __ATOMIC_RELEASE);
 }
 
 /* Table order is hit-test priority: the first zone whose ellipse contains
@@ -679,6 +681,86 @@ int xbox_ios_touch_zone_pressed(int idx)
         }
     SDL_UnlockMutex(s_lock);
     return hit;
+}
+
+/* Look of zone idx (active table order) for the overlay: one of the
+ * XBOX_IOS_STYLE_* values. In the DRIVE layout the LT/RT zones are pedals.
+ * Out of range gives XBOX_IOS_STYLE_OTHER. */
+int xbox_ios_touch_zone_style(int idx)
+{
+    const XBOX_IOS_TOUCH_ZONE *z;
+
+    touch_prefs_once();
+    if (idx < 0 || idx >= s_zone_n)
+        return XBOX_IOS_STYLE_OTHER;
+    z = &s_zones[idx];
+    switch (z->kind) {
+    case XBOX_IOS_ZONE_DPAD:
+        return XBOX_IOS_STYLE_DPAD;
+    case XBOX_IOS_ZONE_FLAG:
+        if (z->value == XBOX_GAMEPAD_BACK)  return XBOX_IOS_STYLE_MENU_BACK;
+        if (z->value == XBOX_GAMEPAD_START) return XBOX_IOS_STYLE_MENU_START;
+        return XBOX_IOS_STYLE_OTHER;
+    case XBOX_IOS_ZONE_ANALOG:
+        switch (z->value) {
+        case XBOX_BUTTON_A:        return XBOX_IOS_STYLE_FACE_A;
+        case XBOX_BUTTON_B:        return XBOX_IOS_STYLE_FACE_B;
+        case XBOX_BUTTON_X:        return XBOX_IOS_STYLE_FACE_X;
+        case XBOX_BUTTON_Y:        return XBOX_IOS_STYLE_FACE_Y;
+        case XBOX_BUTTON_BLACK:    return XBOX_IOS_STYLE_SHOULDER_BLACK;
+        case XBOX_BUTTON_WHITE:    return XBOX_IOS_STYLE_SHOULDER_WHITE;
+        case XBOX_BUTTON_LTRIGGER: return s_drive ? XBOX_IOS_STYLE_PEDAL_BRAKE
+                                                  : XBOX_IOS_STYLE_TRIGGER_L;
+        case XBOX_BUTTON_RTRIGGER: return s_drive ? XBOX_IOS_STYLE_PEDAL_GAS
+                                                  : XBOX_IOS_STYLE_TRIGGER_R;
+        default:                   return XBOX_IOS_STYLE_OTHER;
+        }
+    default:
+        return XBOX_IOS_STYLE_OTHER;
+    }
+}
+
+/* The D-pad directions held through the D-pad zone right now, for the
+ * overlay's arm highlight. Same quadrant rule as fold_finger(), as bits
+ * XBOX_IOS_DPAD_BIT_*; 0 when no finger is on the D-pad. */
+unsigned xbox_ios_touch_dpad_bits(void)
+{
+    unsigned bits = 0;
+    int i;
+
+    touch_prefs_once();
+    SDL_LockMutex(s_lock);
+    for (i = 0; i < TOUCH_MAX_FINGERS; i++) {
+        const TouchFinger *f = &s_finger[i];
+        const XBOX_IOS_TOUCH_ZONE *z;
+        float nx, ny;
+
+        if (f->id < 0 || f->role < ROLE_ZONE(0) ||
+            f->role - ROLE_ZONE(0) >= s_zone_n)
+            continue;
+        z = &s_zones[f->role - ROLE_ZONE(0)];
+        if (z->kind != XBOX_IOS_ZONE_DPAD)
+            continue;
+        nx = (f->x - z->cx) / z->rx;
+        ny = (f->y - z->cy) / z->ry;
+        if (nx * nx + ny * ny > 0.16f) {   /* 0.4^2, as in fold_finger */
+            if (ny < -0.4f) bits |= XBOX_IOS_DPAD_BIT_UP;
+            if (ny >  0.4f) bits |= XBOX_IOS_DPAD_BIT_DOWN;
+            if (nx < -0.4f) bits |= XBOX_IOS_DPAD_BIT_LEFT;
+            if (nx >  0.4f) bits |= XBOX_IOS_DPAD_BIT_RIGHT;
+        }
+    }
+    SDL_UnlockMutex(s_lock);
+    return bits;
+}
+
+/* Generation of the zone table: changes whenever it is rebuilt (layout,
+ * size, later geometry edits), so the overlay knows when to relay its
+ * layers. */
+unsigned xbox_ios_touch_layout_gen(void)
+{
+    touch_prefs_once();
+    return __atomic_load_n(&s_layout_gen, __ATOMIC_ACQUIRE);
 }
 
 /* ------------------------------------------------------------------ */

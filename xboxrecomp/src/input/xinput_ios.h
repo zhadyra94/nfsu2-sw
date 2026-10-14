@@ -72,6 +72,39 @@ void xbox_ios_touch_set_scale(float k);
 /* Text the overlay draws on zone idx ("GAS", "A", ...), NULL for none. */
 const char *xbox_ios_touch_zone_label(int idx);
 
+/* Look of a zone, for the overlay (derived from the zone's kind / value and
+ * the active layout: in DRIVE the LT / RT zones are pedals). Values of
+ * XBOX_IOS_STYLE_*. ios_touch_overlay.m cannot include this header and
+ * mirrors the numbers as plain ints: keep the two in step. */
+enum {
+    XBOX_IOS_STYLE_FACE_A = 0,
+    XBOX_IOS_STYLE_FACE_B,
+    XBOX_IOS_STYLE_FACE_X,
+    XBOX_IOS_STYLE_FACE_Y,
+    XBOX_IOS_STYLE_SHOULDER_BLACK,
+    XBOX_IOS_STYLE_SHOULDER_WHITE,
+    XBOX_IOS_STYLE_TRIGGER_L,
+    XBOX_IOS_STYLE_TRIGGER_R,
+    XBOX_IOS_STYLE_PEDAL_GAS,
+    XBOX_IOS_STYLE_PEDAL_BRAKE,
+    XBOX_IOS_STYLE_DPAD,
+    XBOX_IOS_STYLE_MENU_BACK,
+    XBOX_IOS_STYLE_MENU_START,
+    XBOX_IOS_STYLE_OTHER
+};
+int xbox_ios_touch_zone_style(int idx);   /* OTHER when idx is out of range */
+
+/* D-pad arms held through the D-pad zone (not the keyboard): OR of
+ * XBOX_IOS_DPAD_BIT_*. */
+#define XBOX_IOS_DPAD_BIT_UP    1u
+#define XBOX_IOS_DPAD_BIT_DOWN  2u
+#define XBOX_IOS_DPAD_BIT_LEFT  4u
+#define XBOX_IOS_DPAD_BIT_RIGHT 8u
+unsigned xbox_ios_touch_dpad_bits(void);
+
+/* Changes every time the zone table is rebuilt (layout, size, ...). */
+unsigned xbox_ios_touch_layout_gen(void);
+
 /* Called with the zone index when a finger lands on a zone, on whichever
  * thread pumps SDL events. NULL clears it. */
 void xbox_ios_touch_set_press_hook(void (*hook)(int zone_idx));

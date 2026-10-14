@@ -1106,6 +1106,172 @@ static void t_overlay_queries(void)
     CHECK(xbox_ios_touch_zone_label(zone_by_flag(XBOX_GAMEPAD_START)) == NULL, "START zone has a label");
 }
 
+/* Zone styles for the overlay: derived from kind / value and the layout. */
+static void t_zone_style(void)
+{
+    static const struct { const char *label; int want; const char *name; } pad[] = {
+        { "A", XBOX_IOS_STYLE_FACE_A, "A" },
+        { "B", XBOX_IOS_STYLE_FACE_B, "B" },
+        { "X", XBOX_IOS_STYLE_FACE_X, "X" },
+        { "Y", XBOX_IOS_STYLE_FACE_Y, "Y" },
+        { "LB", XBOX_IOS_STYLE_SHOULDER_BLACK, "LB" },
+        { "RB", XBOX_IOS_STYLE_SHOULDER_WHITE, "RB" },
+        { "LT", XBOX_IOS_STYLE_TRIGGER_L, "LT" },
+        { "RT", XBOX_IOS_STYLE_TRIGGER_R, "RT" },
+    };
+    size_t k;
+    int n, i;
+
+    reset();
+    for (k = 0; k < sizeof pad / sizeof pad[0]; k++) {
+        int zi = zone_by_label(pad[k].label);
+        CHECK(zi >= 0 && xbox_ios_touch_zone_style(zi) == pad[k].want,
+              "PAD %s: style %d, want %d", pad[k].name,
+              zi >= 0 ? xbox_ios_touch_zone_style(zi) : -1, pad[k].want);
+    }
+    CHECK(xbox_ios_touch_zone_style(zone_by_kind(XBOX_IOS_ZONE_DPAD)) == XBOX_IOS_STYLE_DPAD,
+          "d-pad style");
+    CHECK(xbox_ios_touch_zone_style(zone_by_flag(XBOX_GAMEPAD_BACK)) == XBOX_IOS_STYLE_MENU_BACK,
+          "BACK style");
+    CHECK(xbox_ios_touch_zone_style(zone_by_flag(XBOX_GAMEPAD_START)) == XBOX_IOS_STYLE_MENU_START,
+          "START style");
+    CHECK(xbox_ios_touch_zone_style(-1) == XBOX_IOS_STYLE_OTHER &&
+          xbox_ios_touch_zone_style(zcount()) == XBOX_IOS_STYLE_OTHER,
+          "out-of-range style should be OTHER");
+
+    /* DRIVE: LT / RT zones are the pedals, the rest keeps its style. */
+    xbox_ios_touch_set_layout(1);
+    {
+        int gas = zone_by_label("GAS"), brake = zone_by_label("BRAKE");
+        CHECK(gas >= 0 && xbox_ios_touch_zone_style(gas) == XBOX_IOS_STYLE_PEDAL_GAS,
+              "DRIVE GAS style");
+        CHECK(brake >= 0 && xbox_ios_touch_zone_style(brake) == XBOX_IOS_STYLE_PEDAL_BRAKE,
+              "DRIVE BRAKE style");
+        CHECK(zone(gas) && zone(gas)->value == XBOX_BUTTON_RTRIGGER, "DRIVE GAS is not RT");
+        CHECK(zone(brake) && zone(brake)->value == XBOX_BUTTON_LTRIGGER, "DRIVE BRAKE is not LT");
+        CHECK(xbox_ios_touch_zone_style(zone_by_label("A")) == XBOX_IOS_STYLE_FACE_A,
+              "DRIVE A style");
+    }
+    /* Every zone gets a real style, never OTHER, in both layouts. */
+    for (int pass = 0; pass < 2; pass++) {
+        xbox_ios_touch_set_layout(pass);
+        n = zcount();
+        for (i = 0; i < n; i++)
+            CHECK(xbox_ios_touch_zone_style(i) != XBOX_IOS_STYLE_OTHER,
+                  "layout %d zone %d has style OTHER", pass, i);
+    }
+    reset();
+}
+
+/* The pressed D-pad arms, as bits, agree with what the game reads. */
+static void t_dpad_bits(void)
+{
+    int zi;
+    const XBOX_IOS_TOUCH_ZONE *z;
+    XBOX_INPUT_STATE s;
+    size_t k;
+    static const struct { float ox, oy; unsigned want; const char *name; } dirs[] = {
+        {  0.0f, -0.7f, XBOX_IOS_DPAD_BIT_UP,    "up" },
+        {  0.0f,  0.7f, XBOX_IOS_DPAD_BIT_DOWN,  "down" },
+        { -0.7f,  0.0f, XBOX_IOS_DPAD_BIT_LEFT,  "left" },
+        {  0.7f,  0.0f, XBOX_IOS_DPAD_BIT_RIGHT, "right" },
+        { -0.7f, -0.7f, XBOX_IOS_DPAD_BIT_UP | XBOX_IOS_DPAD_BIT_LEFT,    "up-left" },
+        {  0.7f,  0.7f, XBOX_IOS_DPAD_BIT_DOWN | XBOX_IOS_DPAD_BIT_RIGHT, "down-right" },
+    };
+    reset();
+    zi = zone_by_kind(XBOX_IOS_ZONE_DPAD);
+    z = zone(zi);
+    if (!z)
+        return;
+    CHECK(XBOX_IOS_DPAD_BIT_UP == 1u && XBOX_IOS_DPAD_BIT_DOWN == 2u &&
+          XBOX_IOS_DPAD_BIT_LEFT == 4u && XBOX_IOS_DPAD_BIT_RIGHT == 8u,
+          "bit values are part of the overlay contract");
+    CHECK(xbox_ios_touch_dpad_bits() == 0, "bits set with no finger down");
+
+    fdown(1, z->cx, z->cy);
+    CHECK(xbox_ios_touch_dpad_bits() == 0, "bits set at the d-pad centre");
+    fup(1);
+
+    for (k = 0; k < sizeof dirs / sizeof dirs[0]; k++) {
+        unsigned fromstate = 0;
+        fdown(1, z->cx + dirs[k].ox * z->rx, z->cy + dirs[k].oy * z->ry);
+        CHECK(xbox_ios_touch_dpad_bits() == dirs[k].want, "d-pad %s: bits 0x%x, want 0x%x",
+              dirs[k].name, xbox_ios_touch_dpad_bits(), dirs[k].want);
+        s = rd();
+        if (s.Gamepad.wButtons & XBOX_GAMEPAD_DPAD_UP)    fromstate |= XBOX_IOS_DPAD_BIT_UP;
+        if (s.Gamepad.wButtons & XBOX_GAMEPAD_DPAD_DOWN)  fromstate |= XBOX_IOS_DPAD_BIT_DOWN;
+        if (s.Gamepad.wButtons & XBOX_GAMEPAD_DPAD_LEFT)  fromstate |= XBOX_IOS_DPAD_BIT_LEFT;
+        if (s.Gamepad.wButtons & XBOX_GAMEPAD_DPAD_RIGHT) fromstate |= XBOX_IOS_DPAD_BIT_RIGHT;
+        CHECK(fromstate == xbox_ios_touch_dpad_bits(),
+              "d-pad %s: bits 0x%x differ from xbox_ios_touch_state 0x%x", dirs[k].name,
+              xbox_ios_touch_dpad_bits(), fromstate);
+        fup(1);
+        CHECK(xbox_ios_touch_dpad_bits() == 0, "d-pad %s: bits stay after the lift", dirs[k].name);
+    }
+
+    /* A finger that slides keeps following the zone's rule. */
+    fdown(1, z->cx, z->cy);
+    fmove(1, z->cx + 0.7f * z->rx, z->cy);
+    CHECK(xbox_ios_touch_dpad_bits() == XBOX_IOS_DPAD_BIT_RIGHT, "slide to right: bits 0x%x",
+          xbox_ios_touch_dpad_bits());
+    /* Other zones and the sticks never set a bit. */
+    fdown(2, zone(zone_by_label("A"))->cx, zone(zone_by_label("A"))->cy);
+    fdown_bare(3, 0.30f, 0.50f);
+    fmove(3, 0.30f - STICK_RADIUS, 0.50f);
+    CHECK(xbox_ios_touch_dpad_bits() == XBOX_IOS_DPAD_BIT_RIGHT, "A / stick fingers changed the bits");
+    lift_all();
+
+    fdown(1, zone(zone_by_label("A"))->cx, zone(zone_by_label("A"))->cy);
+    CHECK(xbox_ios_touch_dpad_bits() == 0, "bits set by a finger on A");
+    lift_all();
+
+    /* Layout switch clears fingers, so the bits go too. */
+    fdown(1, z->cx + 0.7f * z->rx, z->cy);
+    CHECK(xbox_ios_touch_dpad_bits() != 0, "setup: no bits before the layout switch");
+    xbox_ios_touch_set_layout(1);
+    CHECK(xbox_ios_touch_dpad_bits() == 0, "bits survive a layout switch");
+    reset();
+}
+
+/* layout_gen moves on every rebuild of the zone table and only then. */
+static void t_layout_gen(void)
+{
+    unsigned g0, g1;
+    const XBOX_IOS_TOUCH_ZONE *z;
+    float bx, by, kx, ky;
+
+    reset();
+    g0 = xbox_ios_touch_layout_gen();
+    CHECK(g0 == xbox_ios_touch_layout_gen(), "gen changes between two reads");
+
+    /* Reads, touches, tilt, the enable switch and queries leave it alone. */
+    z = zone(0);
+    if (z)
+        fdown(1, z->cx, z->cy);
+    fdown_bare(2, 0.30f, 0.50f);
+    fmove(2, 0.35f, 0.52f);
+    (void)xbox_ios_touch_stick(0, &bx, &by, &kx, &ky);
+    (void)xbox_ios_touch_zone_pressed(0);
+    (void)xbox_ios_touch_dpad_bits();
+    (void)xbox_ios_touch_zone_style(0);
+    xbox_ios_touch_set_tilt(0.5f, 1);
+    xbox_ios_touch_set_tilt(0.0f, 0);
+    lift_all();
+    xbox_ios_touch_set_enabled(0);
+    xbox_ios_touch_set_enabled(1);
+    CHECK(xbox_ios_touch_layout_gen() == g0, "gen moved without a rebuild");
+
+    xbox_ios_touch_set_layout(1);
+    g1 = xbox_ios_touch_layout_gen();
+    CHECK(g1 != g0, "gen unchanged after set_layout");
+    xbox_ios_touch_set_scale(1.25f);
+    CHECK(xbox_ios_touch_layout_gen() != g1, "gen unchanged after set_scale");
+    g0 = xbox_ios_touch_layout_gen();
+    xbox_ios_touch_set_layout(0);
+    CHECK(xbox_ios_touch_layout_gen() != g0, "gen unchanged after set_layout back");
+    reset();
+}
+
 /* ------------------------------------------------------------------ */
 /* Environment defaults: need a fresh layer, so run in a forked child   */
 /* ------------------------------------------------------------------ */
@@ -1237,6 +1403,9 @@ int main(void)
     run_case("12   Finger limit: five tracked, sixth ignored",      t_finger_limit, NULL);
     run_case("13   Focus loss / background clear all fingers",      t_lifecycle, NULL);
     run_case("14   Overlay queries: stick(), zone_label(), zone_pressed()", t_overlay_queries, NULL);
+    run_case("15   zone_style(): faces, shoulders, triggers / pedals, menu", t_zone_style, NULL);
+    run_case("15b  dpad_bits(): arms held, matches the state, cleared on lift", t_dpad_bits, NULL);
+    run_case("15c  layout_gen(): moves on rebuild only", t_layout_gen, NULL);
 
     reset();
     SDL_Quit();
