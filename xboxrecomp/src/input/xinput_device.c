@@ -309,7 +309,50 @@ void xbox_InputInit(void)
 #endif
 #if defined(NFSU2_IOS)
 #include "xinput_ios.h"
+
+/* ios_keyboard.m: whether a GCKeyboard is attached (an atomic flag). The
+ * keys themselves come from SDL's key state. */
+extern int ios_keyboard_connected(void);
+
+/* NFSU2_KEYBOARD (default on): a hardware keyboard may answer for port 0.
+ * Cached: the panel flips it live through xbox_input_set_keyboard (the
+ * settings writer no longer touches the environment). */
+static int s_kb_on = -1;
+static int kb_enabled(void)
+{
+    int on = __atomic_load_n(&s_kb_on, __ATOMIC_RELAXED);
+    if (on < 0) {
+        const char *v = getenv("NFSU2_KEYBOARD");
+        on = !(v && strcmp(v, "0") == 0);
+        __atomic_store_n(&s_kb_on, on, __ATOMIC_RELAXED);
+    }
+    return on;
+}
+void xbox_input_set_keyboard(int on)
+{
+    __atomic_store_n(&s_kb_on, on ? 1 : 0, __ATOMIC_RELAXED);
+}
 #endif
+
+/* RECOMP_RUMBLE=0 mutes SDL pad rumble (default on). Cached the same way;
+ * the panel calls xbox_input_set_rumble. */
+static int s_rumble_on = -1;
+#if !defined(__SWITCH__)   /* the Switch rumbles through xinput_nx.c */
+static int rumble_enabled(void)
+{
+    int on = __atomic_load_n(&s_rumble_on, __ATOMIC_RELAXED);
+    if (on < 0) {
+        const char *v = getenv("RECOMP_RUMBLE");
+        on = !(v && strcmp(v, "0") == 0);
+        __atomic_store_n(&s_rumble_on, on, __ATOMIC_RELAXED);
+    }
+    return on;
+}
+#endif
+void xbox_input_set_rumble(int on)
+{
+    __atomic_store_n(&s_rumble_on, on ? 1 : 0, __ATOMIC_RELAXED);
+}
 
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
@@ -353,17 +396,18 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     open_controllers();
     if (dwPort == 0) {
         xbox_ios_touch_init();
-        /* A real pad takes over: hide the on-screen controls until it
-         * leaves. Set from this (game) thread; the overlay hops to the
-         * main queue internally. */
+        /* A real pad or a hardware keyboard takes over: hide the on-screen
+         * controls until it leaves. Set from this (game) thread; the overlay
+         * hops to the main queue internally. */
         {
-            static int prev_has = -1;
+            static int prev_vis = -1;
             SDL_GameController *p0 = g_pads[0];
             int has = p0 && SDL_GameControllerGetAttached(p0);
-            if (has != prev_has) {
-                prev_has = has;
+            int vis = !has && !(kb_enabled() && ios_keyboard_connected());
+            if (vis != prev_vis) {
+                prev_vis = vis;
                 extern void ios_touch_overlay_set_visible(int v);
-                ios_touch_overlay_set_visible(!has);
+                ios_touch_overlay_set_visible(vis);
             }
         }
     }
@@ -373,12 +417,22 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     if (!c || !SDL_GameControllerGetAttached(c)) {
         g_controller_connected[dwPort] = FALSE;
 #if defined(NFSU2_IOS)
-        /* With no real pad on port 0 the touchscreen is the controller. A
-         * pad that is attached never reaches this branch, so it always
-         * outranks the touch layer. */
-        if (dwPort == 0 && xbox_ios_touch_state(pState)) {
-            g_controller_connected[0] = TRUE;
-            return ERROR_SUCCESS;
+        /* With no real pad on port 0 the touchscreen and/or a hardware
+         * keyboard are the controller. A pad that is attached never reaches
+         * this branch, so it always outranks both. */
+        if (dwPort == 0) {
+            int kb = kb_enabled() && ios_keyboard_connected();
+            int have = xbox_ios_touch_enabled() ? xbox_ios_touch_state(pState) : 0;
+            if (have || kb) {
+                if (!have) {   /* touch off: an idle pad with a moving packet */
+                    memset(pState, 0, sizeof(XBOX_INPUT_STATE));
+                    pState->dwPacketNumber = ++g_packet[0];
+                }
+                if (kb)
+                    xbox_ios_keyboard_fold(pState, xbox_ios_keyboard_mask_from_sdl());
+                g_controller_connected[0] = TRUE;
+                return ERROR_SUCCESS;
+            }
         }
 #endif
         return ERROR_DEVICE_NOT_CONNECTED;
@@ -445,6 +499,8 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
 #else
     SDL_GameController *c = g_pads[dwPort];
     if (!c) return ERROR_DEVICE_NOT_CONNECTED;
+    if (!rumble_enabled())
+        return ERROR_SUCCESS;
 
     /* SDL rumble needs a duration; refresh for ~1s on each call (the game
      * polls vibration continuously). */

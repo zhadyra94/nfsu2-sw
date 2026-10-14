@@ -27,7 +27,9 @@
  * created, well before the title's first poll in practice).
  *
  * RECOMP_TOUCH=0 turns the layer off, e.g. to prove a Bluetooth pad works
- * with the touch code out of the way.
+ * with the touch code out of the way. The settings panel flips it live
+ * (xbox_ios_touch_set_enabled), and also picks the zone layout (PAD, or
+ * DRIVE for racing), the zone size, haptics and tilt steering.
  *
  * Kept out of xinput_device.c the same way xinput_nx.c is kept out: this
  * file is compiled only for iOS, and everything here is meaningless
@@ -47,6 +49,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include "xinput_xbox.h"
 #include "xinput_ios.h"
@@ -69,7 +72,7 @@
  *   left stick)      A     drag = deflection)
  *     dpad
  */
-static const XBOX_IOS_TOUCH_ZONE s_zones[] = {
+static const XBOX_IOS_TOUCH_ZONE s_zones_pad[] = {
     /* id   cx      cy      rx      ry      kind               value            */
     /* Shoulders ABOVE triggers, both near the top edge; clear of the
      * Dynamic Island (x 11-48 pt, y 133-260 pt in landscape) and of the
@@ -87,15 +90,61 @@ static const XBOX_IOS_TOUCH_ZONE s_zones[] = {
     { 11,  0.840f, 0.680f, 0.038f, 0.082f, XBOX_IOS_ZONE_ANALOG, XBOX_BUTTON_Y      },
     {  3,  0.080f, 0.810f, 0.058f, 0.126f, XBOX_IOS_ZONE_DPAD,   0                  },
 };
-#define ZONE_COUNT (sizeof s_zones / sizeof s_zones[0])
+#define PAD_COUNT ((int)(sizeof s_zones_pad / sizeof s_zones_pad[0]))
+
+/* DRIVE preset (racing): the right trigger is GAS, a tall pedal in the
+ * bottom-right corner, with BRAKE (left trigger) beside it. The face buttons
+ * are a smaller diamond above the pedals, LB/RB sit small near the top
+ * corners, BACK/START and the d-pad stay where PAD has them. The left half
+ * is still the dynamic left stick (steering), the right half outside the
+ * zones the dynamic right stick. Checked numerically on 852x393: no two
+ * ellipses overlap and none touches the Dynamic Island strip. */
+static const XBOX_IOS_TOUCH_ZONE s_zones_drive[] = {
+    /* id   cx      cy      rx      ry      kind               value            */
+    {  1,  0.056f, 0.102f, 0.035f, 0.076f, XBOX_IOS_ZONE_FLAG,   XBOX_GAMEPAD_BACK  },
+    {  2,  0.944f, 0.102f, 0.035f, 0.076f, XBOX_IOS_ZONE_FLAG,   XBOX_GAMEPAD_START },
+    {  4,  0.150f, 0.100f, 0.032f, 0.070f, XBOX_IOS_ZONE_ANALOG, XBOX_BUTTON_BLACK    },  /* LB */
+    {  6,  0.850f, 0.100f, 0.032f, 0.070f, XBOX_IOS_ZONE_ANALOG, XBOX_BUTTON_WHITE    },  /* RB */
+    {  5,  0.785f, 0.780f, 0.055f, 0.150f, XBOX_IOS_ZONE_ANALOG, XBOX_BUTTON_LTRIGGER },  /* BRAKE */
+    {  7,  0.915f, 0.700f, 0.065f, 0.220f, XBOX_IOS_ZONE_ANALOG, XBOX_BUTTON_RTRIGGER },  /* GAS */
+    {  8,  0.830f, 0.500f, 0.030f, 0.066f, XBOX_IOS_ZONE_ANALOG, XBOX_BUTTON_A      },
+    {  9,  0.890f, 0.380f, 0.030f, 0.066f, XBOX_IOS_ZONE_ANALOG, XBOX_BUTTON_B      },
+    { 10,  0.770f, 0.380f, 0.030f, 0.066f, XBOX_IOS_ZONE_ANALOG, XBOX_BUTTON_X      },
+    { 11,  0.830f, 0.260f, 0.030f, 0.066f, XBOX_IOS_ZONE_ANALOG, XBOX_BUTTON_Y      },
+    {  3,  0.080f, 0.810f, 0.045f, 0.098f, XBOX_IOS_ZONE_DPAD,   0                  },
+};
+#define DRIVE_COUNT ((int)(sizeof s_zones_drive / sizeof s_zones_drive[0]))
+
+#define ZONE_MAX 16
+typedef char zone_max_ok[(PAD_COUNT <= ZONE_MAX && DRIVE_COUNT <= ZONE_MAX) ? 1 : -1];
+
+/* The active table: the chosen preset with rx/ry times the size setting.
+ * Rebuilt under s_lock; the overlay reads it on the main thread, the same
+ * thread that changes it. */
+static XBOX_IOS_TOUCH_ZONE s_zones[ZONE_MAX];
+static int   s_zone_n;
+static int   s_drive;                 /* 0 PAD, 1 DRIVE */
+static float s_scale = 1.0f;          /* NFSU2_TOUCH_SCALE, 0.7..1.5 */
+
+static void zones_rebuild_locked(void)
+{
+    const XBOX_IOS_TOUCH_ZONE *src = s_drive ? s_zones_drive : s_zones_pad;
+    int n = s_drive ? DRIVE_COUNT : PAD_COUNT, i;
+    for (i = 0; i < n; i++) {
+        s_zones[i] = src[i];
+        s_zones[i].rx *= s_scale;
+        s_zones[i].ry *= s_scale;
+    }
+    s_zone_n = n;
+}
 
 /* Table order is hit-test priority: the first zone whose ellipse contains
  * the touch wins, which settles the handful of pixels where neighbours
  * overlap. */
 static int zone_at(float x, float y)
 {
-    unsigned i;
-    for (i = 0; i < ZONE_COUNT; i++) {
+    int i;
+    for (i = 0; i < s_zone_n; i++) {
         float dx = (x - s_zones[i].cx) / s_zones[i].rx;
         float dy = (y - s_zones[i].cy) / s_zones[i].ry;
         if (dx * dx + dy * dy <= 1.0f)
@@ -129,21 +178,132 @@ static TouchFinger s_finger[TOUCH_MAX_FINGERS];
 static float       s_aspect = 9.0f / 16.0f;   /* window height / width (landscape) */
 static DWORD       s_packet;
 static int         s_live;                    /* the watch is installed */
-static int         s_disabled = -1;           /* RECOMP_TOUCH, then settings */
+static int         s_enabled = 1;             /* RECOMP_TOUCH, then the panel */
+static int         s_prefs_done;
+static float       s_tilt_x;                  /* under s_lock */
+static int         s_tilt_on;                 /* under s_lock */
+static void      (*s_press_hook)(int);        /* zone index; see set_press_hook */
+
+static void touch_clear_locked(void);
+
+/* First use from any thread: read the env defaults, build the zone table and
+ * create the lock. Every public entry point calls this first, so the main
+ * thread (overlay) and the game thread (input poll) never see a half-built
+ * layer, whichever comes first. */
+static void touch_prefs_once(void)
+{
+    static SDL_SpinLock s_prefs_spin;
+    if (__atomic_load_n(&s_prefs_done, __ATOMIC_ACQUIRE))
+        return;
+    SDL_AtomicLock(&s_prefs_spin);
+    if (!s_prefs_done) {
+        const char *v;
+        int i;
+
+        v = getenv("RECOMP_TOUCH");
+        s_enabled = !(v && strcmp(v, "0") == 0);
+        v = getenv("NFSU2_TOUCH_LAYOUT");
+        s_drive = (v && strcasecmp(v, "drive") == 0);
+        v = getenv("NFSU2_TOUCH_SCALE");
+        if (v && *v) {
+            float k = (float)atof(v);
+            s_scale = !(k >= 0.7f) ? 0.7f : k > 1.5f ? 1.5f : k;
+        }
+        for (i = 0; i < TOUCH_MAX_FINGERS; i++)
+            s_finger[i].id = -1;
+        s_lock = SDL_CreateMutex();
+        zones_rebuild_locked();
+        __atomic_store_n(&s_prefs_done, 1, __ATOMIC_RELEASE);
+    }
+    SDL_AtomicUnlock(&s_prefs_spin);
+}
 
 /* Settings hooks (nfsu2_env.txt / gear panel). Called from the main thread
- * between polls; races with a poll in flight settle on the next poll. */
+ * between polls; races with a poll in flight settle on the next poll. Off
+ * means off: fingers are dropped, new ones are ignored, and
+ * xbox_ios_touch_state() reports nothing. */
 void xbox_ios_touch_set_enabled(int on)
 {
-    if (on)
-        s_disabled = 0;
-    else if (s_disabled < 0)
-    {
-        const char *v = getenv("RECOMP_TOUCH");
-        s_disabled = (v && strcmp(v, "0") == 0) || !on;
+    touch_prefs_once();
+    __atomic_store_n(&s_enabled, on ? 1 : 0, __ATOMIC_RELEASE);
+    SDL_LockMutex(s_lock);
+    touch_clear_locked();
+    s_tilt_on = 0;   /* tilt rides on the touch layer: off with it */
+    SDL_UnlockMutex(s_lock);
+}
+
+int xbox_ios_touch_enabled(void)
+{
+    touch_prefs_once();
+    return __atomic_load_n(&s_enabled, __ATOMIC_ACQUIRE);
+}
+
+/* PAD (0) or DRIVE (1). Fingers are cleared first: a finger that holds
+ * "zone 7" must not keep meaning something else in the new table. */
+void xbox_ios_touch_set_layout(int drive)
+{
+    touch_prefs_once();
+    SDL_LockMutex(s_lock);
+    touch_clear_locked();
+    s_drive = drive ? 1 : 0;
+    zones_rebuild_locked();
+    SDL_UnlockMutex(s_lock);
+}
+
+/* Zone size factor, clamped 0.7..1.5 (rx/ry only; centres stay). */
+void xbox_ios_touch_set_scale(float k)
+{
+    touch_prefs_once();
+    k = !(k >= 0.7f) ? 0.7f : k > 1.5f ? 1.5f : k;
+    SDL_LockMutex(s_lock);
+    touch_clear_locked();
+    s_scale = k;
+    zones_rebuild_locked();
+    SDL_UnlockMutex(s_lock);
+}
+
+/* Label for the overlay to draw on zone idx (active table order), or NULL
+ * for a plain shape. */
+const char *xbox_ios_touch_zone_label(int idx)
+{
+    const XBOX_IOS_TOUCH_ZONE *z;
+
+    touch_prefs_once();
+    if (idx < 0 || idx >= s_zone_n)
+        return NULL;
+    z = &s_zones[idx];
+    if (z->kind != XBOX_IOS_ZONE_ANALOG)
+        return NULL;   /* BACK/START/DPAD stay shapes */
+    switch (z->value) {
+    case XBOX_BUTTON_A:        return "A";
+    case XBOX_BUTTON_B:        return "B";
+    case XBOX_BUTTON_X:        return "X";
+    case XBOX_BUTTON_Y:        return "Y";
+    case XBOX_BUTTON_BLACK:    return "LB";
+    case XBOX_BUTTON_WHITE:    return "RB";
+    case XBOX_BUTTON_LTRIGGER: return s_drive ? "BRAKE" : "LT";
+    case XBOX_BUTTON_RTRIGGER: return s_drive ? "GAS" : "RT";
+    default:                   return NULL;
     }
-    else
-        s_disabled = !on;
+}
+
+/* Called (on whichever thread pumps SDL events) when a finger lands on a
+ * zone. The overlay uses it for haptics. NULL clears. */
+void xbox_ios_touch_set_press_hook(void (*hook)(int))
+{
+    __atomic_store_n(&s_press_hook, hook, __ATOMIC_RELEASE);
+}
+
+/* Tilt steering from the overlay's motion updates: x in -1..1, active 0
+ * stops it. Used for the left stick X while no finger holds that stick. */
+void xbox_ios_touch_set_tilt(float x, int active)
+{
+    touch_prefs_once();
+    x = x > 1.0f ? 1.0f : x < -1.0f ? -1.0f : x;
+    SDL_LockMutex(s_lock);
+    s_tilt_x = active ? x : 0.0f;
+    s_tilt_on = active ? 1 : 0;
+    SDL_UnlockMutex(s_lock);
 }
 
 /* A stick's maximum deflection, as a fraction of the screen width -- the
@@ -204,7 +364,10 @@ static void fold_finger(const TouchFinger *f, float aspect, WORD *flags,
                         int *have_l, int *have_r)
 {
     if (f->role >= ROLE_ZONE(0)) {
-        const XBOX_IOS_TOUCH_ZONE *z = &s_zones[f->role - ROLE_ZONE(0)];
+        const XBOX_IOS_TOUCH_ZONE *z;
+        if (f->role - ROLE_ZONE(0) >= s_zone_n)
+            return;
+        z = &s_zones[f->role - ROLE_ZONE(0)];
         switch (z->kind) {
         case XBOX_IOS_ZONE_FLAG:
             *flags |= (WORD)z->value;
@@ -248,9 +411,12 @@ static void touch_clear_locked(void)
 static void finger_down(SDL_TouchID touch_id, SDL_FingerID id, float x, float y)
 {
     int i, zone;
+    void (*hook)(int);
 
     (void)touch_id;   /* iOS has the one touch screen; ids are its own */
 
+    if (!__atomic_load_n(&s_enabled, __ATOMIC_ACQUIRE))
+        return;
     SDL_LockMutex(s_lock);
     for (i = 0; i < TOUCH_MAX_FINGERS; i++) {
         if (s_finger[i].id == id) {
@@ -293,6 +459,12 @@ static void finger_down(SDL_TouchID touch_id, SDL_FingerID id, float x, float y)
                          : (want_l ? ROLE_LSTICK : ROLE_RSTICK);
     }
     SDL_UnlockMutex(s_lock);
+    /* Outside the lock: the hook may take its own locks or hop threads. */
+    if (zone >= 0) {
+        hook = __atomic_load_n(&s_press_hook, __ATOMIC_ACQUIRE);
+        if (hook)
+            hook(zone);
+    }
 }
 
 static void finger_move(SDL_FingerID id, float x, float y)
@@ -396,32 +568,23 @@ int xbox_ios_touch_init(void)
     static SDL_SpinLock s_spin;   /* first caller from any thread wins */
     int live;
 
-    if (s_disabled < 0) {
-        const char *v = getenv("RECOMP_TOUCH");
-        s_disabled = (v && strcmp(v, "0") == 0);
-    }
-    if (s_disabled)
-        return 0;
-
+    touch_prefs_once();
+    /* The watch goes in even with touch off: the panel can switch it on
+     * later, and a disabled layer ignores every finger anyway. */
     SDL_AtomicLock(&s_spin);
     live = s_live;
-    if (!live) {
-        int i;
-        for (i = 0; i < TOUCH_MAX_FINGERS; i++)
-            s_finger[i].id = -1;
+    if (!live && s_lock) {
         /* The event system is core; the watch simply sees nothing until
          * the UIKit video backend exists and starts delivering touches.
          * SDL_AddEventWatch cannot fail, so the mutex is what can. */
-        s_lock = SDL_CreateMutex();
-        if (s_lock) {
-            SDL_AddEventWatch(touch_watch, NULL);
-            s_live = live = 1;
-            fprintf(stderr, "[INPUT] iOS touch gamepad active "
-                            "(RECOMP_TOUCH=0 disables)\n");
-        }
+        SDL_AddEventWatch(touch_watch, NULL);
+        s_live = live = 1;
+        fprintf(stderr, "[INPUT] iOS touch gamepad active%s "
+                        "(RECOMP_TOUCH=0 disables)\n",
+                s_enabled ? "" : " (currently off)");
     }
     SDL_AtomicUnlock(&s_spin);
-    return live;
+    return live && s_enabled;
 }
 
 int xbox_ios_touch_state(XBOX_INPUT_STATE *pState)
@@ -434,7 +597,9 @@ int xbox_ios_touch_state(XBOX_INPUT_STATE *pState)
     DWORD packet;
     int   have_l = 0, have_r = 0, i;
 
-    if (!pState || !s_lock)
+    touch_prefs_once();
+    if (!pState || !s_lock || !s_live ||
+        !__atomic_load_n(&s_enabled, __ATOMIC_ACQUIRE))
         return 0;
 
     SDL_LockMutex(s_lock);
@@ -443,6 +608,11 @@ int xbox_ios_touch_state(XBOX_INPUT_STATE *pState)
         if (s_finger[i].id >= 0)
             fold_finger(&s_finger[i], aspect, &flags, analog,
                         lstick, rstick, &have_l, &have_r);
+    }
+    /* Tilt steers while no finger holds the left stick. */
+    if (s_tilt_on && !have_l) {
+        lstick[0] = s_tilt_x;
+        lstick[1] = 0.0f;
     }
     /* The input layer looks for button edges on the packet number, so it
      * has to move on every read, the way the other backends' counters do. */
@@ -464,8 +634,9 @@ int xbox_ios_touch_state(XBOX_INPUT_STATE *pState)
 
 const XBOX_IOS_TOUCH_ZONE *xbox_ios_touch_zones(int *count)
 {
+    touch_prefs_once();
     if (count)
-        *count = (int)ZONE_COUNT;
+        *count = s_zone_n;
     return s_zones;
 }
 
@@ -477,6 +648,7 @@ int xbox_ios_touch_stick(int side, float *bx, float *by, float *kx, float *ky)
     int role = side ? ROLE_RSTICK : ROLE_LSTICK;
     int i, found = 0;
 
+    touch_prefs_once();
     SDL_LockMutex(s_lock);
     for (i = 0; i < TOUCH_MAX_FINGERS; i++) {
         if (s_finger[i].id >= 0 && s_finger[i].role == role) {
@@ -497,6 +669,7 @@ int xbox_ios_touch_zone_pressed(int idx)
 {
     int i, hit = 0;
 
+    touch_prefs_once();
     SDL_LockMutex(s_lock);
     for (i = 0; i < TOUCH_MAX_FINGERS; i++)
         if (s_finger[i].id >= 0 && s_finger[i].role >= ROLE_ZONE(0) &&
@@ -506,6 +679,122 @@ int xbox_ios_touch_zone_pressed(int idx)
         }
     SDL_UnlockMutex(s_lock);
     return hit;
+}
+
+/* ------------------------------------------------------------------ */
+/* Hardware keyboard                                                   */
+/* ------------------------------------------------------------------ */
+
+/* Bit numbers of the keyboard action mask (one bit per Xbox control, built
+ * by xbox_ios_keyboard_mask_from_sdl, applied by xbox_ios_keyboard_fold). */
+#define KB_DPAD_UP    0
+#define KB_DPAD_DOWN  1
+#define KB_DPAD_LEFT  2
+#define KB_DPAD_RIGHT 3
+#define KB_A          4
+#define KB_B          5
+#define KB_X          6
+#define KB_Y          7
+#define KB_LB         8    /* Xbox BLACK */
+#define KB_RB         9    /* Xbox WHITE */
+#define KB_LT         10
+#define KB_RT         11
+#define KB_START      12
+#define KB_BACK       13
+#define KB_LS_UP      14
+#define KB_LS_DOWN    15
+#define KB_LS_LEFT    16
+#define KB_LS_RIGHT   17
+#define KB_RS_UP      18
+#define KB_RS_DOWN    19
+#define KB_RS_LEFT    20
+#define KB_RS_RIGHT   21
+
+#define KBIT(b) ((int)((mask >> (b)) & 1ull))
+
+/* The keyboard's action mask, from SDL's own key state. SDL's UIKit backend
+ * feeds that array from GCKeyboard (it clears it on focus loss), and the
+ * game thread only reads bytes of it, which is benign. Keys:
+ *   arrows         D-pad                   W / S     gas (RT) / brake (LT)
+ *   A / D          left stick X            Return, Space   A
+ *   Esc, Backspace B                       Left Shift X;  Left Ctrl Y
+ *   Q / E          LB (Black) / RB (White) Tab, P    START
+ *   O, ` (grave)   BACK                    I J K L   right stick up/left/down/right */
+unsigned long long xbox_ios_keyboard_mask_from_sdl(void)
+{
+    const Uint8 *ks = SDL_GetKeyboardState(NULL);
+    unsigned long long m = 0;
+
+    if (!ks)
+        return 0;
+#define KEYBIT(sc, bit) do { if (ks[sc]) m |= 1ull << (bit); } while (0)
+    KEYBIT(SDL_SCANCODE_UP,        KB_DPAD_UP);
+    KEYBIT(SDL_SCANCODE_DOWN,      KB_DPAD_DOWN);
+    KEYBIT(SDL_SCANCODE_LEFT,      KB_DPAD_LEFT);
+    KEYBIT(SDL_SCANCODE_RIGHT,     KB_DPAD_RIGHT);
+    KEYBIT(SDL_SCANCODE_W,         KB_RT);
+    KEYBIT(SDL_SCANCODE_S,         KB_LT);
+    KEYBIT(SDL_SCANCODE_A,         KB_LS_LEFT);
+    KEYBIT(SDL_SCANCODE_D,         KB_LS_RIGHT);
+    KEYBIT(SDL_SCANCODE_RETURN,    KB_A);
+    KEYBIT(SDL_SCANCODE_SPACE,     KB_A);
+    KEYBIT(SDL_SCANCODE_ESCAPE,    KB_B);
+    KEYBIT(SDL_SCANCODE_BACKSPACE, KB_B);
+    KEYBIT(SDL_SCANCODE_LSHIFT,    KB_X);
+    KEYBIT(SDL_SCANCODE_LCTRL,     KB_Y);
+    KEYBIT(SDL_SCANCODE_Q,         KB_LB);
+    KEYBIT(SDL_SCANCODE_E,         KB_RB);
+    KEYBIT(SDL_SCANCODE_TAB,       KB_START);
+    KEYBIT(SDL_SCANCODE_P,         KB_START);
+    KEYBIT(SDL_SCANCODE_O,         KB_BACK);
+    KEYBIT(SDL_SCANCODE_GRAVE,     KB_BACK);
+    KEYBIT(SDL_SCANCODE_I,         KB_RS_UP);
+    KEYBIT(SDL_SCANCODE_J,         KB_RS_LEFT);
+    KEYBIT(SDL_SCANCODE_K,         KB_RS_DOWN);
+    KEYBIT(SDL_SCANCODE_L,         KB_RS_RIGHT);
+#undef KEYBIT
+    return m;
+}
+
+/* OR the keyboard's actions into *s: buttons add, analog buttons go to 255,
+ * and a stick takes full deflection only where it is not already deflected
+ * (a thumb on the glass or a tilt keeps priority). */
+void xbox_ios_keyboard_fold(XBOX_INPUT_STATE *s, unsigned long long mask)
+{
+    WORD fl = 0;
+    int d;
+
+    if (!s || !mask)
+        return;
+    if (KBIT(KB_DPAD_UP))    fl |= XBOX_GAMEPAD_DPAD_UP;
+    if (KBIT(KB_DPAD_DOWN))  fl |= XBOX_GAMEPAD_DPAD_DOWN;
+    if (KBIT(KB_DPAD_LEFT))  fl |= XBOX_GAMEPAD_DPAD_LEFT;
+    if (KBIT(KB_DPAD_RIGHT)) fl |= XBOX_GAMEPAD_DPAD_RIGHT;
+    if (KBIT(KB_START))      fl |= XBOX_GAMEPAD_START;
+    if (KBIT(KB_BACK))       fl |= XBOX_GAMEPAD_BACK;
+    s->Gamepad.wButtons |= fl;
+
+    if (KBIT(KB_A))  s->Gamepad.bAnalogButtons[XBOX_BUTTON_A] = 255;
+    if (KBIT(KB_B))  s->Gamepad.bAnalogButtons[XBOX_BUTTON_B] = 255;
+    if (KBIT(KB_X))  s->Gamepad.bAnalogButtons[XBOX_BUTTON_X] = 255;
+    if (KBIT(KB_Y))  s->Gamepad.bAnalogButtons[XBOX_BUTTON_Y] = 255;
+    if (KBIT(KB_LB)) s->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK] = 255;
+    if (KBIT(KB_RB)) s->Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE] = 255;
+    if (KBIT(KB_LT)) s->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] = 255;
+    if (KBIT(KB_RT)) s->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] = 255;
+
+    d = KBIT(KB_LS_RIGHT) - KBIT(KB_LS_LEFT);
+    if (d && !s->Gamepad.sThumbLX)
+        s->Gamepad.sThumbLX = (SHORT)(d * 32767);
+    d = KBIT(KB_LS_UP) - KBIT(KB_LS_DOWN);   /* Xbox Y grows upward */
+    if (d && !s->Gamepad.sThumbLY)
+        s->Gamepad.sThumbLY = (SHORT)(d * 32767);
+    d = KBIT(KB_RS_RIGHT) - KBIT(KB_RS_LEFT);
+    if (d && !s->Gamepad.sThumbRX)
+        s->Gamepad.sThumbRX = (SHORT)(d * 32767);
+    d = KBIT(KB_RS_UP) - KBIT(KB_RS_DOWN);
+    if (d && !s->Gamepad.sThumbRY)
+        s->Gamepad.sThumbRY = (SHORT)(d * 32767);
 }
 
 #endif /* NFSU2_IOS */

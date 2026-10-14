@@ -54,8 +54,35 @@ int xbox_ios_touch_init(void);
  * initialized; the caller then reports no device. */
 int xbox_ios_touch_state(XBOX_INPUT_STATE *pState);
 
-/* The hit-test zones, for a future on-screen overlay. Never NULL; *count
- * receives the number of zones. */
+/* The active hit-test zones (the layout preset times the size setting), for
+ * the on-screen overlay. Never NULL; *count receives the number of zones.
+ * The table changes on set_layout / set_scale: re-read it after those. */
 const XBOX_IOS_TOUCH_ZONE *xbox_ios_touch_zones(int *count);
+
+/* Touch on/off (RECOMP_TOUCH). Off drops every finger, ignores new ones and
+ * makes xbox_ios_touch_state() return 0. */
+void xbox_ios_touch_set_enabled(int on);
+int  xbox_ios_touch_enabled(void);
+
+/* Layout preset (0 = PAD, 1 = DRIVE) and zone size factor (0.7..1.5). Both
+ * clear all fingers. Main thread. */
+void xbox_ios_touch_set_layout(int drive);
+void xbox_ios_touch_set_scale(float k);
+
+/* Text the overlay draws on zone idx ("GAS", "A", ...), NULL for none. */
+const char *xbox_ios_touch_zone_label(int idx);
+
+/* Called with the zone index when a finger lands on a zone, on whichever
+ * thread pumps SDL events. NULL clears it. */
+void xbox_ios_touch_set_press_hook(void (*hook)(int zone_idx));
+
+/* Tilt steering: x in -1..1 drives the left stick X while no finger holds
+ * that stick; active 0 turns it off. */
+void xbox_ios_touch_set_tilt(float x, int active);
+
+/* Hardware keyboard: the action mask from SDL's key state (game thread), and
+ * folding such a mask into *s. */
+unsigned long long xbox_ios_keyboard_mask_from_sdl(void);
+void xbox_ios_keyboard_fold(XBOX_INPUT_STATE *s, unsigned long long mask);
 
 #endif /* NFSU2_XINPUT_IOS_H */

@@ -49,8 +49,10 @@ src/nic.c
 )
 
 if(IOS)
-    list(APPEND GAME_SOURCES xboxrecomp/src/platform/ios_touch_overlay.m)
-    set_source_files_properties(xboxrecomp/src/platform/ios_touch_overlay.m PROPERTIES
+    list(APPEND GAME_SOURCES xboxrecomp/src/platform/ios_touch_overlay.m
+                             xboxrecomp/src/platform/ios_keyboard.m)
+    set_source_files_properties(xboxrecomp/src/platform/ios_touch_overlay.m
+                                xboxrecomp/src/platform/ios_keyboard.m PROPERTIES
         COMPILE_FLAGS "-I${CMAKE_SOURCE_DIR}/xboxrecomp/src/input -fobjc-arc")
 endif()
 

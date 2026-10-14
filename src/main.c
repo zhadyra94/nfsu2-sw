@@ -69,6 +69,64 @@ extern void xbe_entry_point(void);
 extern int recomp_dispatch_init(void);
 extern void xbox_path_init(const char *game_dir, const char *save_dir);
 
+/* Disc image backend (xboxrecomp/src/kernel/xbox_xiso.c). */
+extern int xiso_autodetect(const char *game_dir);
+extern void xiso_unmount(void);
+extern void *xiso_read_file(const char *rel, size_t *size);
+extern const char *xiso_image_path(void);
+extern void xiso_sha256(const void *data, size_t len, uint8_t out[32]);
+
+/* The disc this build expects. These values belong to the gen/ the binary was
+ * built from (the XBE the lifter read), so they must change together with it:
+ * NFSU2 NTSC-U, default.xbe certificate title ID 0x4541005A, certificate
+ * version 0x00000001. A different title ID is refused; a different SHA-256
+ * (another printing) only warns, because the lifted code may still match. */
+#define NFSU2_XBE_TITLE_ID 0x4541005Au
+#define NFSU2_XBE_VERSION  0x00000001u
+static const char NFSU2_XBE_SHA256[] =
+    "95c22b9c594f0c187f602ac6484fe4cb65a9d53dafe3110ed815598eb9dcb0bd";
+
+/* Check the default.xbe read from a disc image. Returns 0 to refuse. */
+static int check_disc_identity(const uint8_t *xbe, size_t size)
+{
+    uint8_t sha[32];
+    char hex[65];
+    uint32_t base, cert_va, title_id, version = 0;
+    size_t cert, i;
+
+    if (size < 0x200 || memcmp(xbe, "XBEH", 4) != 0) {
+        fprintf(stderr, "[XISO] FATAL: default.xbe in the image is not an XBE\n");
+        return 0;
+    }
+    memcpy(&base, xbe + 0x104, 4);          /* XBE header: base address   */
+    memcpy(&cert_va, xbe + 0x118, 4);       /* XBE header: certificate VA */
+    cert = (size_t)(cert_va - base);
+    if (cert_va < base || cert + 0xB0 > size) {
+        fprintf(stderr, "[XISO] FATAL: default.xbe in the image has no "
+                "readable certificate\n");
+        return 0;
+    }
+    memcpy(&title_id, xbe + cert + 0x08, 4);
+    memcpy(&version, xbe + cert + 0xAC, 4);
+    if (title_id != NFSU2_XBE_TITLE_ID) {
+        fprintf(stderr, "[XISO] FATAL: wrong game in %s: title ID 0x%08X, "
+                "this build runs only NFSU2 NTSC-U (title ID 0x%08X)\n",
+                xiso_image_path(), title_id, NFSU2_XBE_TITLE_ID);
+        return 0;
+    }
+    xiso_sha256(xbe, size, sha);
+    for (i = 0; i < 32; i++)
+        snprintf(hex + 2 * i, 3, "%02x", sha[i]);
+    if (version != NFSU2_XBE_VERSION || strcmp(hex, NFSU2_XBE_SHA256) != 0)
+        fprintf(stderr, "[XISO] warning: default.xbe differs from the build's "
+                "disc (version 0x%08X, SHA-256 %s); expected version 0x%08X, "
+                "%s. Continuing.\n", version, hex, NFSU2_XBE_VERSION,
+                NFSU2_XBE_SHA256);
+    else
+        fprintf(stderr, "[XISO] default.xbe matches the build (SHA-256 %s)\n", hex);
+    return 1;
+}
+
 #define NFSU2_ENTRY_POINT 0x0021B1CEu
 
 
@@ -125,10 +183,15 @@ static char *cfg_trim(char *t)
     return t;
 }
 
+static char s_cfg_path[1100];   /* where nfsu2_cfg_set writes back */
+
 static void cfg_load(const char *path)
 {
-    FILE *f = fopen(path, "r");
+    FILE *f;
     char line[128];
+    /* Recorded before fopen: a missing file is created by the first save. */
+    snprintf(s_cfg_path, sizeof s_cfg_path, "%s", path);
+    f = fopen(path, "r");
     if (!f) {
         fprintf(stderr, "nfsu2: no settings file at %s (%s)\n",
                 path, strerror(errno));
@@ -159,6 +222,168 @@ static void cfg_load(const char *path)
     for (int i = 0; i < s_cfg_n; i++)
         fprintf(stderr, "nfsu2:   %s=%s\n", s_cfg[i].key, s_cfg[i].val);
 }
+const char *nfsu2_cfg_path(void)
+{
+    return s_cfg_path[0] ? s_cfg_path : NULL;
+}
+
+/* The file's value (as changed by nfsu2_cfg_set), else the environment (a
+ * key set outside the file), else NULL. The pointer may be into s_cfg: copy it before calling nfsu2_cfg_set. */
+const char *nfsu2_cfg_get(const char *key)
+{
+    const char *v = cfg_get(key);
+    return v ? v : getenv(key);
+}
+
+/* Does the line [p, eol) hold `key` (trimmed, as cfg_load reads it)? */
+static int cfg_line_has_key(const char *p, const char *eol, const char *key,
+                            size_t klen)
+{
+    const char *eq = (const char *)memchr(p, '=', (size_t)(eol - p));
+    const char *e;
+    if (!eq || eq == p)
+        return 0;
+    while (p < eq && (*p == ' ' || *p == '\t'))
+        p++;
+    e = eq;
+    while (e > p && (e[-1] == ' ' || e[-1] == '\t'))
+        e--;
+    return (size_t)(e - p) == klen && memcmp(p, key, klen) == 0;
+}
+
+/* Rewrite the settings file with key=val. Every other line is copied byte
+ * for byte (comments, unknown keys, line endings). The new file goes to
+ * <path>.tmp first and rename() swaps it in, so a kill mid-write cannot
+ * leave a half file. Returns 1 on success. */
+static int cfg_save(const char *key, const char *val)
+{
+    char *buf = NULL;
+    size_t len = 0, cap = 0, pos = 0, klen = strlen(key);
+    char tmp[sizeof s_cfg_path + 8];
+    int done = 0, ok = 1;
+    FILE *f = fopen(s_cfg_path, "rb");
+
+    if (f) {
+        for (;;) {
+            size_t n;
+            if (len + 1 >= cap) {
+                size_t nc = cap ? cap * 2 : 1024;
+                char *nb = (char *)realloc(buf, nc);
+                if (!nb) {
+                    free(buf);
+                    fclose(f);
+                    return 0;
+                }
+                buf = nb;
+                cap = nc;
+            }
+            n = fread(buf + len, 1, cap - len - 1, f);
+            if (n == 0)
+                break;
+            len += n;
+            if (len > (1u << 20)) {   /* not a settings file */
+                free(buf);
+                fclose(f);
+                return 0;
+            }
+        }
+        fclose(f);
+    }
+
+    snprintf(tmp, sizeof tmp, "%s.tmp", s_cfg_path);
+    f = fopen(tmp, "wb");
+    if (!f) {
+        fprintf(stderr, "nfsu2: cannot write %s (%s)\n", tmp, strerror(errno));
+        free(buf);
+        return 0;
+    }
+    while (pos < len) {
+        size_t e = pos, next, eol, bom = 0;
+        while (e < len && buf[e] != '\n')
+            e++;
+        next = e < len ? e + 1 : e;
+        eol = e;
+        if (eol > pos && buf[eol - 1] == '\r')
+            eol--;
+        /* UTF-8 BOM on the first line: skip it for the match, keep it. */
+        if (pos == 0 && eol >= 3 && (unsigned char)buf[0] == 0xEF &&
+            (unsigned char)buf[1] == 0xBB && (unsigned char)buf[2] == 0xBF)
+            bom = 3;
+        if (!done && cfg_line_has_key(buf + pos + bom, buf + eol, key, klen)) {
+            if (bom)
+                fwrite(buf, 1, bom, f);
+            fprintf(f, "%s=%s", key, val);
+            fwrite(buf + eol, 1, next - eol, f);   /* original line ending */
+            done = 1;
+        } else {
+            fwrite(buf + pos, 1, next - pos, f);
+        }
+        pos = next;
+    }
+    if (!done) {
+        if (len && buf[len - 1] != '\n')
+            fputc('\n', f);
+        fprintf(f, "%s=%s\n", key, val);
+    }
+    free(buf);
+    if (fflush(f) != 0 || ferror(f))
+        ok = 0;
+    else
+        fsync(fileno(f));
+    if (fclose(f) != 0)
+        ok = 0;
+    if (ok && rename(tmp, s_cfg_path) != 0) {
+        fprintf(stderr, "nfsu2: rename %s failed (%s)\n", tmp, strerror(errno));
+        ok = 0;
+    }
+    if (!ok)
+        remove(tmp);
+    return ok;
+}
+
+/* Main thread only (the panel). Updates the live table, then the file.
+ * Returns 1 when the file was written too. No setenv here: the renderer
+ * calls getenv() on its own thread every flip, and setenv can reallocate
+ * environ under it. Boot-time keys are exported once by cfg_load; the panel
+ * reads values back through nfsu2_cfg_get (s_cfg first); live items take
+ * effect through their own setters. */
+int nfsu2_cfg_set(const char *key, const char *val)
+{
+    int idx = -1, i;
+
+    if (!key || !val || !key[0] ||
+        strlen(key) >= sizeof s_cfg[0].key || strlen(val) >= sizeof s_cfg[0].val ||
+        strpbrk(key, "=\r\n \t") || strpbrk(val, "=\r\n")) {
+        fprintf(stderr, "nfsu2: setting rejected (bad key or value)\n");
+        return 0;
+    }
+    for (i = 0; i < s_cfg_n; i++)
+        if (!strcmp(s_cfg[i].key, key)) {
+            idx = i;
+            break;
+        }
+    if (idx < 0) {
+        if (s_cfg_n >= (int)(sizeof s_cfg / sizeof s_cfg[0])) {
+            fprintf(stderr, "nfsu2: setting %s dropped (table full)\n", key);
+            return 0;
+        }
+        idx = s_cfg_n++;
+        snprintf(s_cfg[idx].key, sizeof s_cfg[0].key, "%s", key);
+    }
+    snprintf(s_cfg[idx].val, sizeof s_cfg[0].val, "%s", val);
+
+    if (!s_cfg_path[0]) {
+        fprintf(stderr, "nfsu2: setting %s=%s not saved (no settings path)\n", key, val);
+        return 0;
+    }
+    if (!cfg_save(key, val)) {
+        fprintf(stderr, "nfsu2: setting %s=%s not saved (write failed)\n", key, val);
+        return 0;
+    }
+    fprintf(stderr, "nfsu2: setting %s=%s saved\n", key, val);
+    return 1;
+}
+
 float nfsu2_cfg_overlay_alpha(void)
 {
     const char *v = cfg_get("NFSU2_OVERLAY_ALPHA");
@@ -551,7 +776,7 @@ int main(int argc, char **argv)
     /* Redirect the log FIRST so main-thread init output is captured. */
     ios_log_to_documents();
     setvbuf(stderr, NULL, _IONBF, 0);
-    fprintf(stderr, "nfsu2: build v22 (MoltenVK async submits + high-priority queue, background drain handshake, suboptimal swapchain limiter)\n");
+    fprintf(stderr, "nfsu2: build v23 (v22 async submits/drain handshake/swapchain limiter + frame lag and quiet log by default, settings menu, touch v2 Drive layout/haptics/tilt, keyboard)\n");
     fprintf(stderr, "nfsu2: HOME=%s TMPDIR=%s\n",
             getenv("CFFIXED_USER_HOME") ? getenv("CFFIXED_USER_HOME") : "(unset)",
             getenv("TMPDIR") ? getenv("TMPDIR") : "(unset)");
@@ -604,6 +829,15 @@ int main(int argc, char **argv)
         setenv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS", "0", 0);
         fprintf(stderr, "nfsu2: MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS=%s\n",
                 getenv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS"));
+        /* iOS defaults, set here on the main thread before any other
+         * thread reads the environment; a key in nfsu2_env.txt wins.
+         * Frame lag: the game waits on the previous frame's fence, so game
+         * code and the executor overlap (Eden race 9-18 -> 21-24 fps; the
+         * log says "[D3D] frame fence: previous frame"). Quiet: every log
+         * line is an unbuffered write to Documents; drop the kernel and
+         * executor chatter, as on the Switch. */
+        setenv("RECOMP_FRAME_LAG", "1", 0);
+        setenv("RECOMP_QUIET", "1", 0);
     }
     {
         extern void nv2a_vk_set_window(void *win);
@@ -632,7 +866,15 @@ int main(int argc, char **argv)
             struct sdl_syswm_info smi;
             memset(&smi, 0, sizeof smi);
             smi.version_major = 2; smi.version_minor = 30; smi.version_patch = 9;
-            if (SDL_GetWindowWMInfo(win, &smi) && smi.subsystem == SDL_SYSWM_UIKIT) {
+            /* NFSU2_OVERLAY=0 (nfsu2_env.txt, loaded above): skip the whole
+             * UIKit overlay -- drawings, gear/settings panel, haptics, tilt
+             * and the keyboard observer (ios_keyboard_install runs from it).
+             * Touch input itself still works. A way in if the overlay ever
+             * breaks launch. */
+            const char *ov = getenv("NFSU2_OVERLAY");
+            if (ov && ov[0] == '0') {
+                fprintf(stderr, "nfsu2: touch overlay off (NFSU2_OVERLAY=0)\n");
+            } else if (SDL_GetWindowWMInfo(win, &smi) && smi.subsystem == SDL_SYSWM_UIKIT) {
                 extern void ios_touch_overlay_install(void *uiwindow);
                 ios_touch_overlay_install(smi.info.uikit.window);
                 fprintf(stderr, "nfsu2: touch overlay installed\n");
@@ -741,7 +983,7 @@ static int game_main(void)
 #ifdef NFSU2_IOS
     ios_log_to_documents();
     setvbuf(stderr, NULL, _IONBF, 0);
-    fprintf(stderr, "nfsu2: build v22 (MoltenVK async submits + high-priority queue, background drain handshake, suboptimal swapchain limiter)\n");
+    fprintf(stderr, "nfsu2: build v23 (v22 async submits/drain handshake/swapchain limiter + frame lag and quiet log by default, settings menu, touch v2 Drive layout/haptics/tilt, keyboard)\n");
     fprintf(stderr, "nfsu2: HOME=%s CFFIXED_USER_HOME=%s TMPDIR=%s\n",
             getenv("HOME") ? getenv("HOME") : "(unset)",
             getenv("CFFIXED_USER_HOME") ? getenv("CFFIXED_USER_HOME") : "(unset)",
@@ -814,11 +1056,33 @@ static int game_main(void)
     fprintf(stderr, "nfsu2: loading %s\n", xbe_path);
 #endif
 
-    xbe_data = load_file(xbe_path, &xbe_size);
+    /* A disc image (.iso) instead of the extracted folder. After the iOS
+     * layout probe so a folder that holds default.xbe still wins. If the image
+     * has no usable default.xbe the folder path below is tried. */
+    xbe_data = NULL;
+    if (xiso_autodetect(game_dir)) {
+        xbe_data = xiso_read_file("default.xbe", &xbe_size);
+        if (!xbe_data) {
+            fprintf(stderr, "[XISO] no default.xbe in %s, using the game folder\n",
+                    xiso_image_path());
+            xiso_unmount();
+        } else if (!check_disc_identity((const uint8_t *)xbe_data, xbe_size)) {
+            fatal("This disc image is not Need for Speed: Underground 2 "
+                  "(NTSC-U Xbox). See the log for the title ID found.");
+            free(xbe_data);
+            xiso_unmount();
+            return 1;
+        } else {
+            snprintf(xbe_path, sizeof(xbe_path), "%s:/default.xbe",
+                     xiso_image_path());
+        }
+    }
+    if (!xbe_data)
+        xbe_data = load_file(xbe_path, &xbe_size);
     if (!xbe_data) {
         fprintf(stderr, "cannot read %s\n", xbe_path);
-        fatal("Failed to load default.xbe. Put the extracted disc in the game "
-              "directory (or set NFSU2_GAME_DIR).");
+        fatal("Failed to load default.xbe. Put the extracted disc or a single .iso in the game "
+              "directory (or set NFSU2_GAME_DIR / NFSU2_ISO).");
         return 1;
     }
     printf("XBE %s: %zu bytes\n", xbe_path, xbe_size);
