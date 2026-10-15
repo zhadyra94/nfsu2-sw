@@ -988,7 +988,7 @@ only, never files): `../IOS_IMPROVEMENT_MAP.md`.
   runtime zone table (hit-testing and drawing share it); display link runs
   only while touched/animating, woken by an activity hook on every finger
   down (`NFSU2_OVERLAY_WATCH=1` = old 20 Hz timer). DRIVE layout by
-  function (GAS/BRAKE analog pedals `NFSU2_ANALOG_PEDALS`, fixed steering
+  function (GAS/BRAKE full-press pedals, analog opt-in `NFSU2_ANALOG_PEDALS=1`, fixed steering
   strip `NFSU2_STEER`/`NFSU2_STEER_SENS`, NOS, E-BRAKE, SHIFT, LOOK, CAM;
   `NFSU2_DRIVE_CLASSIC=1` = old table). Captions/icons per zone
   (`NFSU2_TOUCH_CAPTIONS`). Layout editor: per-zone overrides in C
@@ -1003,6 +1003,12 @@ only, never files): `../IOS_IMPROVEMENT_MAP.md`.
   deadzone rescaled, out = sign(d)*a^curve (`NFSU2_STEER_CURVE` 1.0-2.0,
   default 1.35); absolute = old centre-based strip. A saved editor
   override of the strip (zone id 12) keeps the old width until Reset.
+- **Full-press pedals (v28):** DRIVE GAS and BRAKE read 255 for any touch
+  position; the v24 analog slide (255 down to 90 at the bottom) is opt-in with
+  `NFSU2_ANALOG_PEDALS=1` (panel row "Analog pedals", default off). The user
+  found sliding gas and brake inconvenient on glass. A saved
+  `NFSU2_ANALOG_PEDALS=1` in `nfsu2_env.txt` still wins. The launcher has no
+  pedal row. Device-unverified.
 - **Layout geometry order** (`zones_rebuild_locked`): preset -> editor
   override -> Size -> aspect shape (round zones keep their phone shape in
   points when the window aspect is >10% off 852/393; `NFSU2_TOUCH_ROUND=0`)

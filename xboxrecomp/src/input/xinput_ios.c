@@ -26,8 +26,9 @@
  * (16:9 until the first one arrives; iOS reports the window as it is
  * created, well before the title's first poll in practice).
  *
- * DRIVE adds two things on top of the zones: analog pedals (GAS / BRAKE read
- * lower as the thumb slides down the pedal, NFSU2_ANALOG_PEDALS) and a
+ * DRIVE adds two things on top of the zones: pedals (GAS / BRAKE are a full
+ * press wherever the thumb is; NFSU2_ANALOG_PEDALS=1 opts into analog ones that
+ * read lower as the thumb slides down the pedal) and a
  * steering strip (a zone whose finger x is the left stick X, relative to the
  * touch-down point by default; NFSU2_STEER / NFSU2_STEER_SENS /
  * NFSU2_STEER_MODE / NFSU2_STEER_CURVE). Both, the old DRIVE table
@@ -208,7 +209,7 @@ static int   s_steer_on = 1;          /* NFSU2_STEER: the strip exists in DRIVE 
 static float s_steer_sens = 1.0f;     /* NFSU2_STEER_SENS, 0.5..2.0 */
 static int   s_steer_rel = 1;         /* NFSU2_STEER_MODE: 1 relative, 0 absolute */
 static float s_steer_curve = 1.35f;   /* NFSU2_STEER_CURVE, 1.0..2.0 (relative mode) */
-static int   s_analog_pedals = 1;     /* NFSU2_ANALOG_PEDALS */
+static int   s_analog_pedals;         /* NFSU2_ANALOG_PEDALS (0 default: full press) */
 
 /* The strip keeps its width at every size setting (in absolute mode the
  * steering gain follows its half-width, so the size slider must not change the
@@ -513,7 +514,7 @@ static void touch_prefs_once(void)
             float k = (float)atof(v);
             s_scale = !(k >= 0.7f) ? 0.7f : k > 1.5f ? 1.5f : k;
         }
-        s_analog_pedals = env_switch("NFSU2_ANALOG_PEDALS", 1);
+        s_analog_pedals = env_switch("NFSU2_ANALOG_PEDALS", 0);
         s_steer_on = env_switch("NFSU2_STEER", 1);
         s_drive_classic = env_switch("NFSU2_DRIVE_CLASSIC", 0);
         v = getenv("NFSU2_STEER_SENS");
@@ -574,8 +575,8 @@ void xbox_ios_touch_set_scale(float k)
     SDL_UnlockMutex(s_lock);
 }
 
-/* Analog pedals on / off (NFSU2_ANALOG_PEDALS): off = GAS / BRAKE read a flat
- * 255 as before. No finger is dropped: the next poll just reads the other
+/* Analog pedals on / off (NFSU2_ANALOG_PEDALS, off by default): off = GAS /
+ * BRAKE read a flat 255 wherever the finger is. No finger is dropped: the next poll just reads the other
  * rule. */
 void xbox_ios_touch_set_analog_pedals(int on)
 {
@@ -960,8 +961,8 @@ static SHORT to_short(float v)
     return (SHORT)n;
 }
 
-/* Analog pedals (DRIVE, the LT / RT zones): the value follows the finger's
- * height inside the zone. The upper PEDAL_FULL (60 %) of the pedal is full
+/* Analog pedals (opt-in, NFSU2_ANALOG_PEDALS=1; DRIVE, the LT / RT zones): the
+ * value follows the finger's height inside the zone. The upper PEDAL_FULL (60 %) of the pedal is full
  * travel; from there it eases linearly to PEDAL_MIN_BYTE at the very bottom,
  * so sliding the thumb down eases off while a normal tap anywhere in the
  * middle stays at 255. A latched finger that leaves the zone is clamped to

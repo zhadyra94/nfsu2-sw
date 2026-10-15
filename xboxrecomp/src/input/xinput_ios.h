@@ -25,8 +25,8 @@
 
 /* What a zone drives. ZONE_FLAG sets a wButtons bit (ZONE's `value` is the
  * XBOX_GAMEPAD_* flag), ZONE_ANALOG presses an analog button (`value` is an
- * XBOX_BUTTON_* index, pressed = 255; the DRIVE pedals read lower when the
- * thumb slides down the pedal, see NFSU2_ANALOG_PEDALS), ZONE_DPAD maps the
+ * XBOX_BUTTON_* index, pressed = 255; the DRIVE pedals do too unless the opt-in
+ * NFSU2_ANALOG_PEDALS=1 makes them read lower as the thumb slides down), ZONE_DPAD maps the
  * touch's offset from the zone centre to D-pad flags (diagonals included),
  * ZONE_STEER (DRIVE only) is a strip: the finger's x is the left stick X,
  * relative to where it touched down (default) or to the strip's centre
@@ -130,9 +130,10 @@ void  xbox_ios_touch_set_tablet_scale(float k);
 
 /* Drive feel switches (each also an env key read at the first use; the
  * setters are for the settings panel and the harness):
- *   analog pedals   NFSU2_ANALOG_PEDALS (1)  DRIVE GAS / BRAKE value from the
+ *   analog pedals   NFSU2_ANALOG_PEDALS (0)  1 = DRIVE GAS / BRAKE value from the
  *                   finger's height: 255 in the upper 60 % of the pedal, then
- *                   linearly down to 90 at the very bottom. 0 = flat 255.
+ *                   linearly down to 90 at the very bottom. 0 (default) = a full
+ *                   press, flat 255, wherever the finger is.
  *   steering strip  NFSU2_STEER (1)          the STEER zone exists in DRIVE;
  *                   set_steer rebuilds the table and clears all fingers.
  *   strip mode      NFSU2_STEER_MODE (relative)  relative | absolute (any case).

@@ -2200,11 +2200,13 @@ static const PanelItem s_items[] = {
     /* Closes the panel and moves / resizes the controls of the current layout. */
     { .kind = IK_BUTTON, .title = "Edit layout…", .act = ACT_EDITLAYOUT },
 
-    /* Drive layout: pedal value from the finger's height; the steering strip
-     * (a switch back to the dynamic stick) and its gain; tilt as a wheel. */
+    /* Drive layout: pedal value from the finger's height (opt-in; off = a full
+     * press anywhere on the pedal); the steering strip (a switch back to the
+     * dynamic stick) and its gain; tilt as a wheel. */
     { .kind = IK_SUB, .title = "Driving" },
     { .kind = IK_SWITCH, .title = "Analog pedals", .key = "NFSU2_ANALOG_PEDALS",
-      .on = "1", .off = "0", .def_on = 1, .act = ACT_ANALOG },
+      .on = "1", .off = "0", .def_on = 0, .act = ACT_ANALOG,
+      .note = "Off: gas and brake are a full press anywhere on the pedal" },
     { .kind = IK_SWITCH, .title = "Steering strip (Drive layout)", .key = "NFSU2_STEER",
       .on = "1", .off = "0", .def_on = 1, .act = ACT_STEER },
     /* Relative: the touch-down point in the strip is straight ahead and a short
@@ -3073,9 +3075,12 @@ void ios_touch_overlay_install(void *uiwindow)
         xbox_ios_touch_set_press_hook(touch_press_hook);
         /* Drive-feel settings: the layer already read its env defaults; a
          * stored value wins here. */
-        v = nfsu2_cfg_get("NFSU2_ANALOG_PEDALS");
-        if (v && *v)
-            xbox_ios_touch_set_analog_pedals(!(*v == '0'));
+        {
+            int di;
+            for (di = 0; di < ITEM_COUNT; di++)
+                if (s_items[di].act == ACT_ANALOG && nfsu2_cfg_get(s_items[di].key))
+                    xbox_ios_touch_set_analog_pedals(item_is_on(&s_items[di]));
+        }
         v = nfsu2_cfg_get("NFSU2_STEER_SENS");
         if (v && *v)
             xbox_ios_touch_set_steer_sens((float)atof(v));

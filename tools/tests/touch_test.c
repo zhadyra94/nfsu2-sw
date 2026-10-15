@@ -154,7 +154,7 @@ static void lift_all(void)
 }
 
 /* Back to a known state: touch on, PAD layout, scale 1, no tilt, no hooks,
- * analog pedals on, steering strip on at sensitivity 1 in the shipping mode
+ * analog pedals off (the default: a full press), steering strip on at sensitivity 1 in the shipping mode
  * (relative, curve 1.35), new DRIVE table, no
  * geometry overrides, no safe area, aspect unknown, round shape on, tablet
  * factor 1.0, no fingers, 16:9 window. The setters clear all fingers by contract; the
@@ -164,7 +164,7 @@ static void reset(void)
     xbox_ios_touch_set_press_hook(NULL);
     xbox_ios_touch_set_activity_hook(NULL);
     xbox_ios_touch_set_enabled(1);
-    xbox_ios_touch_set_analog_pedals(1);
+    xbox_ios_touch_set_analog_pedals(0);
     xbox_ios_touch_set_steer(1);
     xbox_ios_touch_set_steer_sens(1.0f);
     xbox_ios_touch_set_steer_mode(1);
@@ -1533,6 +1533,7 @@ static void t_pedal_analog(void)
     XBOX_INPUT_STATE s;
     const XBOX_IOS_TOUCH_ZONE *z;
     reset();
+    xbox_ios_touch_set_analog_pedals(1);             /* opt-in */
     xbox_ios_touch_set_layout(1);
     pedal_ramp("GAS", XBOX_BUTTON_RTRIGGER);
     pedal_ramp("BRAKE", XBOX_BUTTON_LTRIGGER);
@@ -1583,15 +1584,45 @@ static void t_pedal_analog(void)
           "zone_value out of range should be 0");
 }
 
-/* 16b. Digital switch: set_analog_pedals(0) gives today's flat 255, live and
- * with a finger held. */
+/* 16b. The default is digital: GAS and BRAKE read a full 255 (zone_value 1) at
+ * the top, the middle and the bottom of the pedal. The analog switch works live
+ * with a finger held, both ways. */
 static void t_pedal_digital(void)
 {
+    static const struct { const char *label; int button; } pedals[] = {
+        { "GAS", XBOX_BUTTON_RTRIGGER }, { "BRAKE", XBOX_BUTTON_LTRIGGER } };
+    static const float fr[] = { 0.02f, 0.30f, 0.50f, 0.75f, 0.98f, 1.40f };
+    size_t p, k;
     int zi;
     const XBOX_IOS_TOUCH_ZONE *z;
     XBOX_INPUT_STATE s;
     reset();
     xbox_ios_touch_set_layout(1);
+    for (p = 0; p < sizeof pedals / sizeof pedals[0]; p++) {
+        zi = zone_by_label(pedals[p].label);
+        z = zone(zi);
+        if (!z)
+            continue;
+        for (k = 0; k < sizeof fr / sizeof fr[0]; k++) {
+            /* A fresh touch at each height (the zone latches at touch-down), and the same
+             * finger slid there. */
+            if (fr[k] <= 1.0f) {
+                fdown(1, z->cx, zone_y(z, fr[k]));
+                s = rd();
+                expect_only_analog(&s, pedals[p].button, "default pedal, touch-down height");
+                CHECK(xbox_ios_touch_zone_value(zi) == 1.0f, "%s touch-down at %.2f: zone_value %.3f, want 1",
+                      pedals[p].label, fr[k], xbox_ios_touch_zone_value(zi));
+                fup(1);
+            }
+            fdown(1, z->cx, z->cy);
+            fmove(1, z->cx, zone_y(z, fr[k]));
+            s = rd();
+            expect_only_analog(&s, pedals[p].button, "default pedal, slid height");
+            CHECK(xbox_ios_touch_zone_value(zi) == 1.0f, "%s slid to %.2f: zone_value %.3f, want 1",
+                  pedals[p].label, fr[k], xbox_ios_touch_zone_value(zi));
+            fup(1);
+        }
+    }
     zi = zone_by_label("GAS");
     z = zone(zi);
     if (!z)
@@ -1599,17 +1630,16 @@ static void t_pedal_digital(void)
     fdown(1, z->cx, z->cy);
     fmove(1, z->cx, zone_y(z, 1.0f));
     s = rd();
+    expect_only_analog(&s, XBOX_BUTTON_RTRIGGER, "digital GAS at the bottom");
+    xbox_ios_touch_set_analog_pedals(1);            /* the finger stays */
+    s = rd();
     CHECK(abs(analog_of(&s, XBOX_BUTTON_RTRIGGER) - PEDAL_LOW_BYTE) <= 1, "analog GAS bottom %d",
           analog_of(&s, XBOX_BUTTON_RTRIGGER));
-    xbox_ios_touch_set_analog_pedals(0);            /* the finger stays */
+    xbox_ios_touch_set_analog_pedals(0);
     s = rd();
-    expect_only_analog(&s, XBOX_BUTTON_RTRIGGER, "digital GAS at the bottom (finger held across the switch)");
+    expect_only_analog(&s, XBOX_BUTTON_RTRIGGER, "digital again (finger held across both switches)");
     CHECK(xbox_ios_touch_zone_value(zi) == 1.0f, "digital zone_value %.3f, want 1",
           xbox_ios_touch_zone_value(zi));
-    xbox_ios_touch_set_analog_pedals(1);
-    s = rd();
-    CHECK(abs(analog_of(&s, XBOX_BUTTON_RTRIGGER) - PEDAL_LOW_BYTE) <= 1, "analog again: %d",
-          analog_of(&s, XBOX_BUTTON_RTRIGGER));
     fup(1);
 }
 
@@ -1619,6 +1649,7 @@ static void t_pedal_two_fingers(void)
     const XBOX_IOS_TOUCH_ZONE *z;
     XBOX_INPUT_STATE s;
     reset();
+    xbox_ios_touch_set_analog_pedals(1);             /* opt-in */
     xbox_ios_touch_set_layout(1);
     z = zone(zone_by_label("GAS"));
     if (!z)
@@ -2573,6 +2604,7 @@ static void t_drive_classic(void)
     for (i = 0; i < zcount(); i++)
         CHECK(xbox_ios_touch_zone_style(i) != XBOX_IOS_STYLE_OTHER, "classic zone %d has style OTHER", i);
     /* Pedals still honour the analog switch. */
+    xbox_ios_touch_set_analog_pedals(1);
     {
         const XBOX_IOS_TOUCH_ZONE *g = zone(zone_by_label("GAS"));
         if (g) {
@@ -2641,7 +2673,8 @@ static int env_child(const char *what)
             if (fabsf(big / small - 1.5f) > 1e-4f) fails++;
         }
     } else if (!strcmp(what, "analog0")) {
-        /* NFSU2_ANALOG_PEDALS=0: the DRIVE pedals read a flat 255 everywhere. */
+        /* NFSU2_ANALOG_PEDALS=0: the DRIVE pedals read a flat 255 everywhere; the
+         * panel can turn the analog ones on. */
         setenv("NFSU2_TOUCH_LAYOUT", "drive", 1);
         setenv("NFSU2_ANALOG_PEDALS", "0", 1);
         if (xbox_ios_touch_init() != 1) fails++;
@@ -2671,8 +2704,37 @@ static int env_child(const char *what)
         }
         fails += g_nfail_checks;
     } else if (!strcmp(what, "analog1")) {
-        /* The default: analog on in DRIVE. */
+        /* The default: full-press pedals (255 at the top, middle and bottom of GAS
+         * and BRAKE, zone_value 1), the strip on. */
+        static const char *const labels[2] = { "GAS", "BRAKE" };
+        static const int buttons[2] = { XBOX_BUTTON_RTRIGGER, XBOX_BUTTON_LTRIGGER };
+        static const float fr[3] = { 0.03f, 0.50f, 0.97f };
+        int p, k;
         setenv("NFSU2_TOUCH_LAYOUT", "drive", 1);
+        if (xbox_ios_touch_init() != 1) fails++;
+        for (p = 0; p < 2; p++) {
+            int zi = zone_by_label(labels[p]);
+            const XBOX_IOS_TOUCH_ZONE *g = zone(zi);
+            if (!g) {
+                fails++;
+                continue;
+            }
+            for (k = 0; k < 3; k++) {
+                fdown(1, g->cx, zone_y(g, fr[k]));
+                s = rd();
+                CHECK(analog_of(&s, buttons[p]) == 255, "default: %s at %.2f reads %d, want 255", labels[p], fr[k],
+                      analog_of(&s, buttons[p]));
+                CHECK(xbox_ios_touch_zone_value(zi) == 1.0f, "default: %s zone_value %.3f", labels[p],
+                      xbox_ios_touch_zone_value(zi));
+                fup(1);
+            }
+        }
+        CHECK(zone_find_kind(XBOX_IOS_ZONE_STEER) >= 0, "default DRIVE has no strip");
+        fails += g_nfail_checks;
+    } else if (!strcmp(what, "analog_on")) {
+        /* NFSU2_ANALOG_PEDALS=1: the opt-in analog pedals. */
+        setenv("NFSU2_TOUCH_LAYOUT", "drive", 1);
+        setenv("NFSU2_ANALOG_PEDALS", "1", 1);
         if (xbox_ios_touch_init() != 1) fails++;
         {
             const XBOX_IOS_TOUCH_ZONE *g = zone(zone_by_label("GAS"));
@@ -2680,11 +2742,12 @@ static int env_child(const char *what)
                 fdown(1, g->cx, g->cy);
                 fmove(1, g->cx, zone_y(g, 1.0f));
                 s = rd();
-                CHECK(abs(analog_of(&s, XBOX_BUTTON_RTRIGGER) - 90) <= 1, "default: GAS bottom %d, want 90",
+                CHECK(abs(analog_of(&s, XBOX_BUTTON_RTRIGGER) - 90) <= 1, "env analog on: GAS bottom %d, want 90",
                       analog_of(&s, XBOX_BUTTON_RTRIGGER));
                 fup(1);
+            } else {
+                fails++;
             }
-            CHECK(zone_find_kind(XBOX_IOS_ZONE_STEER) >= 0, "default DRIVE has no strip");
         }
         fails += g_nfail_checks;
     } else if (!strcmp(what, "steer0")) {
@@ -3962,8 +4025,9 @@ int main(void)
     env_case("ENV   RECOMP_TOUCH=0: init reports off, state 0, panel can enable", "off");
     env_case("ENV   NFSU2_TOUCH_LAYOUT=drive selects the DRIVE zones", "drive");
     env_case("ENV   NFSU2_TOUCH_SCALE=9 clamps to 1.5", "scale");
-    env_case("ENV   default DRIVE: analog pedals and the strip are on", "analog1");
-    env_case("ENV   NFSU2_ANALOG_PEDALS=0: DRIVE pedals digital 255", "analog0");
+    env_case("ENV   default DRIVE: pedals are a full press, the strip is on", "analog1");
+    env_case("ENV   NFSU2_ANALOG_PEDALS=0: DRIVE pedals digital 255; panel can enable", "analog0");
+    env_case("ENV   NFSU2_ANALOG_PEDALS=1: analog DRIVE pedals (opt-in)", "analog_on");
     env_case("ENV   NFSU2_STEER=0: no strip in DRIVE", "steer0");
     env_case("ENV   NFSU2_STEER_SENS=9 clamps to 2 (relative travel)", "sens2");
     env_case("ENV   NFSU2_STEER_MODE=absolute + SENS=9: old strip gain", "sens2abs");
@@ -4021,8 +4085,8 @@ int main(void)
     run_case("15d  zone_caption() / zone_icon(): PAD, DRIVE, classic DRIVE, out of range", t_caption_icon, NULL);
     run_case("15b  dpad_bits(): arms held, matches the state, cleared on lift", t_dpad_bits, NULL);
     run_case("15c  layout_gen(): moves on rebuild only", t_layout_gen, NULL);
-    run_case("16   Analog pedals: ~90 at the bottom, 255 from the 40% mark up, DRIVE only", t_pedal_analog, NULL);
-    run_case("16b  Analog pedals switch: digital 255, live with a finger held", t_pedal_digital, NULL);
+    run_case("16   Analog pedals (opt-in): ~90 at the bottom, 255 from the 40% mark up, DRIVE only", t_pedal_analog, NULL);
+    run_case("16b  Default pedals: GAS / BRAKE 255 at top, middle, bottom; analog switch live", t_pedal_digital, NULL);
     run_case("16c  Two fingers on one pedal: the higher value", t_pedal_two_fingers, NULL);
     run_case("17   Steering strip: deflection, deadzone, clamp, Y 0, latch, release", t_steer_strip, NULL);
     run_case("17b  Steering strip sensitivity 0.5..2, live", t_steer_sens, NULL);
