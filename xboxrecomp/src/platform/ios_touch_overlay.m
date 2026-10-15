@@ -3,7 +3,8 @@
  * Pure UIKit/QuartzCore: a transparent view whose layer holds one small CALayer
  * subtree per touch zone (built from the same table the touch layer
  * hit-tests, xinput_ios.c; the DRIVE steering strip has a knob, the pedals an
- * analog fill) plus two floating stick layers. Nothing is drawn
+ * analog fill when that opt-in is on) plus two floating stick layers (PAD, classic
+ * DRIVE, NFSU2_DRIVE_STICKS=1; the new DRIVE layout has none). Nothing is drawn
  * with drawRect: layers are rebuilt when the zone table or the bounds change
  * and updated by index when a pressed state changes. The overlay itself
  * never takes touches except the gear button (hitTest: returns nil for
@@ -52,6 +53,8 @@ extern void xbox_ios_touch_set_scale(float k);
 extern void xbox_ios_touch_set_press_hook(void (*hook)(int zone_idx));
 extern void xbox_ios_touch_set_activity_hook(void (*hook)(void));   /* any finger down */
 extern void xbox_ios_touch_set_analog_pedals(int on);
+extern void xbox_ios_touch_set_drive_sticks(int on);       /* NFSU2_DRIVE_STICKS */
+extern int  xbox_ios_touch_sticks_enabled(void);           /* 0 in DRIVE without them */
 extern void xbox_ios_touch_set_steer(int on);
 extern void xbox_ios_touch_set_steer_sens(float k);
 extern void xbox_ios_touch_set_steer_mode(int relative);   /* NFSU2_STEER_MODE: 1 relative, 0 absolute */
@@ -1337,8 +1340,12 @@ static void path_add_rect(UIBezierPath *p, CGRect r)
     }
 
     /* Floating sticks: base ring radius 0.12 of the width (the touch layer's
-     * full travel), knob 0.42 of that. Hidden until a finger drives them. */
-    {
+     * full travel), knob 0.42 of that. Hidden until a finger drives them. None
+     * where the layout has no floating sticks (DRIVE; a setting change bumps the
+     * layout generation, so this runs again). */
+    _stickOn[0] = NO;
+    _stickOn[1] = NO;
+    if (xbox_ios_touch_sticks_enabled()) {
         CGFloat R = 0.12 * W, kr = R * 0.42;
         UIColor *black = [UIColor blackColor];
         for (side = 0; side < 2; side++) {
@@ -1386,7 +1393,8 @@ static void path_add_rect(UIBezierPath *p, CGRect r)
 
 /* The two sticks: shown while a finger drives them, base ring at the
  * touch-down point, knob at the finger (clamped to full travel). Returns YES
- * while either is down. */
+ * while either is down. No layers (NO at once) where the layout has no
+ * floating sticks. */
 - (BOOL)syncSticks
 {
     CGFloat W = self.bounds.size.width, H = self.bounds.size.height;
@@ -1966,8 +1974,9 @@ static void refresh_shapes(void)
  * the link (30 fps) runs only while a zone is held or a stick is driven, and
  * pauses after 3 idle ticks. It wakes through three paths, together every way
  * the touch state or the visibility can change while it is paused:
- *   1. the touch layer's activity hook: ANY finger down (zone, steering strip,
- *      dynamic stick), posted to the main thread at once;
+ *   1. the touch layer's activity hook: ANY tracked finger down (zone, steering
+ *      strip, dynamic stick; bare screen in DRIVE is not tracked), posted to the
+ *      main thread at once;
  *   2. ios_touch_overlay_set_visible -> applyVisibility -> setShapesHidden:NO
  *      (a pad or keyboard leaves), which syncs and wakes;
  *   3. apply_live (the panel: touch on, layout, size, strip): syncs at once.
@@ -2152,7 +2161,7 @@ enum { ACT_NONE, ACT_FPS, ACT_TOUCH, ACT_LAYOUT, ACT_SCALE, ACT_ALPHA,
        ACT_HAPTICS, ACT_TILT, ACT_TILTSENS, ACT_KEYBOARD, ACT_RUMBLE,
        ACT_ANALOG, ACT_STEER, ACT_STEERSENS, ACT_TILTCENTRE, ACT_EDITLAYOUT,
        ACT_CAPTIONS, ACT_AUTOLAYOUT, ACT_SAFE, ACT_TABLET, ACT_HAPSTRENGTH,
-       ACT_STEERMODE, ACT_STEERCURVE };
+       ACT_STEERMODE, ACT_STEERCURVE, ACT_DRIVESTICKS };
 
 typedef struct {
     int         kind;
@@ -2209,6 +2218,11 @@ static const PanelItem s_items[] = {
       .note = "Off: gas and brake are a full press anywhere on the pedal" },
     { .kind = IK_SWITCH, .title = "Steering strip (Drive layout)", .key = "NFSU2_STEER",
       .on = "1", .off = "0", .def_on = 1, .act = ACT_STEER },
+    /* Off: a touch on bare screen in Drive does nothing (the strip still steers).
+     * The strip switch above off also brings the sticks back. */
+    { .kind = IK_SWITCH, .title = "Floating sticks in Drive", .key = "NFSU2_DRIVE_STICKS",
+      .on = "1", .off = "0", .def_on = 0, .act = ACT_DRIVESTICKS,
+      .note = "Off: bare screen does nothing while the steering strip is on" },
     /* Relative: the touch-down point in the strip is straight ahead and a short
      * drag (0.075 of the screen width / sensitivity) is full lock. Absolute: the
      * strip centre is straight ahead (the first version). */
@@ -2409,6 +2423,10 @@ static void apply_live(int act, int on, float fv, const char *sv)
     case ACT_STEER:
         xbox_ios_touch_set_steer(on);      /* rebuilds the table, clears fingers */
         (void)[s_ov syncControls];         /* strip appears / goes now */
+        break;
+    case ACT_DRIVESTICKS:
+        xbox_ios_touch_set_drive_sticks(on);   /* drops fingers, bumps the generation */
+        (void)[s_ov syncControls];             /* stick layers appear / go now */
         break;
     case ACT_STEERSENS:
         xbox_ios_touch_set_steer_sens(fv);
@@ -3080,6 +3098,12 @@ void ios_touch_overlay_install(void *uiwindow)
             for (di = 0; di < ITEM_COUNT; di++)
                 if (s_items[di].act == ACT_ANALOG && nfsu2_cfg_get(s_items[di].key))
                     xbox_ios_touch_set_analog_pedals(item_is_on(&s_items[di]));
+        }
+        {
+            int di;
+            for (di = 0; di < ITEM_COUNT; di++)
+                if (s_items[di].act == ACT_DRIVESTICKS && nfsu2_cfg_get(s_items[di].key))
+                    xbox_ios_touch_set_drive_sticks(item_is_on(&s_items[di]));
         }
         v = nfsu2_cfg_get("NFSU2_STEER_SENS");
         if (v && *v)

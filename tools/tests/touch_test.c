@@ -154,7 +154,8 @@ static void lift_all(void)
 }
 
 /* Back to a known state: touch on, PAD layout, scale 1, no tilt, no hooks,
- * analog pedals off (the default: a full press), steering strip on at sensitivity 1 in the shipping mode
+ * analog pedals off (the default: a full press), no floating sticks in
+ * DRIVE (the default), steering strip on at sensitivity 1 in the shipping mode
  * (relative, curve 1.35), new DRIVE table, no
  * geometry overrides, no safe area, aspect unknown, round shape on, tablet
  * factor 1.0, no fingers, 16:9 window. The setters clear all fingers by contract; the
@@ -165,6 +166,7 @@ static void reset(void)
     xbox_ios_touch_set_activity_hook(NULL);
     xbox_ios_touch_set_enabled(1);
     xbox_ios_touch_set_analog_pedals(0);
+    xbox_ios_touch_set_drive_sticks(0);
     xbox_ios_touch_set_steer(1);
     xbox_ios_touch_set_steer_sens(1.0f);
     xbox_ios_touch_set_steer_mode(1);
@@ -1932,6 +1934,7 @@ static void t_steer_priority(void)
     reset();
     xbox_ios_touch_set_steer_mode(0);
     xbox_ios_touch_set_layout(1);
+    xbox_ios_touch_set_drive_sticks(1);              /* the v27 sticks: the strip must outrank them */
     z = zone(strip_zone());
     if (!z)
         return;
@@ -2424,6 +2427,7 @@ static void t_activity_hook(void)
     int expect = 0;
     reset();
     xbox_ios_touch_set_layout(1);
+    xbox_ios_touch_set_drive_sticks(1);              /* dynamic sticks are tracked fingers */
     z = zone(strip_zone());
     a = zone(zone_by_label("GAS"));
     if (!z || !a)
@@ -2481,6 +2485,106 @@ static void t_activity_hook(void)
     CHECK(s_act_calls == expect, "hook fired after being cleared");
     lift_all();
     xbox_ios_touch_set_press_hook(NULL);
+}
+
+/* 18b. No floating sticks in DRIVE: a touch on bare screen is not tracked (idle
+ * state, no stick query, no hook, no finger slot), the strip / pedals / NOS
+ * still work together, tilt keeps steering, the switch restores the v27 sticks
+ * and drops a held stick finger. PAD is unchanged. */
+static void t_drive_nosticks(void)
+{
+    const XBOX_IOS_TOUCH_ZONE *z, *g, *nos;
+    XBOX_INPUT_STATE s;
+    float bx, by, kx, ky;
+    unsigned gen;
+    int k;
+
+    reset();
+    xbox_ios_touch_set_layout(1);
+    z = zone(strip_zone());
+    g = zone(zone_by_label("GAS"));
+    nos = zone(zone_by_label("NOS"));
+    if (!z || !g || !nos)
+        return;
+    require_bare(0.30f, 0.50f);
+    require_bare(0.60f, 0.50f);
+    CHECK(xbox_ios_touch_sticks_enabled() == 0, "DRIVE: sticks_enabled %d, want 0", xbox_ios_touch_sticks_enabled());
+
+    /* Bare areas do nothing and are not tracked at all. */
+    s_act_calls = 0;
+    xbox_ios_touch_set_activity_hook(act_hook);
+    for (k = 0; k < 8; k++)                           /* more than the tracked limit */
+        fdown(10 + k, (k & 1) ? 0.60f : 0.30f, 0.50f);
+    fmove(10, 0.30f + STICK_RADIUS, 0.50f);
+    fmove(11, 0.60f + STICK_RADIUS, 0.45f);
+    s = rd();
+    expect_idle(&s, "DRIVE: fingers on bare screen");
+    CHECK(xbox_ios_touch_stick(0, &bx, &by, &kx, &ky) == 0, "DRIVE: stick(0) reports a finger");
+    CHECK(xbox_ios_touch_stick(1, &bx, &by, &kx, &ky) == 0, "DRIVE: stick(1) reports a finger");
+    CHECK(s_act_calls == 0, "DRIVE: bare fingers fired the activity hook %d times", s_act_calls);
+    /* They took no slot: strip, GAS and NOS still work together. */
+    fdown(1, g->cx, g->cy);
+    fdown(2, nos->cx, nos->cy);
+    fdown(3, z->cx, z->cy);
+    CHECK(s_act_calls == 3, "DRIVE: %d hook calls for three control fingers, want 3", s_act_calls);
+    fmove(3, z->cx + REL_TRAVEL, z->cy);
+    s = rd();
+    CHECK(analog_of(&s, XBOX_BUTTON_RTRIGGER) == 255 && analog_of(&s, XBOX_BUTTON_B) == 255,
+          "strip + GAS + NOS: RT %d B %d, want 255 each", analog_of(&s, XBOX_BUTTON_RTRIGGER),
+          analog_of(&s, XBOX_BUTTON_B));
+    CHECK(abs(LX(s) - STICK_FULL) <= STICK_NEAR && s.Gamepad.sThumbLY == 0 && s.Gamepad.sThumbRX == 0 &&
+          s.Gamepad.sThumbRY == 0, "strip + GAS + NOS: stick (%d,%d,%d,%d), want full right only", LX(s),
+          s.Gamepad.sThumbLY, s.Gamepad.sThumbRX, s.Gamepad.sThumbRY);
+    CHECK(xbox_ios_touch_stick(0, &bx, &by, &kx, &ky) == 0, "DRIVE: the strip finger shows as a stick");
+    lift_all();
+    xbox_ios_touch_set_activity_hook(NULL);
+    s = rd();
+    expect_idle(&s, "DRIVE: all lifted");
+
+    /* Tilt keeps steering while a thumb rests on bare screen. */
+    xbox_ios_touch_set_tilt(0.5f, 1);
+    fdown(1, 0.30f, 0.50f);
+    s = rd();
+    expect_sticks(&s, 16383, 0, 0, 0, 2, "tilt with a finger on bare DRIVE screen");
+    lift_all();
+    xbox_ios_touch_set_tilt(0.0f, 0);
+
+    /* The switch: v27 sticks back; turning it off drops a held stick finger. */
+    gen = xbox_ios_touch_layout_gen();
+    xbox_ios_touch_set_drive_sticks(1);
+    CHECK(xbox_ios_touch_layout_gen() != gen, "set_drive_sticks did not bump the layout generation");
+    CHECK(xbox_ios_touch_sticks_enabled() == 1, "sticks on: sticks_enabled %d", xbox_ios_touch_sticks_enabled());
+    fdown(1, 0.30f, 0.50f);
+    fmove(1, 0.30f + STICK_RADIUS, 0.50f);
+    s = rd();
+    expect_sticks(&s, STICK_FULL, 0, 0, 0, STICK_NEAR, "DRIVE with sticks on");
+    CHECK(xbox_ios_touch_stick(0, &bx, &by, &kx, &ky) == 1, "sticks on: stick(0) reports no finger");
+    xbox_ios_touch_set_drive_sticks(0);
+    s = rd();
+    expect_idle(&s, "stick finger held while the sticks were switched off");
+    CHECK(xbox_ios_touch_stick(0, &bx, &by, &kx, &ky) == 0, "stale stick(0) after the switch");
+    fmove(1, 0.30f + STICK_RADIUS, 0.50f);          /* the dropped finger stays dead */
+    s = rd();
+    expect_idle(&s, "dropped stick finger moves on");
+    lift_all();
+
+    /* Sticks stay where they were: classic DRIVE, strip switched off, PAD. */
+    xbox_ios_touch_set_drive_classic(1);
+    CHECK(xbox_ios_touch_sticks_enabled() == 1, "classic DRIVE: sticks_enabled %d, want 1",
+          xbox_ios_touch_sticks_enabled());
+    xbox_ios_touch_set_drive_classic(0);
+    xbox_ios_touch_set_steer(0);
+    CHECK(xbox_ios_touch_sticks_enabled() == 1, "strip off: sticks_enabled %d, want 1",
+          xbox_ios_touch_sticks_enabled());
+    xbox_ios_touch_set_steer(1);
+    xbox_ios_touch_set_layout(0);
+    CHECK(xbox_ios_touch_sticks_enabled() == 1, "PAD: sticks_enabled %d, want 1", xbox_ios_touch_sticks_enabled());
+    fdown_bare(1, 0.30f, 0.50f);
+    fmove(1, 0.30f + STICK_RADIUS, 0.50f);
+    s = rd();
+    expect_sticks(&s, STICK_FULL, 0, 0, 0, STICK_NEAR, "PAD left stick");
+    CHECK(xbox_ios_touch_stick(0, &bx, &by, &kx, &ky) == 1, "PAD: stick(0) reports no finger");
+    lift_all();
 }
 
 /* 19. DRIVE geometry on an 852x393 screen: nothing overlaps, nothing meets the
@@ -2638,6 +2742,7 @@ static int env_child(const char *what)
     unsetenv("NFSU2_TOUCH_LAYOUT");
     unsetenv("NFSU2_TOUCH_SCALE");
     unsetenv("NFSU2_ANALOG_PEDALS");
+    unsetenv("NFSU2_DRIVE_STICKS");
     unsetenv("NFSU2_STEER");
     unsetenv("NFSU2_STEER_SENS");
     unsetenv("NFSU2_STEER_MODE");
@@ -2730,6 +2835,26 @@ static int env_child(const char *what)
             }
         }
         CHECK(zone_find_kind(XBOX_IOS_ZONE_STEER) >= 0, "default DRIVE has no strip");
+        fails += g_nfail_checks;
+    } else if (!strcmp(what, "sticks_default") || !strcmp(what, "sticks_on")) {
+        /* Default: no floating sticks in DRIVE. NFSU2_DRIVE_STICKS=1: the v27 sticks. */
+        int want = !strcmp(what, "sticks_on");
+        setenv("NFSU2_TOUCH_LAYOUT", "drive", 1);
+        if (want)
+            setenv("NFSU2_DRIVE_STICKS", "1", 1);
+        if (xbox_ios_touch_init() != 1) fails++;
+        {
+            float bx, by, kx, ky;
+            require_bare(0.30f, 0.50f);
+            CHECK(xbox_ios_touch_sticks_enabled() == want, "env %s: sticks_enabled %d", what,
+                  xbox_ios_touch_sticks_enabled());
+            fdown(1, 0.30f, 0.50f);
+            fmove(1, 0.30f + STICK_RADIUS, 0.50f);
+            s = rd();
+            CHECK(abs(LX(s) - (want ? STICK_FULL : 0)) <= STICK_NEAR, "env %s: bare touch gives LX=%d", what, LX(s));
+            CHECK(xbox_ios_touch_stick(0, &bx, &by, &kx, &ky) == want, "env %s: stick(0) wrong", what);
+            fup(1);
+        }
         fails += g_nfail_checks;
     } else if (!strcmp(what, "analog_on")) {
         /* NFSU2_ANALOG_PEDALS=1: the opt-in analog pedals. */
@@ -4028,6 +4153,8 @@ int main(void)
     env_case("ENV   default DRIVE: pedals are a full press, the strip is on", "analog1");
     env_case("ENV   NFSU2_ANALOG_PEDALS=0: DRIVE pedals digital 255; panel can enable", "analog0");
     env_case("ENV   NFSU2_ANALOG_PEDALS=1: analog DRIVE pedals (opt-in)", "analog_on");
+    env_case("ENV   default DRIVE: no floating sticks", "sticks_default");
+    env_case("ENV   NFSU2_DRIVE_STICKS=1: the v27 sticks in DRIVE", "sticks_on");
     env_case("ENV   NFSU2_STEER=0: no strip in DRIVE", "steer0");
     env_case("ENV   NFSU2_STEER_SENS=9 clamps to 2 (relative travel)", "sens2");
     env_case("ENV   NFSU2_STEER_MODE=absolute + SENS=9: old strip gain", "sens2abs");
@@ -4042,6 +4169,7 @@ int main(void)
     unsetenv("NFSU2_TOUCH_LAYOUT");
     unsetenv("NFSU2_TOUCH_SCALE");
     unsetenv("NFSU2_ANALOG_PEDALS");
+    unsetenv("NFSU2_DRIVE_STICKS");
     unsetenv("NFSU2_STEER");
     unsetenv("NFSU2_STEER_SENS");
     unsetenv("NFSU2_STEER_MODE");
@@ -4099,6 +4227,7 @@ int main(void)
     run_case("17i  Steering curve: 1.0 linear, 2.0 squared, clamps, absolute ignores it, live mode switch", t_steer_curve, NULL);
     run_case("17j  Relative steering ignores strip size / place; setters keep fingers; two strip fingers", t_steer_rel_indep, NULL);
     run_case("18   Activity hook: every tracked finger down, not moves / repeats / off", t_activity_hook, NULL);
+    run_case("18b  DRIVE has no floating sticks: bare screen untracked, strip + GAS + NOS, tilt, switch, PAD unchanged", t_drive_nosticks, NULL);
     run_case("19   DRIVE geometry on 852x393: no overlap, off the island, sizes", t_drive_geometry, NULL);
     run_case("20   NFSU2_DRIVE_CLASSIC / set_drive_classic: the old table", t_drive_classic, NULL);
     run_case("21   Layout editor: set_geom moves the hit area (scale applied)", t_geom_move, NULL);

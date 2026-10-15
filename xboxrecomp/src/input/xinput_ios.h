@@ -153,8 +153,19 @@ void  xbox_ios_touch_set_tablet_scale(float k);
  *                   mode ignores it, so it stays today's behaviour.
  *   old DRIVE       NFSU2_DRIVE_CLASSIC (0)  1 = the pre-strip DRIVE table and
  *                   its A / B / X / Y / LB / RB labels (no STEER zone).
+ *   DRIVE sticks    NFSU2_DRIVE_STICKS (0)   PAD has dynamic (floating) sticks: a
+ *                   touch on bare screen is that half's stick. The new DRIVE
+ *                   table has none: a touch on bare screen is not tracked at all
+ *                   (no finger slot, no activity hook, no stick state, tilt
+ *                   keeps steering). 1 = the v27 behaviour. The sticks also
+ *                   stay on in the classic DRIVE table and while the strip is
+ *                   switched off (NFSU2_STEER=0). set_drive_sticks clears all
+ *                   fingers and bumps the generation. sticks_enabled says
+ *                   whether the layout and settings in force have sticks.
  * Main thread. */
 void xbox_ios_touch_set_analog_pedals(int on);
+void xbox_ios_touch_set_drive_sticks(int on);
+int  xbox_ios_touch_sticks_enabled(void);
 void xbox_ios_touch_set_steer(int on);
 void xbox_ios_touch_set_steer_sens(float k);
 void xbox_ios_touch_set_steer_mode(int relative);    /* 1 relative, 0 absolute */
@@ -280,7 +291,7 @@ int  xbox_ios_touch_layout_parse(const char *text);
 void xbox_ios_touch_set_press_hook(void (*hook)(int zone_idx));
 
 /* Called when ANY finger goes down and is tracked (zone, steering strip or
- * dynamic stick), on the thread that pumps SDL events, outside the layer's
+ * dynamic stick; bare screen in DRIVE is not tracked), on the thread that pumps SDL events, outside the layer's
  * lock, after the finger is recorded and before the press hook. Not called
  * for a repeated down of a held finger, for a finger past the tracking limit
  * or while touch is off. The overlay wakes its display link with it. NULL

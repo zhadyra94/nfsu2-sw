@@ -1009,6 +1009,14 @@ only, never files): `../IOS_IMPROVEMENT_MAP.md`.
   found sliding gas and brake inconvenient on glass. A saved
   `NFSU2_ANALOG_PEDALS=1` in `nfsu2_env.txt` still wins. The launcher has no
   pedal row. Device-unverified.
+- **No floating sticks in Drive (v28):** in the new DRIVE table a touch on
+  bare screen is not tracked (no finger slot, no activity hook, no stick
+  ring/knob, `xbox_ios_touch_stick` returns 0); the strip is the only steering
+  touch, tilt keeps working. `NFSU2_DRIVE_STICKS=1` (panel "Floating sticks in
+  Drive", default off) restores the v27 sticks. PAD, classic DRIVE and Drive
+  with the strip off (`NFSU2_STEER=0`) keep them, else Drive would have no
+  touch steering. Changing the switch clears all fingers and bumps the layout
+  generation. The launcher has no Drive rows. Device-unverified.
 - **Layout geometry order** (`zones_rebuild_locked`): preset -> editor
   override -> Size -> aspect shape (round zones keep their phone shape in
   points when the window aspect is >10% off 852/393; `NFSU2_TOUCH_ROUND=0`)

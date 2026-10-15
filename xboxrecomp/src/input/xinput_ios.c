@@ -7,10 +7,12 @@
  * xbox_InputGetState: a pad that is attached never reaches it, so a real
  * pad always outranks the screen).
  *
- * The sticks are dynamic, the way most mobile ports do it: nothing is on
- * screen for them, a touch that lands on the bare half of the screen
+ * In PAD the sticks are dynamic, the way most mobile ports do it: nothing is
+ * on screen for them, a touch that lands on the bare half of the screen
  * becomes that stick's centre, and the deflection is the offset from there,
- * so the thumb never has to find a fixed circle first. Everything else is
+ * so the thumb never has to find a fixed circle first. DRIVE has no floating
+ * sticks (v28): the steering strip is the only steering touch and a touch on
+ * bare screen does nothing; see sticks_on_locked. Everything else is
  * a fixed zone (xinput_ios.h's XBOX_IOS_TOUCH_ZONE): a touch that lands in
  * one presses it and holds it until the finger lifts, wherever the finger
  * drifts meanwhile -- re-testing every motion would drop a button the
@@ -26,7 +28,8 @@
  * (16:9 until the first one arrives; iOS reports the window as it is
  * created, well before the title's first poll in practice).
  *
- * DRIVE adds two things on top of the zones: pedals (GAS / BRAKE are a full
+ * DRIVE adds two things on top of the zones (and, in the new table, a d-pad
+ * that picks one direction at a time): pedals (GAS / BRAKE are a full
  * press wherever the thumb is; NFSU2_ANALOG_PEDALS=1 opts into analog ones that
  * read lower as the thumb slides down the pedal) and a
  * steering strip (a zone whose finger x is the left stick X, relative to the
@@ -123,8 +126,8 @@ static const XBOX_IOS_TOUCH_ZONE s_zones_pad[] = {
  * half-extents, see zone_at) sits in the lower left, x 0.06-0.28 (51-239 pt,
  * 187 pt wide on 852 pt): the touch-down point inside it is "straight ahead"
  * (relative mode), so it only has to be big enough to land a thumb on. The
- * rest of the left half is still the dynamic left stick, so menus keep working
- * by stick.
+ * rest of the screen is bare and does nothing (no floating sticks in DRIVE,
+ * NFSU2_DRIVE_STICKS=1 brings them back); menus use the d-pad.
  *
  * Checked numerically on 852x393 (harness case "DRIVE geometry"): no two
  * zones overlap, the strip starts at x = 51 pt so it clears the Dynamic Island
@@ -210,6 +213,7 @@ static float s_steer_sens = 1.0f;     /* NFSU2_STEER_SENS, 0.5..2.0 */
 static int   s_steer_rel = 1;         /* NFSU2_STEER_MODE: 1 relative, 0 absolute */
 static float s_steer_curve = 1.35f;   /* NFSU2_STEER_CURVE, 1.0..2.0 (relative mode) */
 static int   s_analog_pedals;         /* NFSU2_ANALOG_PEDALS (0 default: full press) */
+static int   s_drive_sticks;          /* NFSU2_DRIVE_STICKS (0 default: no floating sticks in DRIVE) */
 
 /* The strip keeps its width at every size setting (in absolute mode the
  * steering gain follows its half-width, so the size slider must not change the
@@ -460,6 +464,17 @@ static void      (*s_activity_hook)(void);    /* see set_activity_hook */
 
 static void touch_clear_locked(void);
 
+/* Whether a touch on bare screen drives a dynamic stick. PAD and the classic
+ * DRIVE table: always. The new DRIVE table: only with NFSU2_DRIVE_STICKS=1, or
+ * while the steering strip is switched off (the strip setting is "a switch back
+ * to the dynamic stick"; without it DRIVE would have no touch steering at all).
+ * Every input that changes the answer clears the fingers. Called with s_lock
+ * held. */
+static int sticks_on_locked(void)
+{
+    return !s_drive || s_drive_classic || s_drive_sticks || !s_steer_on;
+}
+
 /* First use from any thread: read the env defaults, build the zone table and
  * create the lock. Every public entry point calls this first, so the main
  * thread (overlay) and the game thread (input poll) never see a half-built
@@ -515,6 +530,7 @@ static void touch_prefs_once(void)
             s_scale = !(k >= 0.7f) ? 0.7f : k > 1.5f ? 1.5f : k;
         }
         s_analog_pedals = env_switch("NFSU2_ANALOG_PEDALS", 0);
+        s_drive_sticks = env_switch("NFSU2_DRIVE_STICKS", 0);
         s_steer_on = env_switch("NFSU2_STEER", 1);
         s_drive_classic = env_switch("NFSU2_DRIVE_CLASSIC", 0);
         v = getenv("NFSU2_STEER_SENS");
@@ -583,6 +599,20 @@ void xbox_ios_touch_set_analog_pedals(int on)
     touch_prefs_once();
     SDL_LockMutex(s_lock);
     s_analog_pedals = on ? 1 : 0;
+    SDL_UnlockMutex(s_lock);
+}
+
+/* Floating sticks in DRIVE on / off (NFSU2_DRIVE_STICKS, off by default). Drops
+ * every finger (a held stick finger must not outlive the switch) and rebuilds
+ * the table, which bumps the generation so the overlay re-evaluates its stick
+ * layers. */
+void xbox_ios_touch_set_drive_sticks(int on)
+{
+    touch_prefs_once();
+    SDL_LockMutex(s_lock);
+    touch_clear_locked();
+    s_drive_sticks = on ? 1 : 0;
+    zones_rebuild_locked();
     SDL_UnlockMutex(s_lock);
 }
 
@@ -888,7 +918,8 @@ void xbox_ios_touch_set_press_hook(void (*hook)(int))
 }
 
 /* Called (same threads) when ANY finger goes down and is tracked: a zone, the
- * steering strip or a dynamic stick. Not for a repeated down of a finger that
+ * steering strip or a dynamic stick (bare screen in DRIVE is not tracked).
+ * Not for a repeated down of a finger that
  * is already held, not for a finger beyond the tracked limit, not while touch
  * is off. Runs outside the layer's lock, after the finger is recorded, and
  * before the press hook. The overlay uses it to wake its display link. NULL
@@ -1134,6 +1165,12 @@ static void finger_down(SDL_TouchID touch_id, SDL_FingerID id, float x, float y)
     }
 
     zone = zone_at(x, y);
+    if (zone < 0 && !sticks_on_locked()) {
+        /* Bare screen in DRIVE: not tracked at all. No slot, no hook, nothing
+         * to hand a stick over to. */
+        SDL_UnlockMutex(s_lock);
+        return;
+    }
     s_finger[i].id = id;
     s_finger[i].x = x;
     s_finger[i].y = y;
@@ -1343,7 +1380,8 @@ const XBOX_IOS_TOUCH_ZONE *xbox_ios_touch_zones(int *count)
 
 /* Live stick state for the overlay's floating-stick visual: the touch-down
  * point is the base ring, the current position the knob. side: 0 left,
- * 1 right. Returns 1 while a finger drives that stick. */
+ * 1 right. Returns 1 while a finger drives that stick; always 0 where there are
+ * no floating sticks (DRIVE, see sticks_on_locked). */
 int xbox_ios_touch_stick(int side, float *bx, float *by, float *kx, float *ky)
 {
     int role = side ? ROLE_RSTICK : ROLE_LSTICK;
@@ -1352,7 +1390,7 @@ int xbox_ios_touch_stick(int side, float *bx, float *by, float *kx, float *ky)
     touch_prefs_once();
     SDL_LockMutex(s_lock);
     for (i = 0; i < TOUCH_MAX_FINGERS; i++) {
-        if (s_finger[i].id >= 0 && s_finger[i].role == role) {
+        if (s_finger[i].id >= 0 && s_finger[i].role == role && sticks_on_locked()) {
             *bx = s_finger[i].sx;
             *by = s_finger[i].sy;
             *kx = s_finger[i].x;
@@ -1363,6 +1401,19 @@ int xbox_ios_touch_stick(int side, float *bx, float *by, float *kx, float *ky)
     }
     SDL_UnlockMutex(s_lock);
     return found;
+}
+
+/* 1 when a touch on bare screen drives a floating stick in the layout now in
+ * force (the overlay builds its stick layers only then). */
+int xbox_ios_touch_sticks_enabled(void)
+{
+    int on;
+
+    touch_prefs_once();
+    SDL_LockMutex(s_lock);
+    on = sticks_on_locked();
+    SDL_UnlockMutex(s_lock);
+    return on;
 }
 
 /* Whether any finger is on zone idx (table order): pressed highlight. */
