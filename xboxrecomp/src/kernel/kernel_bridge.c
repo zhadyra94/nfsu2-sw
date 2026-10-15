@@ -2898,6 +2898,355 @@ void xbox_vblank_report(double dt, char *buf, size_t n)
     last = c;
 }
 
+/* ── Vblank locked to the display (v27) ──────────────────────────────────
+ *
+ * The free-running 59.94 Hz tick and a 60.00 Hz screen with FIFO present
+ * drift: one frame repeats or slips about every 17 s. A display source (iOS:
+ * a CADisplayLink on its own thread, ios_vblank.m) pushes vsync timestamps
+ * with kernel_vblank_link_sample(). They go through a lock-free ring (one
+ * producer, the timer thread is the only consumer), in THIS file's clock
+ * (vb_now_us): the source pairs the clocks with a simultaneous reading of
+ * kernel_vblank_clock_us(). kernel_vblank_tick itself still runs only on the
+ * timer thread, at DISPATCH: that ordering fixed the Quick Race start hang.
+ *
+ * The timer thread estimates the link period over a ~1 s window (timestamp
+ * span / periods; a per-delta average on +-0.3 ms jitter would swing by
+ * tenths of a Hz) and locks only when it reads 59.5-60.5 Hz (unlock outside
+ * 59.4-60.6): a 30 Hz link (Low Power Mode) or a 120 Hz one stays free. While
+ * locked each tick's step is the link period plus a phase correction of
+ * e/4, bounded to +-0.5 ms, where e is the distance of the next due time to
+ * the nearest link-aligned time. No sample for 3 periods (background, stall)
+ * -> back to 59.94 Hz from the current due time, estimator cleared; it
+ * re-locks after ~0.5 s of fresh samples and walks onto the link phase at
+ * <= 0.5 ms per tick (no burst of ticks). An off-period delta restarts the
+ * window but keeps the last good period; 4 in a row drop the lock.
+ * NFSU2_VBLANK_LOCK=0 drops the samples (read on the timer thread). Without a source nothing here
+ * runs, and nothing is logged. */
+#if defined(__GNUC__)
+#define LK_LOAD(p)     __atomic_load_n((p), __ATOMIC_ACQUIRE)
+#define LK_STORE(p, v) __atomic_store_n((p), (v), __ATOMIC_RELEASE)
+#else
+#define LK_LOAD(p)     (*(volatile uint32_t *)(p))
+#define LK_STORE(p, v) (*(volatile uint32_t *)(p) = (v))
+#endif
+
+#define LK_RING       16
+#define LK_WIN        64
+#define LK_MIN_N      32          /* samples before the period is trusted */
+#define LK_LOCK_LO    59.5
+#define LK_LOCK_HI    60.5
+#define LK_UNLOCK_LO  59.4
+#define LK_UNLOCK_HI  60.6
+#define LK_MAX_ADJ_US 500.0
+#define LK_IRREG_MAX  4
+
+static uint64_t         s_lk_ring[LK_RING];
+static volatile uint32_t s_lk_head;           /* producer */
+static uint32_t         s_lk_tail;            /* consumer (timer thread) */
+static int              s_lk_enabled = -1;
+
+static struct {
+    int       seen;                 /* any sample ever consumed */
+    int       locked;
+    int       n;                    /* samples in the current window */
+    uint64_t  ts[LK_WIN];           /* circular */
+    uint64_t  last_ts;              /* newest consumed */
+    double    prev_dt;              /* last regular delta */
+    double    period;               /* last good link period, us (0: none) */
+    int       irregular_run;
+    double    carry;                /* sub-microsecond remainder of the step */
+    unsigned  corrections;          /* ticks with |adj| >= 100 us */
+    unsigned  fallbacks;
+    long long log_us;               /* last 10 s line */
+    unsigned  tk_n;                  /* ticks since the last 10 s line */
+    long long tk_first, tk_last;    /* first and last of them, us */
+    double    adj_max, step_min, step_max, phase_sum;
+    unsigned  phase_n;
+} lk;
+
+static int lk_enabled(void)
+{
+    if (s_lk_enabled < 0) {
+        const char *e = getenv("NFSU2_VBLANK_LOCK");
+        s_lk_enabled = !(e && e[0] == '0');
+    }
+    return s_lk_enabled;
+}
+
+/* One vsync timestamp, in kernel_vblank_clock_us() microseconds. Any thread,
+ * ONE producer at a time. */
+void kernel_vblank_link_sample(uint64_t host_us)
+{
+    uint32_t h;
+
+    h = s_lk_head;
+    s_lk_ring[h % LK_RING] = host_us;
+    LK_STORE(&s_lk_head, h + 1);
+}
+
+static double lk_abs(double x) { return x < 0 ? -x : x; }
+static long long lk_round(double x) { return (long long)(x < 0 ? x - 0.5 : x + 0.5); }
+
+static double lk_hz(void)
+{
+    double p = lk.period > 0 ? lk.period : (lk.n >= 2 ? lk.prev_dt : 0);
+    return p > 0 ? 1e6 / p : 0;
+}
+
+static void lk_reset_window(void)
+{
+    lk.n = 0;
+}
+
+static void lk_set_locked(int on, const char *why)
+{
+    if (lk.locked == on)
+        return;
+    lk.locked = on;
+    lk.carry = 0;
+    if (!on)
+        lk.fallbacks++;
+    fprintf(stderr, "[vblank] %s: %s, link %.2f Hz\n", on ? "locked" : "free", why,
+            lk_hz());
+    fflush(stderr);
+}
+
+/* A locked/free decision from the current period estimate. */
+static void lk_decide(void)
+{
+    double hz = lk.period > 0 ? 1e6 / lk.period : 0;
+
+    if (!lk.locked && lk.period > 0 && hz >= LK_LOCK_LO && hz <= LK_LOCK_HI)
+        lk_set_locked(1, "link in range");
+    else if (lk.locked && (lk.period <= 0 || hz < LK_UNLOCK_LO || hz > LK_UNLOCK_HI))
+        lk_set_locked(0, "link out of range");
+}
+
+static void lk_add(uint64_t ts)
+{
+    lk.seen = 1;
+    if (lk.n > 0) {
+        double dt = ts > lk.last_ts ? (double)(ts - lk.last_ts) : -1.0;
+        double ref = lk.period > 0 ? lk.period : (lk.n >= 2 ? lk.prev_dt : 0);
+        int irregular;
+
+        if (dt <= 0)
+            irregular = 1;
+        else if (ref > 0)
+            irregular = lk_abs(dt - ref) > 0.25 * ref;
+        else
+            irregular = dt < 2000.0 || dt > 100000.0;
+        if (irregular) {
+            /* Restart the window; keep the last good period for now. */
+            lk.irregular_run++;
+            lk_reset_window();
+            lk.prev_dt = 0;
+            if (lk.irregular_run >= LK_IRREG_MAX) {
+                lk.period = 0;
+                if (lk.locked)
+                    lk_set_locked(0, "irregular link timestamps");
+            }
+        } else {
+            lk.irregular_run = 0;
+            lk.prev_dt = dt;
+        }
+    }
+    lk.ts[lk.n % LK_WIN] = ts;
+    lk.n++;
+    lk.last_ts = ts;
+    if (lk.n >= LK_MIN_N) {
+        int cnt = lk.n < LK_WIN ? lk.n : LK_WIN;
+        uint64_t oldest = lk.ts[lk.n >= LK_WIN ? lk.n % LK_WIN : 0];
+        double raw = (double)(ts - oldest) / (double)(cnt - 1);
+        lk.period = lk.period > 0 ? lk.period + (raw - lk.period) * 0.25 : raw;
+    }
+    lk_decide();
+}
+
+/* Timer thread, every wake: consume samples, detect a gap, log. */
+static void lk_poll(long long now)
+{
+    uint32_t head = LK_LOAD(&s_lk_head);
+
+    /* NFSU2_VBLANK_LOCK=0: samples are read and dropped. The key is read here,
+     * on the timer thread (the producer thread never calls getenv). */
+    if (!lk_enabled()) {
+        s_lk_tail = head;
+        return;
+    }
+    if (head - s_lk_tail > LK_RING - 2) {      /* overrun: lost samples */
+        s_lk_tail = head - 8;
+        lk_reset_window();
+        lk.prev_dt = 0;
+    }
+    while (s_lk_tail != head) {
+        lk_add(s_lk_ring[s_lk_tail % LK_RING]);
+        s_lk_tail++;
+    }
+    if (!lk.seen)
+        return;
+
+    /* No sample for 3 periods: free-run from here, estimator cleared. */
+    if (lk.n > 0 || lk.locked) {
+        double ref = lk.period > 0 ? lk.period : (lk.prev_dt > 0 ? lk.prev_dt : 16667.0);
+        double gap = (double)(now - (long long)lk.last_ts);
+        if (gap > 3.0 * ref) {
+            char why[48];
+            snprintf(why, sizeof why, "no link sample for %.0f ms", gap / 1000.0);
+            lk_reset_window();
+            lk.period = 0;
+            lk.prev_dt = 0;
+            lk.irregular_run = 0;
+            lk_set_locked(0, why);
+        }
+    }
+
+    if (!lk.log_us) {
+        lk.log_us = now;
+    }
+    if (now - lk.log_us >= 10000000LL) {
+        /* Guest rate from the first and last tick of the window: counting
+         * ticks over the wall window is +-1 tick = +-0.1 Hz. */
+        double ghz = lk.tk_n > 1 && lk.tk_last > lk.tk_first
+                   ? (double)(lk.tk_n - 1) * 1e6 / (double)(lk.tk_last - lk.tk_first) : 0.0;
+
+        fprintf(stderr, "[vblank] %s, link %.2f Hz, guest %.2f Hz, corrections %u, "
+                        "fallbacks %u, phase err avg %.0f us, adj max %.0f us, "
+                        "step min/max %.0f/%.0f us\n",
+                lk.locked ? "locked" : "free", lk_hz(), ghz,
+                lk.corrections, lk.fallbacks,
+                lk.phase_n ? lk.phase_sum / lk.phase_n : 0.0, lk.adj_max,
+                lk.step_max > 0 ? lk.step_min : 0.0, lk.step_max);
+        fflush(stderr);
+        lk.log_us = now;
+        lk.tk_n = 0;
+        lk.adj_max = lk.step_max = lk.phase_sum = 0;
+        lk.step_min = 0;
+        lk.phase_n = 0;
+    }
+}
+
+static void lk_note_tick(long long now)
+{
+    if (!lk.tk_n)
+        lk.tk_first = now;
+    lk.tk_last = now;
+    lk.tk_n++;
+}
+
+/* The interval from this vblank to the next, in us. */
+static long long lk_step(long long due)
+{
+    double step, p, e, adj, next;
+    long long whole;
+
+    if (!lk.locked)
+        return VBLANK_PERIOD_US;
+    p = lk.period;
+    next = (double)due + p;
+    e = (double)(long long)lk.last_ts
+        + (double)lk_round((next - (double)(long long)lk.last_ts) / p) * p - next;
+    adj = e * 0.25;
+    if (adj > LK_MAX_ADJ_US) adj = LK_MAX_ADJ_US;
+    if (adj < -LK_MAX_ADJ_US) adj = -LK_MAX_ADJ_US;
+    if (lk_abs(adj) >= 100.0)
+        lk.corrections++;
+    if (lk_abs(adj) > lk.adj_max)
+        lk.adj_max = lk_abs(adj);
+    lk.phase_sum += e;
+    lk.phase_n++;
+    step = p + adj + lk.carry;
+    whole = (long long)step;
+    lk.carry = step - (double)whole;
+    if (!lk.step_max || (double)whole < lk.step_min) lk.step_min = (double)whole;
+    if ((double)whole > lk.step_max) lk.step_max = (double)whole;
+    return whole;
+}
+
+/* The clock samples must be given in. */
+long long kernel_vblank_clock_us(void)
+{
+    return vb_now_us();
+}
+
+/* RECOMP_VBLANK_LINK_TEST=1 (any host): a fake display at exactly 60.00 Hz
+ * with +-0.3 ms timestamp jitter. At RECOMP_VBLANK_LINK_TEST_GAP_AT seconds
+ * (default 90) it stops for RECOMP_VBLANK_LINK_TEST_GAP_S seconds (default
+ * 2), then resumes on a phase 7 ms later. RECOMP_VBLANK_LINK_TEST_HZ=
+ * "30@30,60@60" switches the rate (Low Power Mode, 120 Hz): hz@seconds. */
+static DWORD WINAPI lk_test_thread(LPVOID unused)
+{
+    const char *g = getenv("RECOMP_VBLANK_LINK_TEST_GAP_AT");
+    double gap_at = g && atof(g) > 0 ? atof(g) : 90.0;
+    const char *gl = getenv("RECOMP_VBLANK_LINK_TEST_GAP_S");
+    double gap_s = gl && atof(gl) > 0 ? atof(gl) : 2.0;
+    const char *hs = getenv("RECOMP_VBLANK_LINK_TEST_HZ");
+    double sched_hz[8], sched_t[8];
+    int nsched = 0, si = 0;
+    double per = 1e6 / 60.0;
+    long long start = vb_now_us();
+    double anchor = (double)start;
+    long long k = 0;
+    int gap_done = 0, in_gap = 0;
+    unsigned rng = 12345;
+
+    (void)unused;
+    while (hs && *hs && nsched < 8) {
+        double hz = atof(hs), t;
+        const char *at = strchr(hs, '@'), *comma = strchr(hs, ',');
+        if (!at || hz <= 0)
+            break;
+        t = atof(at + 1);
+        sched_hz[nsched] = hz;
+        sched_t[nsched++] = t;
+        if (!comma)
+            break;
+        hs = comma + 1;
+    }
+    fprintf(stderr, "[vblank-test] fake 60.00 Hz display, %.0f s gap at t=%.0f s, %d rate change(s)\n",
+            gap_s, gap_at, nsched);
+    fflush(stderr);
+    for (;;) {
+        double due = anchor + (double)k * per;
+        double rel;
+
+        while ((double)vb_now_us() < due + 400.0)
+            Sleep(1);
+        rel = ((double)vb_now_us() - (double)start) / 1e6;
+        if (si < nsched && rel >= sched_t[si]) {
+            per = 1e6 / sched_hz[si];
+            anchor = due;
+            k = 0;
+            fprintf(stderr, "[vblank-test] link now %.2f Hz\n", sched_hz[si]);
+            fflush(stderr);
+            si++;
+        }
+        if (!gap_done && rel >= gap_at) {
+            if (!in_gap) {
+                in_gap = 1;
+                fprintf(stderr, "[vblank-test] gap begins\n");
+                fflush(stderr);
+            }
+            if (rel >= gap_at + gap_s) {
+                in_gap = 0;
+                gap_done = 1;
+                anchor = (double)vb_now_us() + 7000.0;   /* resume 7 ms out of phase */
+                k = 0;
+                fprintf(stderr, "[vblank-test] gap ends, phase shifted\n");
+                fflush(stderr);
+            }
+        }
+        if (!in_gap) {
+            double jit;
+            rng = rng * 1103515245u + 12345u;
+            jit = ((double)((rng >> 8) & 0xFFFF) / 65535.0 * 2.0 - 1.0) * 300.0;
+            kernel_vblank_link_sample((uint64_t)(due + jit));
+        }
+        k++;
+    }
+    return 0;
+}
+
 /* How long the timer thread may sleep before the next vblank is due. */
 static DWORD kernel_vblank_wait_ms(void)
 {
@@ -2919,15 +3268,17 @@ static void kernel_vblank_tick(void)
         return;
 
     now = vb_now_us();
+    lk_poll(now);                /* display samples, if a source pushes any */
     if (!s_vb_next_us)
         s_vb_next_us = now;
     if (now < s_vb_next_us)
         return;
     if (now - s_vb_next_us > VBLANK_PERIOD_US / 2)
-        s_vb_next_us = now + VBLANK_PERIOD_US;    /* far behind: restart here */
+        s_vb_next_us = now + lk_step(now);          /* far behind: restart here */
     else
-        s_vb_next_us += VBLANK_PERIOD_US;         /* on time: no drift */
+        s_vb_next_us += lk_step(s_vb_next_us);      /* on time: no drift */
     InterlockedIncrement(&s_vb_count);
+    lk_note_tick(now);
 
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
         return;
@@ -3266,6 +3617,11 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
             return 0;
         }
         g_fs_base = tib;
+    }
+    {
+        const char *t = getenv("RECOMP_VBLANK_LINK_TEST");
+        if (t && t[0] == '1')
+            CloseHandle(CreateThread(NULL, 0, lk_test_thread, NULL, 0, NULL));
     }
 
     for (;;) {

@@ -988,6 +988,40 @@ only, never files): `../IOS_IMPROVEMENT_MAP.md`.
   (`CFBundleIconFiles` AppIcon60x60, AppIcon76x76, AppIcon83.5x83.5) itself.
   The log lists `Assets.car` / `AppIcon*` and the icon keys. macOS steps
   checked by eye and `bash -n` only.
+- **Guest vblank locked to the display (v27, iOS):** the free-running 59.94
+  Hz tick on a 60.00 Hz FIFO screen repeats or slips a frame about every
+  17 s. `xboxrecomp/src/platform/ios_vblank.m` runs a CADisplayLink
+  on its own thread and run loop (60/60/60 range on iOS 15+, else
+  `preferredFramesPerSecond = 60`), started from main.c after the game
+  thread. Each callback reads `kernel_vblank_clock_us()` and
+  `CACurrentMediaTime()` back to back and pushes the vsync time converted to
+  the kernel clock with `kernel_vblank_link_sample()` (Darwin
+  CLOCK_MONOTONIC keeps counting in sleep, mach time does not, so the raw
+  link timestamp is never pushed). kernel_bridge.c keeps a lock-free ring;
+  `kernel_vblank_tick` still runs ONLY on the timer thread (the DISPATCH
+  ordering behind the Quick Race start fix). The timer thread estimates the
+  link period over a ~1 s window, locks only at 59.5-60.5 Hz (a 30 Hz Low
+  Power Mode link or 120 Hz stays free; unlock outside 59.4-60.6), and while
+  locked steps by the link period plus a phase correction e/4 clamped to
+  +-0.5 ms. No sample for 3 periods (background, stall) -> free 59.94 Hz
+  from the current due time, estimator cleared, re-lock after ~0.5 s with the
+  same bounded slew (no tick bursts); an off-period delta restarts the window
+  and keeps the last period, 4 in a row unlock. `NFSU2_VBLANK_LOCK=0` (read in main.c before the game thread
+  starts, and on the timer thread, which then drops the samples) leaves
+  the free-running 59.94 Hz and does not start the link. Logs every 10 s once any sample
+  has arrived: `[vblank] locked|free, link N.NN Hz, guest N.NN Hz,
+  corrections N, fallbacks N, phase err avg N us, adj max N us, step min/max
+  a/b us` (corrections = ticks with |adj| >= 100 us), plus one line per state
+  change (`[vblank] locked: link in range ...`, `free: no link sample for N
+  ms`). No source, no lines, behaviour unchanged. Linux test source:
+  `RECOMP_VBLANK_LINK_TEST=1` pushes a 60.00 Hz clock with +-0.3 ms jitter
+  and stops for 2 s at t = 90 s (`..._GAP_AT`, `..._GAP_S`), resuming 7 ms out
+  of phase; `RECOMP_VBLANK_LINK_TEST_HZ=30@30,60@60` switches its rate
+  (hz@seconds). Linux proof: locks at 60.00, free windows read 59.94, 7 ms
+  phase jump absorbed with step min/max 16.17/17.17 ms; test links of 30 and 120
+  Hz stay free (`free: irregular link timestamps`), 60 Hz again re-locks. Device-unverified:
+  with FIFO a lock whose phase lands on the host's latch could repeat frames
+  more often than the free-run slip; the phase error is in the log line.
 - **Device verification pending:** everything in v22/v23 (no device log on
   this machine yet).
 

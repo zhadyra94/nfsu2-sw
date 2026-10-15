@@ -124,14 +124,19 @@ NSArray *NSSearchPathForDirectoriesInDomains(NSUInteger dir, NSUInteger domain, 
 + (NSNumber*)numberWithInt:(int)i;
 + (NSNumber*)numberWithDouble:(double)d;
 @end
+#define NSQualityOfServiceUserInteractive 0x21
 @interface NSThread : NSObject
 + (BOOL)isMainThread;
++ (void)sleepForTimeInterval:(double)s;
+- (instancetype)initWithTarget:(id)t selector:(SEL)s object:(id)o;
+- (void)start;
+@property (copy) NSString *name; @property NSInteger qualityOfService;
 @end
 @interface NSDate : NSObject
 + (instancetype)dateWithTimeIntervalSinceNow:(double)s;
 @end
 @interface NSRunLoop : NSObject
-+ (NSRunLoop*)mainRunLoop; - (void)addTimer:(id)t forMode:(NSString*)m;
++ (NSRunLoop*)mainRunLoop; + (NSRunLoop*)currentRunLoop; - (void)addTimer:(id)t forMode:(NSString*)m;
 - (BOOL)runMode:(NSString*)mode beforeDate:(NSDate*)d;
 @end
 @interface NSSet : NSObject <NSFastEnumeration> - (NSUInteger)count; @end
@@ -221,8 +226,14 @@ extern NSString *const NSKernAttributeName;
 @interface CATransaction : NSObject
 + (void)begin; + (void)commit; + (void)setDisableActions:(BOOL)f; + (void)setAnimationDuration:(double)d;
 @end
+typedef struct { float minimum, maximum, preferred; } CAFrameRateRange;
+static inline CAFrameRateRange CAFrameRateRangeMake(float a, float b, float c)
+{ CAFrameRateRange r = { a, b, c }; return r; }
+double CACurrentMediaTime(void);
 @interface CADisplayLink : NSObject
 + (CADisplayLink*)displayLinkWithTarget:(id)t selector:(SEL)s;
+@property (readonly) double timestamp, targetTimestamp;
+@property CAFrameRateRange preferredFrameRateRange;
 @property NSInteger preferredFramesPerSecond; @property (getter=isPaused) BOOL paused;
 - (void)addToRunLoop:(NSRunLoop*)r forMode:(NSString*)m; - (void)invalidate;
 @end

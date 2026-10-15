@@ -886,6 +886,7 @@ int main(int argc, char **argv)
     pthread_attr_t attr;
     pthread_t th;
     int rc = 1;
+    int vblank_lock_on = 1;
 
     (void)argc;
     (void)argv;
@@ -1034,12 +1035,26 @@ int main(int argc, char **argv)
         fprintf(stderr, "nfsu2: background handshake %s\n",
                 s_bg_handshake ? "on" : "off (flag only)");
     }
+    /* Read before the game thread exists: game_main setenv()s more keys. */
+    {
+        const char *vl = getenv("NFSU2_VBLANK_LOCK");
+        vblank_lock_on = !(vl && vl[0] == '0');
+        if (!vblank_lock_on)
+            fprintf(stderr, "nfsu2: vblank display lock off (NFSU2_VBLANK_LOCK=0)\n");
+    }
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 16u * 1024 * 1024);
     if (pthread_create(&th, &attr, ios_game_thread, &rc) == 0) {
         pthread_t dth;
         pthread_create(&dth, NULL, ios_diag_thread, NULL);
         pthread_detach(dth);
+        if (vblank_lock_on) {
+            /* v27: display vsync timestamps for the guest vblank (own
+             * thread; the kernel timer thread consumes them). The samples
+             * wait in a ring until the timer thread runs. */
+            extern void ios_vblank_link_start(void);
+            ios_vblank_link_start();
+        }
         /* SDL_Event is opaque here (main.c avoids SDL.h): 64 bytes is its
          * sizeof on every SDL2 target. */
         char ev[64] __attribute__((aligned(16)));
