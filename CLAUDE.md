@@ -978,6 +978,16 @@ only, never files): `../IOS_IMPROVEMENT_MAP.md`.
   more). `RECOMP_UNIMPL_TRAP=1` still prints and aborts at the first hit.
   Linux run: 7 sites, each printed once, no summary. The MVK key is
   device-unverified.
+- **App icon (v27):** `ios/Assets.xcassets/AppIcon.appiconset` (one
+  1024x1024 universal PNG, no alpha: `nfsu2_logo.png` on a dark gradient) and
+  loose PNGs in `ios/icon/` (`AppIcon60x60@2x/@3x`, `AppIcon76x76@2x~ipad`,
+  `AppIcon83.5x83.5@2x~ipad`) for LiveContainer and sideload tools. The CI
+  packaging step runs `xcrun actool --compile "$APP" ... --app-icon AppIcon`,
+  merges its partial plist into Info.plist, and always copies the loose PNGs
+  in; if actool fails it writes `CFBundleIcons` / `CFBundleIcons~ipad`
+  (`CFBundleIconFiles` AppIcon60x60, AppIcon76x76, AppIcon83.5x83.5) itself.
+  The log lists `Assets.car` / `AppIcon*` and the icon keys. macOS steps
+  checked by eye and `bash -n` only.
 - **Device verification pending:** everything in v22/v23 (no device log on
   this machine yet).
 
