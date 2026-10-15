@@ -111,18 +111,19 @@ static const XBOX_IOS_TOUCH_ZONE s_zones_pad[] = {
 /* DRIVE preset (racing), laid out by function: the right thumb works the
  * pedals and the boost, the left thumb steers.
  *
- *   BACK  dpad           LOOK  CAM        START
- *                                          SHIFT up
- *                                          SHIFT down
- *                  E-BRAKE    NOS
- *   steering       BRAKE            GAS
- *   strip          BRAKE            GAS
+ *   BACK                 LOOK  CAM        START
+ *         dpad                                SHIFT up
+ *                                             SHIFT down
+ *                      E-BRAKE    NOS
+ *   steering           BRAKE            GAS
+ *   strip              BRAKE            GAS
  *
  * GAS (RT) is a tall pedal in the bottom-right corner, BRAKE (LT) left of it,
  * NOS (B) above GAS, E-BRAKE (A) above BRAKE, SHIFT up / down (X / Y) a small
  * pair on the right edge, LOOK (Black) and CAM (White) small near the top
- * right, BACK / START in the top corners, a small d-pad (menus, free roam)
- * top left. The steering strip (XBOX_IOS_ZONE_STEER, a RECTANGLE: rx / ry are
+ * right, BACK / START in the top corners, a big d-pad (menus, free roam; ~150 pt
+ * across, four arms of ~47 pt, one direction at a time, see dpad_dirs) above the
+ * strip in the freed left half. The steering strip (XBOX_IOS_ZONE_STEER, a RECTANGLE: rx / ry are
  * half-extents, see zone_at) sits in the lower left, x 0.06-0.28 (51-239 pt,
  * 187 pt wide on 852 pt): the touch-down point inside it is "straight ahead"
  * (relative mode), so it only has to be big enough to land a thumb on. The
@@ -130,9 +131,10 @@ static const XBOX_IOS_TOUCH_ZONE s_zones_pad[] = {
  * NFSU2_DRIVE_STICKS=1 brings them back); menus use the d-pad.
  *
  * Checked numerically on 852x393 (harness case "DRIVE geometry"): no two
- * zones overlap, the strip starts at x = 51 pt so it clears the Dynamic Island
- * strip (x 11-48 pt, y 133-260 pt), every main control is at least 60 pt
- * across. */
+ * zones overlap, the strip starts at x = 51 pt and the d-pad at x = 66 pt so
+ * both clear the Dynamic Island strip (x 11-48 pt, y 133-260 pt), every main
+ * control (pedals, NOS, E-BRAKE, d-pad, strip) is at least 60 pt across and
+ * the d-pad arms are at least 44 pt. */
 static const XBOX_IOS_TOUCH_ZONE s_zones_drive[] = {
     /* id   cx      cy      rx      ry      kind               value            */
     {  1,  0.056f, 0.102f, 0.035f, 0.076f, XBOX_IOS_ZONE_FLAG,   XBOX_GAMEPAD_BACK  },
@@ -145,7 +147,10 @@ static const XBOX_IOS_TOUCH_ZONE s_zones_drive[] = {
     {  9,  0.860f, 0.375f, 0.036f, 0.078f, XBOX_IOS_ZONE_ANALOG, XBOX_BUTTON_B      },  /* NOS */
     { 10,  0.955f, 0.272f, 0.032f, 0.066f, XBOX_IOS_ZONE_ANALOG, XBOX_BUTTON_X      },  /* SHIFT up */
     { 11,  0.955f, 0.425f, 0.032f, 0.066f, XBOX_IOS_ZONE_ANALOG, XBOX_BUTTON_Y      },  /* SHIFT down */
-    {  3,  0.190f, 0.300f, 0.040f, 0.087f, XBOX_IOS_ZONE_DPAD,   0                  },
+    /* A circle of 79 pt radius (rx = 79/852, ry = 79/393); its bottom (y 226 pt)
+     * is 17 pt above the strip's top (y 244 pt), so a thumb landing a little
+     * high on the strip does not hit DOWN; centred over the strip. */
+    {  3,  0.170f, 0.370f, 0.0927f, 0.2010f, XBOX_IOS_ZONE_DPAD, 0                  },
     { 12,  0.170f, 0.790f, 0.110f, 0.170f, XBOX_IOS_ZONE_STEER,  0                  },
 };
 #define DRIVE_NEW_COUNT ((int)(sizeof s_zones_drive / sizeof s_zones_drive[0]))
@@ -1066,6 +1071,37 @@ static float steer_value(const XBOX_IOS_TOUCH_ZONE *z, const TouchFinger *f)
     return v < 0.0f ? -a : a;
 }
 
+/* The D-pad directions a finger on D-pad zone z means, as XBOX_IOS_DPAD_BIT_*;
+ * the one rule behind both the game state and the overlay's arm highlight.
+ * The new DRIVE table (the big four-arm d-pad): one direction at a time, the
+ * axis the touch is further from the centre on wins (a tie goes vertical), and
+ * a small round dead zone (XBOX_IOS_DPAD_DEAD of the radius, narrower than the
+ * hub between the arms) is neutral -- a thumb near a corner sends one
+ * direction, so a menu does not step twice. PAD and the classic DRIVE table
+ * keep the quadrants: the touch's offset from the centre, neutral inside 0.4 of
+ * the radius, diagonals when both axes clear it. */
+static unsigned dpad_dirs(const XBOX_IOS_TOUCH_ZONE *z, const TouchFinger *f)
+{
+    float nx = (f->x - z->cx) / z->rx;
+    float ny = (f->y - z->cy) / z->ry;
+    unsigned bits = 0;
+
+    if (s_drive && !s_drive_classic) {
+        if (!(nx * nx + ny * ny >= XBOX_IOS_DPAD_DEAD * XBOX_IOS_DPAD_DEAD))
+            return 0;                                  /* also NaN */
+        if (fabsf(nx) > fabsf(ny))
+            return nx < 0.0f ? XBOX_IOS_DPAD_BIT_LEFT : XBOX_IOS_DPAD_BIT_RIGHT;
+        return ny < 0.0f ? XBOX_IOS_DPAD_BIT_UP : XBOX_IOS_DPAD_BIT_DOWN;
+    }
+    if (nx * nx + ny * ny > 0.16f) {   /* 0.4^2 */
+        if (ny < -0.4f) bits |= XBOX_IOS_DPAD_BIT_UP;
+        if (ny >  0.4f) bits |= XBOX_IOS_DPAD_BIT_DOWN;
+        if (nx < -0.4f) bits |= XBOX_IOS_DPAD_BIT_LEFT;
+        if (nx >  0.4f) bits |= XBOX_IOS_DPAD_BIT_RIGHT;
+    }
+    return bits;
+}
+
 /* Everything a held finger means, folded into the caller's accumulators.
  * Called with s_lock held. A steering-strip finger outranks a dynamic
  * left-stick finger whatever their slot order (the strip writes X and zeroes
@@ -1099,17 +1135,12 @@ static void fold_finger(const TouchFinger *f, float aspect, WORD *flags,
                 *have_l = 1;
             }
             break;
-        case XBOX_IOS_ZONE_DPAD: {  /* the touch's quadrant inside the zone,
-                                     * centre neutral, diagonals when both
-                                     * axes clear the mark */
-            float nx = (f->x - z->cx) / z->rx;
-            float ny = (f->y - z->cy) / z->ry;
-            if (nx * nx + ny * ny > 0.16f) {   /* 0.4^2 */
-                if (ny < -0.4f) *flags |= XBOX_GAMEPAD_DPAD_UP;
-                if (ny >  0.4f) *flags |= XBOX_GAMEPAD_DPAD_DOWN;
-                if (nx < -0.4f) *flags |= XBOX_GAMEPAD_DPAD_LEFT;
-                if (nx >  0.4f) *flags |= XBOX_GAMEPAD_DPAD_RIGHT;
-            }
+        case XBOX_IOS_ZONE_DPAD: {
+            unsigned d = dpad_dirs(z, f);
+            if (d & XBOX_IOS_DPAD_BIT_UP)    *flags |= XBOX_GAMEPAD_DPAD_UP;
+            if (d & XBOX_IOS_DPAD_BIT_DOWN)  *flags |= XBOX_GAMEPAD_DPAD_DOWN;
+            if (d & XBOX_IOS_DPAD_BIT_LEFT)  *flags |= XBOX_GAMEPAD_DPAD_LEFT;
+            if (d & XBOX_IOS_DPAD_BIT_RIGHT) *flags |= XBOX_GAMEPAD_DPAD_RIGHT;
             break;
         }
         default:
@@ -1541,7 +1572,7 @@ int xbox_ios_touch_zone_style(int idx)
 }
 
 /* The D-pad directions held through the D-pad zone right now, for the
- * overlay's arm highlight. Same quadrant rule as fold_finger(), as bits
+ * overlay's arm highlight. Same rule as fold_finger() (dpad_dirs), as bits
  * XBOX_IOS_DPAD_BIT_*; 0 when no finger is on the D-pad. */
 unsigned xbox_ios_touch_dpad_bits(void)
 {
@@ -1553,7 +1584,6 @@ unsigned xbox_ios_touch_dpad_bits(void)
     for (i = 0; i < TOUCH_MAX_FINGERS; i++) {
         const TouchFinger *f = &s_finger[i];
         const XBOX_IOS_TOUCH_ZONE *z;
-        float nx, ny;
 
         if (f->id < 0 || f->role < ROLE_ZONE(0) ||
             f->role - ROLE_ZONE(0) >= s_zone_n)
@@ -1561,14 +1591,7 @@ unsigned xbox_ios_touch_dpad_bits(void)
         z = &s_zones[f->role - ROLE_ZONE(0)];
         if (z->kind != XBOX_IOS_ZONE_DPAD)
             continue;
-        nx = (f->x - z->cx) / z->rx;
-        ny = (f->y - z->cy) / z->ry;
-        if (nx * nx + ny * ny > 0.16f) {   /* 0.4^2, as in fold_finger */
-            if (ny < -0.4f) bits |= XBOX_IOS_DPAD_BIT_UP;
-            if (ny >  0.4f) bits |= XBOX_IOS_DPAD_BIT_DOWN;
-            if (nx < -0.4f) bits |= XBOX_IOS_DPAD_BIT_LEFT;
-            if (nx >  0.4f) bits |= XBOX_IOS_DPAD_BIT_RIGHT;
-        }
+        bits |= dpad_dirs(z, f);
     }
     SDL_UnlockMutex(s_lock);
     return bits;

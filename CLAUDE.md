@@ -1017,6 +1017,16 @@ only, never files): `../IOS_IMPROVEMENT_MAP.md`.
   with the strip off (`NFSU2_STEER=0`) keep them, else Drive would have no
   touch steering. Changing the switch clears all fingers and bumps the layout
   generation. The launcher has no Drive rows. Device-unverified.
+- **Real d-pad (v28):** the Drive d-pad zone (id 3) is a 79 pt-radius circle
+  at (0.170, 0.370): the cross is ~150 pt across with four separate arm buttons
+  of ~47 pt (`XBOX_IOS_DPAD_ARM_*` in `xinput_ios.h`, mirrored as `DP_*` in the
+  overlay), at least 16 pt above the steering strip (17.3 pt hit-circle gap) and clear of BACK and the island. The
+  overlay draws four arms with gaps, each with its own outline, highlight and a
+  `chevron.*` symbol; PAD uses the same drawing at its old size. Input in the
+  new Drive table is one direction at a time (larger |offset| axis wins, round
+  dead zone 0.30 of the radius); PAD and classic Drive keep the quadrant rule
+  with diagonals. One helper (`dpad_dirs`) feeds both the game state and the
+  highlight. Layout editor keeps working (same zone id). Device-unverified.
 - **Layout geometry order** (`zones_rebuild_locked`): preset -> editor
   override -> Size -> aspect shape (round zones keep their phone shape in
   points when the window aspect is >10% off 852/393; `NFSU2_TOUCH_ROUND=0`)

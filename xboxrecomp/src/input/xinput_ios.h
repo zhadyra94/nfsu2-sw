@@ -27,7 +27,8 @@
  * XBOX_GAMEPAD_* flag), ZONE_ANALOG presses an analog button (`value` is an
  * XBOX_BUTTON_* index, pressed = 255; the DRIVE pedals do too unless the opt-in
  * NFSU2_ANALOG_PEDALS=1 makes them read lower as the thumb slides down), ZONE_DPAD maps the
- * touch's offset from the zone centre to D-pad flags (diagonals included),
+ * touch's offset from the zone centre to D-pad flags (diagonals included; in
+ * the new DRIVE table one direction at a time, see the D-pad block below),
  * ZONE_STEER (DRIVE only) is a strip: the finger's x is the left stick X,
  * relative to where it touched down (default) or to the strip's centre
  * (NFSU2_STEER_MODE=absolute). A STEER zone is hit-tested as a RECTANGLE (rx /
@@ -232,11 +233,31 @@ enum {
 int xbox_ios_touch_zone_style(int idx);   /* OTHER when idx is out of range */
 
 /* D-pad arms held through the D-pad zone (not the keyboard): OR of
- * XBOX_IOS_DPAD_BIT_*. */
+ * XBOX_IOS_DPAD_BIT_*.
+ *
+ * Input rule. PAD and the classic DRIVE table: the touch's offset from the
+ * zone centre, normalized by the radii; neutral inside 0.4, a direction for
+ * every axis past 0.4 (diagonals included). New DRIVE table: one direction at a
+ * time -- the axis with the larger |offset| wins, a tie goes vertical -- with a
+ * round dead zone of XBOX_IOS_DPAD_DEAD of the radius in the centre. (PAD keeps
+ * the diagonals: its zone and arms are small, and a menu step on a corner is
+ * rarer there than a deliberate diagonal on the free-roam map.)
+ *
+ * Drawing. The overlay draws four separate arm buttons per D-pad (PAD and
+ * DRIVE). With c0 the zone's shorter radius in points, an arm is a rounded
+ * rectangle 2 * HALF * c0 wide, from (HALF + GAP) * c0 to REACH * c0 away from
+ * the centre, so the arms are (REACH - HALF - GAP) * c0 long and the hub between
+ * them is empty. The arm tips lie inside the hit ellipse (REACH^2 + HALF^2 < 1).
+ * ios_touch_overlay.m mirrors these numbers (DP_REACH / DP_HALF / DP_GAP): keep
+ * the two in step. */
 #define XBOX_IOS_DPAD_BIT_UP    1u
 #define XBOX_IOS_DPAD_BIT_DOWN  2u
 #define XBOX_IOS_DPAD_BIT_LEFT  4u
 #define XBOX_IOS_DPAD_BIT_RIGHT 8u
+#define XBOX_IOS_DPAD_ARM_REACH 0.95f
+#define XBOX_IOS_DPAD_ARM_HALF  0.30f
+#define XBOX_IOS_DPAD_ARM_GAP   0.05f
+#define XBOX_IOS_DPAD_DEAD      0.30f
 unsigned xbox_ios_touch_dpad_bits(void);
 
 /* Changes every time the zone table is rebuilt (layout, size, geometry edits,

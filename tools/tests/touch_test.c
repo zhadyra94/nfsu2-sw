@@ -538,6 +538,114 @@ static void t_dpad(void)
     fup(1);
 }
 
+/* 3b. DRIVE d-pad: one direction at a time. Each arm gives its own direction, a
+ * corner gives the dominant axis only, the centre is neutral, the highlight bits
+ * match the state, and a grid sweep never shows two directions. PAD and the
+ * classic DRIVE table keep their diagonals. */
+static void t_dpad_drive(void)
+{
+    static const struct { float ox, oy; int want; unsigned bit; const char *name; } pts[] = {
+        {  0.00f, -0.65f, XBOX_GAMEPAD_DPAD_UP,    XBOX_IOS_DPAD_BIT_UP,    "up arm" },
+        {  0.00f,  0.65f, XBOX_GAMEPAD_DPAD_DOWN,  XBOX_IOS_DPAD_BIT_DOWN,  "down arm" },
+        { -0.65f,  0.00f, XBOX_GAMEPAD_DPAD_LEFT,  XBOX_IOS_DPAD_BIT_LEFT,  "left arm" },
+        {  0.65f,  0.00f, XBOX_GAMEPAD_DPAD_RIGHT, XBOX_IOS_DPAD_BIT_RIGHT, "right arm" },
+        {  0.60f, -0.40f, XBOX_GAMEPAD_DPAD_RIGHT, XBOX_IOS_DPAD_BIT_RIGHT, "corner, right dominant" },
+        { -0.60f, -0.40f, XBOX_GAMEPAD_DPAD_LEFT,  XBOX_IOS_DPAD_BIT_LEFT,  "corner, left dominant" },
+        {  0.40f, -0.60f, XBOX_GAMEPAD_DPAD_UP,    XBOX_IOS_DPAD_BIT_UP,    "corner, up dominant" },
+        { -0.40f,  0.60f, XBOX_GAMEPAD_DPAD_DOWN,  XBOX_IOS_DPAD_BIT_DOWN,  "corner, down dominant" },
+        {  0.31f,  0.00f, XBOX_GAMEPAD_DPAD_RIGHT, XBOX_IOS_DPAD_BIT_RIGHT, "just outside the dead zone" },
+        {  0.00f, -0.31f, XBOX_GAMEPAD_DPAD_UP,    XBOX_IOS_DPAD_BIT_UP,    "just outside the dead zone, up" },
+        {  0.29f,  0.00f, 0,                       0,                       "inside the dead zone" },
+        {  0.20f, -0.20f, 0,                       0,                       "inside the dead zone, diagonal" },
+        {  0.00f,  0.00f, 0,                       0,                       "centre" },
+    };
+    const XBOX_IOS_TOUCH_ZONE *z;
+    XBOX_INPUT_STATE s;
+    size_t k;
+    int zi, a, b, bits_n;
+
+    reset();
+    xbox_ios_touch_set_layout(1);
+    zi = zone_by_kind(XBOX_IOS_ZONE_DPAD);
+    z = zone(zi);
+    if (!z)
+        return;
+    for (k = 0; k < sizeof pts / sizeof pts[0]; k++) {
+        float x = z->cx + pts[k].ox * z->rx;
+        float y = z->cy + pts[k].oy * z->ry;
+        CHECK(zone_hit(x, y) == zi, "DRIVE d-pad %s lands on zone %d, not the d-pad", pts[k].name, zone_hit(x, y));
+        fdown(1, x, y);
+        s = rd();
+        CHECK(s.Gamepad.wButtons == pts[k].want, "DRIVE d-pad %s: wButtons=0x%x, want 0x%x", pts[k].name,
+              s.Gamepad.wButtons, pts[k].want);
+        CHECK(xbox_ios_touch_dpad_bits() == pts[k].bit, "DRIVE d-pad %s: bits %u, want %u", pts[k].name,
+              xbox_ios_touch_dpad_bits(), pts[k].bit);
+        s.Gamepad.wButtons = 0;
+        expect_idle(&s, "DRIVE d-pad analog/stick");
+        fup(1);
+    }
+
+    /* Sweep the whole zone: never two directions, flags always equal the bits. */
+    for (a = -20; a <= 20; a++)
+        for (b = -20; b <= 20; b++) {
+            float ox = (float)a / 20.0f, oy = (float)b / 20.0f;
+            unsigned bits;
+            if (ox * ox + oy * oy > 0.98f)
+                continue;
+            fdown(1, z->cx + ox * z->rx, z->cy + oy * z->ry);
+            s = rd();
+            bits = xbox_ios_touch_dpad_bits();
+            bits_n = (int)(bits & 1u) + (int)((bits >> 1) & 1u) + (int)((bits >> 2) & 1u) + (int)((bits >> 3) & 1u);
+            CHECK(bits_n <= 1, "DRIVE d-pad at (%.2f,%.2f): %d directions", ox, oy, bits_n);
+            CHECK(((s.Gamepad.wButtons & XBOX_GAMEPAD_DPAD_UP) != 0) == ((bits & XBOX_IOS_DPAD_BIT_UP) != 0) &&
+                  ((s.Gamepad.wButtons & XBOX_GAMEPAD_DPAD_DOWN) != 0) == ((bits & XBOX_IOS_DPAD_BIT_DOWN) != 0) &&
+                  ((s.Gamepad.wButtons & XBOX_GAMEPAD_DPAD_LEFT) != 0) == ((bits & XBOX_IOS_DPAD_BIT_LEFT) != 0) &&
+                  ((s.Gamepad.wButtons & XBOX_GAMEPAD_DPAD_RIGHT) != 0) == ((bits & XBOX_IOS_DPAD_BIT_RIGHT) != 0),
+                  "DRIVE d-pad at (%.2f,%.2f): flags 0x%x differ from bits %u", ox, oy, s.Gamepad.wButtons, bits);
+            fup(1);
+        }
+
+    /* A held finger sliding from one arm to the next changes direction. */
+    fdown(1, z->cx, z->cy - 0.65f * z->ry);
+    fmove(1, z->cx + 0.65f * z->rx, z->cy);
+    s = rd();
+    CHECK(s.Gamepad.wButtons == XBOX_GAMEPAD_DPAD_RIGHT, "DRIVE d-pad slide up -> right: 0x%x", s.Gamepad.wButtons);
+    fup(1);
+
+    /* The arms are separate buttons: the arm rectangles do not touch each other. */
+    {
+        float c0 = fminf(z->rx * 852.0f, z->ry * 393.0f);
+        float inner = (XBOX_IOS_DPAD_ARM_HALF + XBOX_IOS_DPAD_ARM_GAP) * c0;
+        CHECK(inner > XBOX_IOS_DPAD_ARM_HALF * c0 + 2.0f, "d-pad arms are %.1f pt apart, want >= 2",
+              inner - XBOX_IOS_DPAD_ARM_HALF * c0);
+        CHECK(XBOX_IOS_DPAD_DEAD < XBOX_IOS_DPAD_ARM_HALF + XBOX_IOS_DPAD_ARM_GAP,
+              "dead zone reaches into the arms' inner edge");
+    }
+
+    /* PAD and classic DRIVE: the quadrant rule with diagonals, unchanged. */
+    xbox_ios_touch_set_drive_classic(1);
+    z = zone(zone_by_kind(XBOX_IOS_ZONE_DPAD));
+    if (z) {
+        fdown(1, z->cx + 0.7f * z->rx, z->cy - 0.7f * z->ry);
+        s = rd();
+        CHECK(s.Gamepad.wButtons == (XBOX_GAMEPAD_DPAD_UP | XBOX_GAMEPAD_DPAD_RIGHT),
+              "classic DRIVE d-pad corner: 0x%x, want up+right", s.Gamepad.wButtons);
+        CHECK(xbox_ios_touch_dpad_bits() == (XBOX_IOS_DPAD_BIT_UP | XBOX_IOS_DPAD_BIT_RIGHT),
+              "classic DRIVE d-pad corner bits %u", xbox_ios_touch_dpad_bits());
+        fup(1);
+    }
+    xbox_ios_touch_set_drive_classic(0);
+    xbox_ios_touch_set_layout(0);
+    z = zone(zone_by_kind(XBOX_IOS_ZONE_DPAD));
+    if (z) {
+        fdown(1, z->cx - 0.7f * z->rx, z->cy + 0.7f * z->ry);
+        s = rd();
+        CHECK(s.Gamepad.wButtons == (XBOX_GAMEPAD_DPAD_DOWN | XBOX_GAMEPAD_DPAD_LEFT),
+              "PAD d-pad corner: 0x%x, want down+left", s.Gamepad.wButtons);
+        fup(1);
+    }
+}
+
 /* 4a. Left stick, all four directions, deadzone, half travel, clamp. */
 static void t_left_stick(void)
 {
@@ -2589,10 +2697,10 @@ static void t_drive_nosticks(void)
 
 /* 19. DRIVE geometry on an 852x393 screen: nothing overlaps, nothing meets the
  * Dynamic Island strip or leaves the screen, the main controls are at least
- * 44 pt. TOUCHTEST_GEOMETRY=1 prints the table. */
+ * 60 pt. TOUCHTEST_GEOMETRY=1 prints the table. */
 static void t_drive_geometry(void)
 {
-    static const char *main_labels[] = { "GAS", "BRAKE", "NOS", "E-BRAKE" };
+    static const char *main_labels[] = { "GAS", "BRAKE", "NOS", "E-BRAKE" };   /* + strip + d-pad: >= 60 pt */
     const float W = 852.0f, H = 393.0f;
     int n, i, j, k, pass;
     int print = getenv("TOUCHTEST_GEOMETRY") != NULL;
@@ -2659,16 +2767,44 @@ static void t_drive_geometry(void)
             for (k = 0; k < 4; k++) {
                 const XBOX_IOS_TOUCH_ZONE *zk = zone(zone_by_label(main_labels[k]));
                 if (zk)
-                    CHECK(2.0f * zk->rx * W >= 44.0f && 2.0f * zk->ry * H >= 44.0f,
-                          "%s is %.1f x %.1f pt, want >= 44", main_labels[k], 2.0f * zk->rx * W,
+                    CHECK(2.0f * zk->rx * W >= 60.0f && 2.0f * zk->ry * H >= 60.0f,
+                          "%s is %.1f x %.1f pt, want >= 60", main_labels[k], 2.0f * zk->rx * W,
                           2.0f * zk->ry * H);
+            }
+            {
+                /* The d-pad: a circle in points, ~150 pt across the arm tips, four arms of at
+                 * least 44 x 44 pt whose tips lie inside the hit ellipse, above the strip. */
+                const XBOX_IOS_TOUCH_ZONE *zd = zone(zone_by_kind(XBOX_IOS_ZONE_DPAD));
+                const XBOX_IOS_TOUCH_ZONE *zs = zone(strip_zone());
+                if (zd && zs) {
+                    float rpx = zd->rx * W, rpy = zd->ry * H, c0 = fminf(rpx, rpy);
+                    float armw = 2.0f * XBOX_IOS_DPAD_ARM_HALF * c0;
+                    float armlen = (XBOX_IOS_DPAD_ARM_REACH - XBOX_IOS_DPAD_ARM_HALF - XBOX_IOS_DPAD_ARM_GAP) * c0;
+                    float tip = XBOX_IOS_DPAD_ARM_REACH * XBOX_IOS_DPAD_ARM_REACH +
+                                XBOX_IOS_DPAD_ARM_HALF * XBOX_IOS_DPAD_ARM_HALF;
+                    CHECK(fabsf(rpx - rpy) < 1.0f, "the d-pad is %.1f x %.1f pt radii, want a circle", rpx, rpy);
+                    CHECK(2.0f * zd->rx * W >= 60.0f && 2.0f * zd->ry * H >= 60.0f, "the d-pad is under 60 pt");
+                    CHECK(2.0f * XBOX_IOS_DPAD_ARM_REACH * c0 >= 140.0f && 2.0f * XBOX_IOS_DPAD_ARM_REACH * c0 <= 152.0f,
+                          "the d-pad cross is %.1f pt across, want 140-152", 2.0f * XBOX_IOS_DPAD_ARM_REACH * c0);
+                    CHECK(armw >= 44.0f && armlen >= 44.0f, "d-pad arms are %.1f x %.1f pt, want >= 44", armw, armlen);
+                    CHECK(tip < 1.0f, "d-pad arm tips leave the hit circle (%.3f)", tip);
+                    /* A thumb landing a little high on the strip must not hit DOWN. */
+                    CHECK(((zs->cy - zs->ry) - (zd->cy + zd->ry)) * H >= 16.0f,
+                          "the d-pad (bottom %.1f pt) is %.1f pt above the strip (top %.1f pt), want >= 16",
+                          (zd->cy + zd->ry) * H, ((zs->cy - zs->ry) - (zd->cy + zd->ry)) * H, (zs->cy - zs->ry) * H);
+                    {
+                        const XBOX_IOS_TOUCH_ZONE *zb = zone(zone_by_flag(XBOX_GAMEPAD_BACK));
+                        /* Right of BACK's left edge: the left group's safe-area shift stays BACK's. */
+                        CHECK(zb && zd->cx - zd->rx > zb->cx - zb->rx, "the d-pad's left edge is left of BACK's");
+                    }
+                }
             }
             {
                 const XBOX_IOS_TOUCH_ZONE *zs = zone(strip_zone());
                 if (zs)
                 {
-                    CHECK(2.0f * zs->rx * W >= 44.0f && 2.0f * zs->ry * H >= 44.0f,
-                          "the strip is %.1f x %.1f pt, want >= 44", 2.0f * zs->rx * W, 2.0f * zs->ry * H);
+                    CHECK(2.0f * zs->rx * W >= 60.0f && 2.0f * zs->ry * H >= 60.0f,
+                          "the strip is %.1f x %.1f pt, want >= 60", 2.0f * zs->rx * W, 2.0f * zs->ry * H);
                     /* Narrow on purpose (relative steering needs a landing area, not a
                      * wheel): about 0.22 of the width, bottom left. */
                     CHECK(2.0f * zs->rx > 0.20f && 2.0f * zs->rx < 0.24f && zs->cx < 0.25f && zs->cy > 0.7f,
@@ -4193,6 +4329,7 @@ int main(void)
     run_case(" 1c  PAD: two zones at once lift independently",     t_pad_multitouch, NULL);
     run_case(" 2   BACK / START set their wButtons flag",           t_flags, NULL);
     run_case(" 3   D-pad: cardinals, diagonals, neutral centre",    t_dpad, NULL);
+    run_case(" 3b  DRIVE d-pad: one direction at a time, dead zone, PAD / classic keep diagonals", t_dpad_drive, NULL);
     run_case(" 4a  Left stick: directions, deadzone, scale, clamp", t_left_stick, NULL);
     run_case(" 4b  Right stick: directions, independent of left",   t_right_stick, NULL);
     run_case(" 4c  Stick travel follows the window aspect",         t_stick_aspect, NULL);

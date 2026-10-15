@@ -132,6 +132,13 @@ enum {
     ZS_STEER, ZS_OTHER
 };
 
+/* D-pad arm proportions, as fractions of the zone radius (the shorter radius,
+ * in points): a plain-number mirror of XBOX_IOS_DPAD_ARM_* in xinput_ios.h
+ * (not includable here). Keep the two in step. */
+#define DP_REACH 0.95     /* outer edge of an arm, from the centre */
+#define DP_HALF  0.30     /* half the width of an arm */
+#define DP_GAP   0.05     /* gap between neighbouring arms; inner edge = DP_HALF + DP_GAP */
+
 static CGFloat s_cscale = 2.0;       /* screen scale, refreshed at every rebuild */
 static int s_captions_on = 1;         /* Button captions switch (main thread only) */
 static unsigned s_style_epoch = 0;   /* bumped by the panel: rebuild the control layers */
@@ -339,34 +346,6 @@ static CGFloat chord_at(CGFloat w, CGFloat h, CGFloat r, CGFloat y)
     return w - 2.0 * (r - sqrt(fmax(r * r - dy * dy, 0.0)));
 }
 
-/* Closed polygon with every corner rounded by a quad curve. */
-static UIBezierPath *rounded_polygon(const CGPoint *p, int n, CGFloat rad)
-{
-    UIBezierPath *path = [UIBezierPath bezierPath];
-    int i;
-    for (i = 0; i < n; i++) {
-        CGPoint prev = p[(i + n - 1) % n];
-        CGPoint cur = p[i];
-        CGPoint next = p[(i + 1) % n];
-        CGFloat dx1 = prev.x - cur.x, dy1 = prev.y - cur.y;
-        CGFloat dx2 = next.x - cur.x, dy2 = next.y - cur.y;
-        CGFloat l1 = sqrt(dx1 * dx1 + dy1 * dy1);
-        CGFloat l2 = sqrt(dx2 * dx2 + dy2 * dy2);
-        CGPoint a, b;
-        if (l1 < 0.001 || l2 < 0.001)
-            continue;
-        a = CGPointMake(cur.x + dx1 / l1 * rad, cur.y + dy1 / l1 * rad);
-        b = CGPointMake(cur.x + dx2 / l2 * rad, cur.y + dy2 / l2 * rad);
-        if ([path isEmpty])
-            [path moveToPoint:a];
-        else
-            [path addLineToPoint:a];
-        [path addQuadCurveToPoint:b controlPoint:cur];
-    }
-    [path closePath];
-    return path;
-}
-
 /* The largest rounded rectangle (half extents u*A*fx by u*B*fy, corner radius
  * frac * shorter side) whose corners still sit inside the hit-test ellipse
  * with radii A, B: what you can see is what you can touch. */
@@ -406,7 +385,8 @@ static void fit_rounded(CGFloat A, CGFloat B, CGFloat fx, CGFloat fy, CGFloat fr
 @property (nonatomic, strong) CALayer *pressFill;     /* opacity 0 / 1 */
 @property (nonatomic, strong) CALayer *levelClip;     /* pedals: analog fill level */
 @property (nonatomic, strong) CALayer *levelFill;
-@property (nonatomic, strong) NSArray *arms;          /* d-pad: up, down, left, right */
+@property (nonatomic, strong) NSArray *arms;          /* d-pad: up, down, left, right highlight fills */
+@property (nonatomic, strong) NSArray *armRings;      /* d-pad: the same order, one outline per arm */
 @property (nonatomic, strong) UIColor *ringIdle;
 @property (nonatomic, strong) UIColor *ringHot;
 @property (nonatomic, assign) int pressed;            /* cached; -1 = unknown */
@@ -487,11 +467,16 @@ static void fit_rounded(CGFloat A, CGFloat B, CGFloat fx, CGFloat fy, CGFloat fr
             self.knob.opacity = p ? 1.0f : 0.6f;     /* no shrink: the track stays put */
         }
     } else if (self.style == ZS_DPAD) {
+        /* Each arm lights on its own; there is no whole-control ring. */
         NSUInteger k;
         for (k = 0; k < self.arms.count; k++) {
             CALayer *a = [self.arms objectAtIndex:k];
-            a.opacity = (bits & (1u << k)) ? 1.0f : 0.0f;
+            BOOL on = (bits & (1u << k)) ? YES : NO;
+            a.opacity = on ? 1.0f : 0.0f;
+            if (k < self.armRings.count)
+                set_stroke([self.armRings objectAtIndex:k], on ? self.ringHot : self.ringIdle);
         }
+        return;
     } else {
         self.pressFill.opacity = p ? 1.0f : 0.0f;
         self.root.transform = p ? CATransform3DMakeScale(0.92, 0.92, 1.0)
@@ -656,8 +641,8 @@ static Nfsu2Ctl *build_ctl(int idx, const XBOX_IOS_TOUCH_ZONE_MIRROR *z, CGFloat
     BOOL circle = ((face && !wide) || shoulder);
     UIColor *accent = nil;
     UIColor *white = [UIColor colorWithWhite:1.0 alpha:0.92];
-    CGPoint pts[12];
-    CGFloat prad = 0.0;
+    CGRect arm_r[4];                     /* d-pad arms: up, down, left, right */
+    CGFloat arm_rad = 0.0;
 
     switch (style) {
     case ZS_FACE_A:     case ZS_PEDAL_GAS:   accent = rgba(0x5DC21E, 1.0); break;
@@ -695,38 +680,46 @@ static Nfsu2Ctl *build_ctl(int idx, const XBOX_IOS_TOUCH_ZONE_MIRROR *z, CGFloat
     root.contentsScale = s_cscale;
     CGRect R = root.bounds;
 
-    /* Cross outline (d-pad), also the ring path. */
+    /* D-pad: four separate arm buttons with a gap between neighbours and an
+     * empty hub (DP_* above), so it cannot read as one round button. The arm
+     * tips sit inside the hit ellipse. */
     if (cross) {
-        CGFloat c0 = w / 2.0, L = 0.93 * c0, t = 0.32 * c0;
-        pts[0]  = CGPointMake(c0 - t, c0 - L);  pts[1]  = CGPointMake(c0 + t, c0 - L);
-        pts[2]  = CGPointMake(c0 + t, c0 - t);  pts[3]  = CGPointMake(c0 + L, c0 - t);
-        pts[4]  = CGPointMake(c0 + L, c0 + t);  pts[5]  = CGPointMake(c0 + t, c0 + t);
-        pts[6]  = CGPointMake(c0 + t, c0 + L);  pts[7]  = CGPointMake(c0 - t, c0 + L);
-        pts[8]  = CGPointMake(c0 - t, c0 + t);  pts[9]  = CGPointMake(c0 - L, c0 + t);
-        pts[10] = CGPointMake(c0 - L, c0 - t);  pts[11] = CGPointMake(c0 - t, c0 - t);
-        prad = 0.12 * c0;
+        CGFloat c0 = w / 2.0, reach = DP_REACH * c0, inner = (DP_HALF + DP_GAP) * c0;
+        CGFloat hw = DP_HALF * c0;
+        arm_r[0] = CGRectMake(c0 - hw, c0 - reach, 2.0 * hw, reach - inner);   /* up */
+        arm_r[1] = CGRectMake(c0 - hw, c0 + inner, 2.0 * hw, reach - inner);   /* down */
+        arm_r[2] = CGRectMake(c0 - reach, c0 - hw, reach - inner, 2.0 * hw);   /* left */
+        arm_r[3] = CGRectMake(c0 + inner, c0 - hw, reach - inner, 2.0 * hw);   /* right */
+        arm_rad = 0.18 * c0;
     }
 
-    /* Body: glassy dark gradient. */
-    CAGradientLayer *body = [CAGradientLayer layer];
-    body.frame = R;
-    body.contentsScale = s_cscale;
-    if (shoulder)
-        set_gradient(body, [UIColor colorWithWhite:0.22 alpha:0.50],
-                           [UIColor colorWithWhite:0.08 alpha:0.34]);
-    else
-        set_gradient(body, [UIColor colorWithWhite:0.0 alpha:0.46],
-                           [UIColor colorWithWhite:0.0 alpha:0.30]);
+    /* Body: glassy dark gradient (one per arm on the d-pad). */
     if (cross) {
-        CAShapeLayer *mask = [CAShapeLayer layer];
-        mask.frame = R;
-        set_path(mask, rounded_polygon(pts, 12, prad));
-        body.mask = mask;
+        int k;
+        for (k = 0; k < 4; k++) {
+            CAGradientLayer *ab = [CAGradientLayer layer];
+            ab.frame = arm_r[k];
+            ab.contentsScale = s_cscale;
+            set_gradient(ab, [UIColor colorWithWhite:0.0 alpha:0.46],
+                             [UIColor colorWithWhite:0.0 alpha:0.30]);
+            ab.cornerRadius = arm_rad;
+            ab.masksToBounds = YES;
+            [root addSublayer:ab];
+        }
     } else {
+        CAGradientLayer *body = [CAGradientLayer layer];
+        body.frame = R;
+        body.contentsScale = s_cscale;
+        if (shoulder)
+            set_gradient(body, [UIColor colorWithWhite:0.22 alpha:0.50],
+                               [UIColor colorWithWhite:0.08 alpha:0.34]);
+        else
+            set_gradient(body, [UIColor colorWithWhite:0.0 alpha:0.46],
+                               [UIColor colorWithWhite:0.0 alpha:0.30]);
         body.cornerRadius = r;
         body.masksToBounds = YES;
+        [root addSublayer:body];
     }
-    [root addSublayer:body];
 
     /* Pressed fill (faces use their colour). */
     Nfsu2Ctl *c = [[Nfsu2Ctl alloc] init];
@@ -781,17 +774,13 @@ static Nfsu2Ctl *build_ctl(int idx, const XBOX_IOS_TOUCH_ZONE_MIRROR *z, CGFloat
         [root addSublayer:grips];
     }
 
-    /* Faint inner highlight along the top. */
-    {
+    /* Faint inner highlight along the top (not on the d-pad's arms). */
+    if (!cross) {
         CAShapeLayer *hi = [CAShapeLayer layer];
         UIBezierPath *hp = [UIBezierPath bezierPath];
         hi.frame = R;
         hi.contentsScale = s_cscale;
-        if (cross) {
-            CGFloat c0 = w / 2.0, L = 0.93 * c0, t = 0.32 * c0;
-            [hp moveToPoint:CGPointMake(c0 - t + 4.0, c0 - L + 3.5)];
-            [hp addLineToPoint:CGPointMake(c0 + t - 4.0, c0 - L + 3.5)];
-        } else if (circle || (w - 2.0 * r) < 6.0) {
+        if (circle || (w - 2.0 * r) < 6.0) {
             CGFloat hr = fmax(r - 3.5, 2.0);
             CGFloat a0 = M_PI * 1.22, a1 = M_PI * 1.78;
             int k;
@@ -815,14 +804,12 @@ static Nfsu2Ctl *build_ctl(int idx, const XBOX_IOS_TOUCH_ZONE_MIRROR *z, CGFloat
         [root addSublayer:hi];
     }
 
-    /* Ring. */
-    CAShapeLayer *ring = [CAShapeLayer layer];
-    {
+    /* Ring (the d-pad has one per arm, below). */
+    CAShapeLayer *ring = cross ? nil : [CAShapeLayer layer];
+    if (!cross) {
         CGRect ri = CGRectInset(R, 0.75, 0.75);
         UIBezierPath *rp;
-        if (cross)
-            rp = rounded_polygon(pts, 12, prad);
-        else if (circle)
+        if (circle)
             rp = [UIBezierPath bezierPathWithOvalInRect:ri];
         else
             rp = [UIBezierPath bezierPathWithRoundedRect:ri
@@ -928,28 +915,80 @@ static Nfsu2Ctl *build_ctl(int idx, const XBOX_IOS_TOUCH_ZONE_MIRROR *z, CGFloat
         c.travel = fmax((w - kd) / 2.0 - 4.0, 1.0);
     }
 
-    /* D-pad: four arm highlights, lit by xbox_ios_touch_dpad_bits(). */
+    /* D-pad arms, lit one by one by xbox_ios_touch_dpad_bits(): an outline, a
+     * highlight fill and a chevron (SF Symbol, a drawn one when it is missing)
+     * on each. */
     if (cross) {
-        CGFloat c0 = w / 2.0, L = 0.93 * c0, t = 0.32 * c0, ar = 0.12 * c0;
-        CGRect ar_rect[4];
+        static const char *const chev[4] = { "chevron.up", "chevron.down",
+                                             "chevron.left", "chevron.right" };
         NSMutableArray *arms = [NSMutableArray arrayWithCapacity:4];
+        NSMutableArray *rings = [NSMutableArray arrayWithCapacity:4];
         int k;
-        ar_rect[0] = CGRectMake(c0 - t, c0 - L, 2.0 * t, L - t);   /* up */
-        ar_rect[1] = CGRectMake(c0 - t, c0 + t, 2.0 * t, L - t);   /* down */
-        ar_rect[2] = CGRectMake(c0 - L, c0 - t, L - t, 2.0 * t);   /* left */
-        ar_rect[3] = CGRectMake(c0 + t, c0 - t, L - t, 2.0 * t);   /* right */
+        c.ringIdle = [UIColor colorWithWhite:1.0 alpha:0.45];
+        c.ringHot = [UIColor colorWithWhite:1.0 alpha:0.90];
         for (k = 0; k < 4; k++) {
+            CGRect ar = arm_r[k];
+            CGPoint mid = CGPointMake(ar.origin.x + ar.size.width / 2.0, ar.origin.y + ar.size.height / 2.0);
+            CGFloat cs = fmin(ar.size.width, ar.size.height) * 0.40;
+            UIImage *ci = symbol_image(ns(chev[k]), cs);
+            CAShapeLayer *rl = [CAShapeLayer layer];
             CAShapeLayer *arm = [CAShapeLayer layer];
+
+            rl.frame = R;
+            rl.contentsScale = s_cscale;
+            set_path(rl, [UIBezierPath bezierPathWithRoundedRect:CGRectInset(ar, 0.75, 0.75)
+                                                    cornerRadius:fmax(arm_rad - 0.75, 0.0)]);
+            rl.fillColor = NULL;
+            rl.lineWidth = 1.5;
+            set_stroke(rl, c.ringIdle);
+            [root addSublayer:rl];
+            [rings addObject:rl];
+
             arm.frame = R;
             arm.contentsScale = s_cscale;
-            set_path(arm, [UIBezierPath bezierPathWithRoundedRect:ar_rect[k]
-                                                     cornerRadius:ar]);
+            set_path(arm, [UIBezierPath bezierPathWithRoundedRect:ar cornerRadius:arm_rad]);
             set_fill(arm, [UIColor colorWithWhite:1.0 alpha:0.34]);
             arm.opacity = 0.0f;
             [root addSublayer:arm];
             [arms addObject:arm];
+
+            if (ci) {
+                add_image_layer(root, ci, mid, ci.size);
+            } else {
+                /* The symbol did not load: a drawn chevron, half the arm's short side. */
+                CAShapeLayer *cv = [CAShapeLayer layer];
+                UIBezierPath *cp = [UIBezierPath bezierPath];
+                CGFloat e = cs * 0.5, f = cs * 0.3;
+                if (k == 0) {
+                    [cp moveToPoint:CGPointMake(mid.x - e, mid.y + f)];
+                    [cp addLineToPoint:CGPointMake(mid.x, mid.y - f)];
+                    [cp addLineToPoint:CGPointMake(mid.x + e, mid.y + f)];
+                } else if (k == 1) {
+                    [cp moveToPoint:CGPointMake(mid.x - e, mid.y - f)];
+                    [cp addLineToPoint:CGPointMake(mid.x, mid.y + f)];
+                    [cp addLineToPoint:CGPointMake(mid.x + e, mid.y - f)];
+                } else if (k == 2) {
+                    [cp moveToPoint:CGPointMake(mid.x + f, mid.y - e)];
+                    [cp addLineToPoint:CGPointMake(mid.x - f, mid.y)];
+                    [cp addLineToPoint:CGPointMake(mid.x + f, mid.y + e)];
+                } else {
+                    [cp moveToPoint:CGPointMake(mid.x - f, mid.y - e)];
+                    [cp addLineToPoint:CGPointMake(mid.x + f, mid.y)];
+                    [cp addLineToPoint:CGPointMake(mid.x - f, mid.y + e)];
+                }
+                cv.frame = R;
+                cv.contentsScale = s_cscale;
+                set_path(cv, cp);
+                cv.fillColor = NULL;
+                set_stroke(cv, [UIColor colorWithWhite:1.0 alpha:0.92]);
+                cv.lineWidth = 2.5;
+                cv.lineCap = kCALineCapRound;
+                cv.lineJoin = kCALineJoinRound;
+                [root addSublayer:cv];
+            }
         }
         c.arms = arms;
+        c.armRings = rings;
     }
 
     /* Label, icon and caption, rendered once. A control with an icon (that
