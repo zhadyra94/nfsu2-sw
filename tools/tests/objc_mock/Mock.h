@@ -308,7 +308,7 @@ double CACurrentMediaTime(void);
 @interface UIApplication : NSObject
 + (UIApplication*)sharedApplication; @property (readonly) NSSet *connectedScenes;
 @end
-@interface UIScreen : NSObject + (UIScreen*)mainScreen; @property (readonly) CGFloat scale; @property (readonly) CGRect bounds; @end
+@interface UIScreen : NSObject + (UIScreen*)mainScreen; @property (readonly) CGFloat scale, nativeScale; @property (readonly) CGRect bounds; @end
 @interface UIImpactFeedbackGenerator : NSObject
 - (instancetype)initWithStyle:(UIImpactFeedbackStyle)s; - (void)impactOccurred; - (void)prepare;
 @end

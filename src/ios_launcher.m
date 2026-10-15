@@ -36,6 +36,7 @@ extern int         nfsu2_game_data_status(char *desc, size_t n);   /* 0 none 1 f
 extern const char *nfsu2_build_label(void);
 
 int ios_launcher_run(void);
+int ios_point_res_wanted(char *desc, size_t n);
 
 /* ── Settings table (a copy of the overlay panel's rows for these keys) ── */
 
@@ -547,4 +548,44 @@ int ios_launcher_run(void)
     }
     s_running = 0;
     return result;
+}
+
+/* ── Drawable resolution (v29) ── */
+
+/* Called once from main() (iOS, main thread, before any thread starts and
+ * before SDL_CreateWindow): 1 = create the window WITHOUT
+ * SDL_WINDOW_ALLOW_HIGHDPI, so SDL gives the CAMetalLayer contentsScale 1.0
+ * and the swapchain is the size in points; 0 = native pixels.
+ * NFSU2_POINT_RES: auto (default) | 1 forces points | 0 forces native pixels.
+ * Auto picks points on a big iPad: [UIScreen mainScreen].bounds long side
+ * >= 1280 pt and short side >= 720 pt (13" iPad Pro 1376x1032; the 11" 1194x834
+ * and every iPhone stay native). The long and short side are used, not
+ * width and height: the bounds follow the interface orientation. desc gets
+ * the text for the log line, e.g. "852x393 pt, x3". */
+int ios_point_res_wanted(char *desc, size_t n)
+{
+    const char *v = nfsu2_cfg_get("NFSU2_POINT_RES");
+    UIScreen *scr = [UIScreen mainScreen];
+    CGRect b = scr.bounds;
+    CGFloat lw = b.size.width > b.size.height ? b.size.width : b.size.height;
+    CGFloat sh = b.size.width > b.size.height ? b.size.height : b.size.width;
+    int mode = -1;                  /* -1 auto, 0 native, 1 points */
+    int point;
+
+    if (v && (*v == '1' || *v == 'y' || *v == 'Y' || *v == 't' || *v == 'T' ||
+              strcasecmp(v, "on") == 0))
+        mode = 1;
+    else if (v && (*v == '0' || *v == 'n' || *v == 'N' || *v == 'f' || *v == 'F' ||
+                   strcasecmp(v, "off") == 0))
+        mode = 0;
+    point = mode < 0 ? (lw >= 1280.0 && sh >= 720.0) : mode;
+    if (desc && n) {
+        if (point)
+            snprintf(desc, n, "%gx%g pt, x1; NFSU2_POINT_RES=%s", (double)lw, (double)sh,
+                     mode < 0 ? "auto" : "1");
+        else
+            snprintf(desc, n, "%gx%g pt, x%g%s", (double)lw, (double)sh,
+                     (double)scr.nativeScale, mode == 0 ? "; NFSU2_POINT_RES=0" : "");
+    }
+    return point;
 }

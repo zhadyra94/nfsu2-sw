@@ -995,11 +995,20 @@ int main(int argc, char **argv)
          * edge must not leave the game. */
         SDL_SetHint("SDL_IOS_HIDE_HOME_INDICATOR", "2");
         SDL_InitSubSystem(SDL_INIT_VIDEO);
+        /* Drawable size (v29): without ALLOW_HIGHDPI SDL sets the layer's
+         * contentsScale to 1.0 and MoltenVK's surface extent is the size in
+         * points. Decided here, on the main thread, before the window (and
+         * before any thread starts: it reads NFSU2_POINT_RES). */
+        extern int ios_point_res_wanted(char *desc, size_t n);
+        char prdesc[96];
+        int point_res = ios_point_res_wanted(prdesc, sizeof prdesc);
+        fprintf(stderr, "nfsu2: drawable at %s (%s)\n",
+                point_res ? "point resolution" : "native pixels", prdesc);
         fprintf(stderr, "nfsu2: creating SDL window on main thread\n");
         void *win = SDL_CreateWindow("NFSU2", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                      1280, 720,
                                      SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE |
-                                     SDL_WINDOW_ALLOW_HIGHDPI);
+                                     (point_res ? 0 : SDL_WINDOW_ALLOW_HIGHDPI));
         fprintf(stderr, "nfsu2: window=%p (%s)\n", win, win ? "ok" : SDL_GetError());
         nv2a_vk_set_window(win);
         if (!win)

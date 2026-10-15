@@ -2314,6 +2314,11 @@ static const PanelItem s_items[] = {
       .on = "1", .off = "0", .def_on = 1 },
     { .kind = IK_SEG, .title = "Texture filtering", .key = "RECOMP_VK_ANISO",
       .labels = "Off|2x|4x|8x|16x", .values = "1|2|4|8|16", .def_val = "4" },
+    /* main.c / ios_launcher.m ios_point_res_wanted: window flag before
+     * SDL_CreateWindow. Auto = points on an iPad with a 1280x720 pt screen or
+     * bigger (13" Pro/Air), native pixels elsewhere. */
+    { .kind = IK_SEG, .title = "Point resolution (big iPads)", .key = "NFSU2_POINT_RES",
+      .labels = "Auto|On|Off", .values = "auto|1|0", .def_val = "auto" },
     /* ios_launcher.m: the screen before boot (main.c reads the key). Off by
      * default since v29; shown anyway when no game data is found. */
     { .kind = IK_SWITCH, .title = "Launch screen at start",

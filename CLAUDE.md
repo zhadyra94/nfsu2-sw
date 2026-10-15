@@ -1039,6 +1039,24 @@ only, never files): `../IOS_IMPROVEMENT_MAP.md`.
   launch screen next time" row became "Launch screen at start" (Display, default
   off); the launcher row default matches. Every other launcher row already had
   the same key, values and default in the panel. Device-unverified.
+- **Point-resolution drawable on big iPads (v29, iOS):** main.c drops
+  `SDL_WINDOW_ALLOW_HIGHDPI` when `ios_point_res_wanted()` (ios_launcher.m) says
+  so: `[UIScreen mainScreen].bounds` long side >= 1280 pt AND short side >= 720
+  pt (iPad Pro 13" 1376x1032, Air 13" and Pro 12.9" 1366x1024; Pro 11" 1194 and
+  every iPhone stay native). SDL 2.30.9 then sets the CAMetalLayer
+  `contentsScale` to 1.0 (SDL_uikitmetalview.m), MoltenVK reports
+  `currentExtent = bounds * contentsScale` = points, and the swapchain and the
+  present blit (nv2a_vk.c `create_swapchain`, `s_sc_extent`) are 1376x1032
+  instead of 2752x2064: the clear + blit + present touch a quarter of the pixels. Render
+  scale is unchanged (2x = 1280x960 from the 640x480 guest frame, slightly
+  upscaled by the present blit). Touch
+  is normalised and the overlay is UIKit points, so neither depends on the
+  drawable. `NFSU2_POINT_RES=auto|1|0` (default auto; 1 forces points, 0
+  forces native; panel row "Point resolution (big iPads)" in Display, next launch). Log
+  `nfsu2: drawable at native pixels (852x393 pt, x3)` / `drawable at point
+  resolution (1376x1032 pt, x1; NFSU2_POINT_RES=auto)`; the device check is
+  `[VK] swapchain 1376x1032`. Idea from nfsmw-ios (GPLv3), no code taken.
+  Device-unverified.
 - **Layout geometry order** (`zones_rebuild_locked`): preset -> editor
   override -> Size -> aspect shape (round zones keep their phone shape in
   points when the window aspect is >10% off 852/393; `NFSU2_TOUCH_ROUND=0`)
