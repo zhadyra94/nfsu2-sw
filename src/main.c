@@ -973,6 +973,9 @@ int main(int argc, char **argv)
          * executor chatter, as on the Switch. */
         setenv("RECOMP_FRAME_LAG", "1", 0);
         setenv("RECOMP_QUIET", "1", 0);
+        /* 60 fps races (v27): present every vblank. The panel row has
+         * def_on = 1 to match; a "0" in nfsu2_env.txt still wins. */
+        setenv("RECOMP_PRESENT_INTERVAL", "1", 0);
     }
     {
         extern void nv2a_vk_set_window(void *win);

@@ -959,6 +959,12 @@ only, never files): `../IOS_IMPROVEMENT_MAP.md`.
 - **Guest RAM:** `anon_map_fd` uses an unlinked file in `$TMPDIR`
   (shm_open is refused in the sandbox). nfsmw-ios uses a Mach memory entry
   instead; no symptom seen here.
+- **60 fps races on by default (v27, iOS):** main.c sets
+  `RECOMP_PRESENT_INTERVAL=1` with the other iOS defaults (`setenv(..., 0)`:
+  a key in `nfsu2_env.txt` wins, `0` = the old 30 fps races). The gear panel
+  and launch-screen row is "60 fps races" (no "experimental") with
+  `def_on = 1`, so it shows ON when the key is absent. Cutscenes stay at 30
+  fps (v26 `RECOMP_DT_FLOOR=auto`). Device-unverified.
 - **Device verification pending:** everything in v22/v23 (no device log on
   this machine yet).
 
