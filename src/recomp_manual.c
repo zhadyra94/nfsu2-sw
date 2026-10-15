@@ -574,8 +574,11 @@ static void swap_pre(uint32_t slot)
     }
 }
 
+static void unimpl_tick(void);
+
 void sub_002EB4B0(void)
 {
+    unimpl_tick();
     if (swap_interval_wanted())
         swap_pre(0x2F76FCu);
     sub_002EB4B0_gen();
@@ -583,6 +586,7 @@ void sub_002EB4B0(void)
 
 void sub_002EB6A0(void)
 {
+    unimpl_tick();
     if (swap_interval_wanted())
         swap_pre(0x2F76FCu);
     sub_002EB6A0_gen();
@@ -2170,19 +2174,98 @@ void recomp_icall_not_code_log(uint32_t va)
  * cause rather than wherever the damage surfaces. */
 #include <stdlib.h>
 
+#define UNIMPL_SITES 64
+
+static struct { const char *text; uint32_t va; } s_ui_site[UNIMPL_SITES];
+static int s_ui_n;                       /* sites in the table */
+static int s_ui_lock;                    /* tiny spin lock: any guest thread */
+static unsigned long long s_ui_repeat;   /* calls past a site's first print */
+static unsigned long long s_ui_over;     /* calls from sites after the table filled */
+static unsigned long long s_ui_reported; /* over-table count at the last summary */
+static int s_ui_atexit;
+
+/* One summary line, only when sites beyond the table were suppressed since
+ * the last one (a hot site repeating is not news: it already printed). Called
+ * every ~10 s from the swap wrappers and at exit. */
+void recomp_unimpl_report(void)
+{
+    unsigned long long rep, over;
+
+    while (__atomic_exchange_n(&s_ui_lock, 1, __ATOMIC_ACQUIRE))
+        ;
+    rep = s_ui_repeat;
+    over = s_ui_over;
+    if (over == s_ui_reported) {
+        __atomic_store_n(&s_ui_lock, 0, __ATOMIC_RELEASE);
+        return;
+    }
+    s_ui_reported = over;
+    __atomic_store_n(&s_ui_lock, 0, __ATOMIC_RELEASE);
+    fprintf(stderr, "[UNIMPL] %llu call(s) from sites beyond the %d-site table were "
+                    "not printed (%llu repeat call(s) at the %d printed site(s))\n",
+            over, UNIMPL_SITES, rep, s_ui_n);
+    fflush(stderr);
+}
+
+/* Cheap: look at the clock every 16th swap, report at most every 10 s. */
+static void unimpl_tick(void)
+{
+    static unsigned n;
+    static long long last_ms;
+    struct timespec ts;
+    long long ms;
+
+    if ((++n & 15) != 0)
+        return;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    ms = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    if (!last_ms)
+        last_ms = ms;
+    if (ms - last_ms >= 10000) {
+        last_ms = ms;
+        recomp_unimpl_report();
+    }
+}
+
 void recomp_unimpl(const char *text, uint32_t va)
 {
-    static int printed;
-    const char *trap = getenv("RECOMP_UNIMPL_TRAP");
-    int stop = trap && *trap && *trap != '0';
+    static int trap_cached = -1;
+    int i, fresh = 0;
 
-    if (printed < 50 || stop) {
-        printed++;
+    if (trap_cached < 0) {
+        const char *trap = getenv("RECOMP_UNIMPL_TRAP");
+        trap_cached = (trap && *trap && *trap != '0');
+    }
+
+    /* Each (text, va) site prints once. The table holds UNIMPL_SITES; past
+     * that, calls are only counted. */
+    while (__atomic_exchange_n(&s_ui_lock, 1, __ATOMIC_ACQUIRE))
+        ;
+    for (i = 0; i < s_ui_n; i++)
+        if (s_ui_site[i].va == va && s_ui_site[i].text == text)
+            break;
+    if (i < s_ui_n) {
+        s_ui_repeat++;
+    } else if (s_ui_n < UNIMPL_SITES) {
+        s_ui_site[s_ui_n].text = text;
+        s_ui_site[s_ui_n].va = va;
+        s_ui_n++;
+        fresh = 1;
+        if (!s_ui_atexit) {
+            s_ui_atexit = 1;
+            atexit(recomp_unimpl_report);
+        }
+    } else {
+        s_ui_over++;
+    }
+    __atomic_store_n(&s_ui_lock, 0, __ATOMIC_RELEASE);
+
+    if (fresh || trap_cached) {
         fprintf(stderr,
                 "[UNIMPL] untranslated instruction REACHED: `%s` at 0x%08X"
                 " (a no-op; set RECOMP_UNIMPL_TRAP=1 to stop here)\n",
                 text, va);
         fflush(stderr);
     }
-    if (stop) abort();
+    if (trap_cached) abort();
 }

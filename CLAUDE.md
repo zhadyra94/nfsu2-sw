@@ -965,6 +965,19 @@ only, never files): `../IOS_IMPROVEMENT_MAP.md`.
   and launch-screen row is "60 fps races" (no "experimental") with
   `def_on = 1`, so it shows ON when the key is absent. Cutscenes stay at 30
   fps (v26 `RECOMP_DT_FLOOR=auto`). Device-unverified.
+- **Log noise (v27):** iOS default `MVK_CONFIG_LOG_LEVEL=1` (errors only),
+  set before `SDL_CreateWindow` next to the other MVK default; level 2 printed
+  `[mvk-warn] ... Metal does not support disabling primitive restart` for every
+  pipeline (123 lines in one short device session). `recomp_unimpl`
+  (recomp_manual.c) prints each (text, va) site once from a 64-site table;
+  further calls, and calls from sites past the table, are only counted. One
+  line `[UNIMPL] N call(s) from sites beyond the 64-site table were not
+  printed (M repeat call(s) at S printed site(s))` follows every ~10 s (clock
+  checked in the swap wrappers) and at exit, only when sites beyond the table
+  were suppressed since the last line (a hot site repeating prints nothing
+  more). `RECOMP_UNIMPL_TRAP=1` still prints and aborts at the first hit.
+  Linux run: 7 sites, each printed once, no summary. The MVK key is
+  device-unverified.
 - **Device verification pending:** everything in v22/v23 (no device log on
   this machine yet).
 

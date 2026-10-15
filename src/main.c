@@ -964,6 +964,11 @@ int main(int argc, char **argv)
         setenv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS", "0", 0);
         fprintf(stderr, "nfsu2: MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS=%s\n",
                 getenv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS"));
+        /* MoltenVK log level 1 = errors only. Level 2 (default) prints
+         * "[mvk-warn] Metal does not support disabling primitive restart"
+         * for every pipeline (123 lines in one short session). Same
+         * rule: read once, so it must precede SDL_CreateWindow. */
+        setenv("MVK_CONFIG_LOG_LEVEL", "1", 0);
         /* iOS defaults, set here on the main thread before any other
          * thread reads the environment; a key in nfsu2_env.txt wins.
          * Frame lag: the game waits on the previous frame's fence, so game
