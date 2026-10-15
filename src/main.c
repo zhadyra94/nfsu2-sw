@@ -530,7 +530,7 @@ static const char *const nfsu2_ios_alts[] = { "NFSU2-data", "game", "nfsu2", "NF
 /* Build label for the launch screen. */
 const char *nfsu2_build_label(void)
 {
-    return "v26 " __DATE__;
+    return "v27 " __DATE__;
 }
 
 /* Is the launch screen on? NFSU2_LAUNCHER, default on; an odd value follows
@@ -893,7 +893,7 @@ int main(int argc, char **argv)
     /* Redirect the log FIRST so main-thread init output is captured. */
     ios_log_to_documents();
     setvbuf(stderr, NULL, _IONBF, 0);
-    fprintf(stderr, "nfsu2: build v26 (v25 + cutscenes at 30 fps in 60 fps mode, no white flashes in the opening movie)\n");
+    fprintf(stderr, "nfsu2: build v27 (v26 + mipmaps and 4x texture filtering, 60 fps by default, vblank locked to the display, app icon, quieter log)\n");
     fprintf(stderr, "nfsu2: HOME=%s TMPDIR=%s\n",
             getenv("CFFIXED_USER_HOME") ? getenv("CFFIXED_USER_HOME") : "(unset)",
             getenv("TMPDIR") ? getenv("TMPDIR") : "(unset)");
@@ -1141,7 +1141,7 @@ static int game_main(void)
 #ifdef NFSU2_IOS
     ios_log_to_documents();
     setvbuf(stderr, NULL, _IONBF, 0);
-    fprintf(stderr, "nfsu2: build v26 (v25 + cutscenes at 30 fps in 60 fps mode, no white flashes in the opening movie)\n");
+    fprintf(stderr, "nfsu2: build v27 (v26 + mipmaps and 4x texture filtering, 60 fps by default, vblank locked to the display, app icon, quieter log)\n");
     fprintf(stderr, "nfsu2: HOME=%s CFFIXED_USER_HOME=%s TMPDIR=%s\n",
             getenv("HOME") ? getenv("HOME") : "(unset)",
             getenv("CFFIXED_USER_HOME") ? getenv("CFFIXED_USER_HOME") : "(unset)",
