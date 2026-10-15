@@ -1,5 +1,5 @@
 /**
- * Need for Speed: Underground 2 (Xbox) - recompiled game entry point
+ * Need for Speed: Underground (Xbox, NFSU1) - recompiled game entry point
  *
  * Boot order (same on every host):
  *   crash reporter -> load default.xbe -> xbox_MemoryLayoutInit ->
@@ -83,13 +83,13 @@ extern void xiso_sha256(const void *data, size_t len, uint8_t out[32]);
 
 /* The disc this build expects. These values belong to the gen/ the binary was
  * built from (the XBE the lifter read), so they must change together with it:
- * NFSU2 NTSC-U, default.xbe certificate title ID 0x4541005A, certificate
+ * NFSU1 NTSC-U, default.xbe certificate title ID 0x45410047, certificate
  * version 0x00000001. A different title ID is refused; a different SHA-256
  * (another printing) only warns, because the lifted code may still match. */
-#define NFSU2_XBE_TITLE_ID 0x4541005Au
+#define NFSU2_XBE_TITLE_ID 0x45410047u
 #define NFSU2_XBE_VERSION  0x00000001u
 static const char NFSU2_XBE_SHA256[] =
-    "95c22b9c594f0c187f602ac6484fe4cb65a9d53dafe3110ed815598eb9dcb0bd";
+    "cdd562ffcc70906b3fecd841db4dc10fd463664b05e03f896a8fb38b9a7d878a";
 
 /* Check the default.xbe read from a disc image. Returns 0 to refuse. */
 static int check_disc_identity(const uint8_t *xbe, size_t size)
@@ -115,7 +115,7 @@ static int check_disc_identity(const uint8_t *xbe, size_t size)
     memcpy(&version, xbe + cert + 0xAC, 4);
     if (title_id != NFSU2_XBE_TITLE_ID) {
         fprintf(stderr, "[XISO] FATAL: wrong game in %s: title ID 0x%08X, "
-                "this build runs only NFSU2 NTSC-U (title ID 0x%08X)\n",
+                "this build runs only NFSU1 NTSC-U (title ID 0x%08X)\n",
                 xiso_image_path(), title_id, NFSU2_XBE_TITLE_ID);
         return 0;
     }
@@ -132,7 +132,7 @@ static int check_disc_identity(const uint8_t *xbe, size_t size)
     return 1;
 }
 
-#define NFSU2_ENTRY_POINT 0x0021B1CEu
+#define NFSU2_ENTRY_POINT 0x00164356u
 
 
 /* iOS detection, once: the iphoneos SDK predefines __IPHONE_OS_VERSION_MIN_REQUIRED__.
@@ -525,12 +525,12 @@ static const char *ios_save_dir(void)
 
 /* Folders people copy the game into, probed in this order after the plain
  * game dir. Shared with game_main so the launch screen and the boot agree. */
-static const char *const nfsu2_ios_alts[] = { "NFSU2-data", "game", "nfsu2", "NFSU2" };
+static const char *const nfsu2_ios_alts[] = { "NFSU1-data", "game", "nfsu1", "NFSU1" };
 
 /* Build label for the launch screen. */
 const char *nfsu2_build_label(void)
 {
-    return "v29 " __DATE__;
+    return "u1-1 " __DATE__;
 }
 
 /* Is the launch screen asked for? NFSU2_LAUNCHER, default OFF (v29): the game
@@ -690,6 +690,10 @@ static void install_crash_reporter(void)
 static void install_crash_reporter(void) {}
 #else
 #include <execinfo.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 static void crash_signal(int sig, siginfo_t *si, void *uc)
 {
@@ -711,6 +715,23 @@ static void crash_signal(int sig, siginfo_t *si, void *uc)
     raise(sig);
 }
 
+#ifdef __linux__
+/* SIGUSR1 to one thread (tgkill): print that thread's guest state and host
+ * backtrace, then go on. For hangs: a stack snapshot of every guest thread. */
+static void snapshot_signal(int sig, siginfo_t *si, void *uc)
+{
+    void *frames[32];
+    int n;
+    (void)sig; (void)si; (void)uc;
+    fprintf(stderr, "[SNAP] thread %ld\n", (long)syscall(SYS_gettid));
+    print_guest_state();
+    n = backtrace(frames, 32);
+    fprintf(stderr, "  host backtrace:\n");
+    fflush(stderr);
+    backtrace_symbols_fd(frames, n, 2);
+}
+#endif
+
 static void install_crash_reporter(void)
 {
     struct sigaction sa;
@@ -729,6 +750,10 @@ static void install_crash_reporter(void)
     sigaction(SIGBUS, &sa, NULL);
     sigaction(SIGILL, &sa, NULL);
     sigaction(SIGFPE, &sa, NULL);
+#ifdef __linux__
+    sa.sa_sigaction = snapshot_signal;
+    sigaction(SIGUSR1, &sa, NULL);
+#endif
 }
 #endif
 
@@ -777,7 +802,6 @@ void xbox_guest_pin(int interrupt);   /* win32_compat.c: the Xbox's one CPU */
 void xbox_gil_enter(void);             /* kernel_bridge.c: the guest lock */
 void xbox_gil_leave(void);
 void xbox_gil_mark_main(void);
-void nfsu2_text_patch_init(void);    /* text_patch.c: Switch button names */
 
 #ifdef __SWITCH__
 #include <pthread.h>
@@ -891,7 +915,7 @@ int main(int argc, char **argv)
     /* Redirect the log FIRST so main-thread init output is captured. */
     ios_log_to_documents();
     setvbuf(stderr, NULL, _IONBF, 0);
-    fprintf(stderr, "nfsu2: build v29 (v28 + no launch screen at start, point-resolution drawable on big iPads)\n");
+    fprintf(stderr, "nfsu1: build u1-1 (first NFSU1 iOS build: NFSU1 lift on the NFSU2 v29 shell)\n");
     fprintf(stderr, "nfsu2: HOME=%s TMPDIR=%s\n",
             getenv("CFFIXED_USER_HOME") ? getenv("CFFIXED_USER_HOME") : "(unset)",
             getenv("TMPDIR") ? getenv("TMPDIR") : "(unset)");
@@ -987,6 +1011,11 @@ int main(int argc, char **argv)
         /* 60 fps races (v27): present every vblank. The panel row has
          * def_on = 1 to match; a "0" in nfsu2_env.txt still wins. */
         setenv("RECOMP_PRESENT_INTERVAL", "1", 0);
+        /* NFSU1: 4:3 and no movie crop until both are checked for this
+         * title (game_main sets the same defaults; setting them here keeps
+         * every setenv before the other threads start). */
+        setenv("RECOMP_WIDESCREEN", "0", 0);
+        setenv("NFSU2_MOVIE_CROP", "0", 0);
     }
     {
         extern void nv2a_vk_set_window(void *win);
@@ -1005,7 +1034,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "nfsu2: drawable at %s (%s)\n",
                 point_res ? "point resolution" : "native pixels", prdesc);
         fprintf(stderr, "nfsu2: creating SDL window on main thread\n");
-        void *win = SDL_CreateWindow("NFSU2", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+        void *win = SDL_CreateWindow("NFSU1", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                      1280, 720,
                                      SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE |
                                      (point_res ? 0 : SDL_WINDOW_ALLOW_HIGHDPI));
@@ -1155,7 +1184,7 @@ static int game_main(void)
 #ifdef NFSU2_IOS
     ios_log_to_documents();
     setvbuf(stderr, NULL, _IONBF, 0);
-    fprintf(stderr, "nfsu2: build v29 (v28 + no launch screen at start, point-resolution drawable on big iPads)\n");
+    fprintf(stderr, "nfsu1: build u1-1 (first NFSU1 iOS build: NFSU1 lift on the NFSU2 v29 shell)\n");
     fprintf(stderr, "nfsu2: HOME=%s CFFIXED_USER_HOME=%s TMPDIR=%s\n",
             getenv("HOME") ? getenv("HOME") : "(unset)",
             getenv("CFFIXED_USER_HOME") ? getenv("CFFIXED_USER_HOME") : "(unset)",
@@ -1165,7 +1194,7 @@ static int game_main(void)
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
-    printf("=== Need for Speed: Underground 2 (Xbox) - static recompilation ===\n");
+    printf("=== Need for Speed: Underground (Xbox) - static recompilation ===\n");
     install_crash_reporter();
     if (getenv("NFSU2_EXIT_TRACE"))
         atexit(print_guest_state);
@@ -1183,6 +1212,10 @@ static int game_main(void)
     setenv("RECOMP_AC97_READY", "plain", 0);
     setenv("RECOMP_USB", "1", 0);       /* the pad is on the MCPX's OHCI */
     setenv("RECOMP_PB_EXEC", "1", 0);   /* the title draws through NV2A */
+    /* NFSU1 first boot: no movie crop; no widescreen EEPROM bit (a known
+     * CreateDevice stall path). */
+    setenv("NFSU2_MOVIE_CROP", "0", 0);
+    setenv("RECOMP_WIDESCREEN", "0", 0);
 #endif
 #if defined(__SWITCH__)
     /* Every periodic log line flushes to the SD card; keep the log to what
@@ -1238,7 +1271,7 @@ static int game_main(void)
                     xiso_image_path());
             xiso_unmount();
         } else if (!check_disc_identity((const uint8_t *)xbe_data, xbe_size)) {
-            fatal("This disc image is not Need for Speed: Underground 2 "
+            fatal("This disc image is not Need for Speed: Underground "
                   "(NTSC-U Xbox). See the log for the title ID found.");
             free(xbe_data);
             xiso_unmount();
@@ -1268,23 +1301,8 @@ static int game_main(void)
     printf("Xbox memory mapped at host offset 0x%llX\n",
            (unsigned long long)g_xbox_mem_offset);
 
-    /* Game time per frame is capped: sub_001890C0 takes the real elapsed
-     * time but at most 3.0 (the .data float at 0x3A4C64, read nowhere else)
-     * x 1/60 s = 50 ms, and drops the rest. Below 20 fps the game ran slower
-     * than real time (races looked slow-motion on the Switch at 13-19 fps).
-     * NFSU2_SIM_STEPS sets the cap in 1/60 s units: default 6 = 100 ms, real
-     * speed down to 10 fps; 3 = the original. */
-    {
-        const char *e = getenv("NFSU2_SIM_STEPS");
-        float steps = e ? (float)atof(e) : 6.0f;
-        if (steps >= 1.0f && steps <= 30.0f) {
-            float *cap = (float *)((uint8_t *)xbox_GetMemoryBase() + 0x3A4C64);
-            if (*cap == 3.0f) {
-                *cap = steps;
-                printf("[BOOT] game time cap %.0f ms per frame\n", steps * 1000.0f / 60.0f);
-            }
-        }
-    }
+    /* NFSU2 raised a sim-step cap in .data here (0x3A4C64); that address is
+     * outside NFSU1's image, so NFSU1 has no such patch. */
 
     /* The emulated APU. DirectSound's accesses reach it through the MMIO
      * accessors the DSOUND section is lifted with (regen.sh passes
@@ -1314,7 +1332,8 @@ static int game_main(void)
         xbox_OhciInit();
     }
 
-    /* The NIC the title's XNET library drives (src/nic.c). */
+    /* The NIC the title's XNET library drives (src/nic.c). NFSU1's XBE has no
+     * XNET section, so this should be harmless but unused. */
     {
         extern void nfsu2_nic_init(void);
         nfsu2_nic_init();
@@ -1337,7 +1356,7 @@ static int game_main(void)
 #endif
 
     xbox_kernel_init();
-    nfsu2_text_patch_init();
+    /* NFSU2's string-table patch (text_patch.c) does not apply to NFSU1. */
 #ifdef NFSU2_IOS
     xbox_path_init(game_dir, ios_save_dir());
 #else

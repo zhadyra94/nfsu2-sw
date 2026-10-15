@@ -2300,7 +2300,7 @@ static const PanelItem s_items[] = {
     { .kind = IK_SEG, .title = "Render scale", .key = "RECOMP_GL_SCALE",
       .labels = "1x|1.5x|2x|3x", .values = "1|1.5|2|3", .def_val = "2" },
     { .kind = IK_SWITCH, .title = "Widescreen 16:9", .key = "RECOMP_WIDESCREEN",
-      .on = "1", .off = "0", .def_on = 1 },
+      .on = "1", .off = "0", .def_on = 0 },
     { .kind = IK_SWITCH, .title = "60 fps races",
       .key = "RECOMP_PRESENT_INTERVAL", .on = "1", .off = "0", .def_on = 1 },
     { .kind = IK_SLIDER, .title = "Brightness", .key = "NFSU2_GAMMA",
@@ -2308,7 +2308,7 @@ static const PanelItem s_items[] = {
     { .kind = IK_SWITCH, .title = "Car reflections", .key = "RECOMP_VK_CUBE",
       .on = "1", .off = "0", .def_on = 1 },
     { .kind = IK_SWITCH, .title = "Fill screen with movies", .key = "NFSU2_MOVIE_CROP",
-      .on = "1", .off = "0", .def_on = 1 },
+      .on = "1", .off = "0", .def_on = 0 },
     /* nv2a_vk.c: guest mip chains + anisotropic filtering of mipped textures. */
     { .kind = IK_SWITCH, .title = "Mipmaps", .key = "RECOMP_VK_MIPS",
       .on = "1", .off = "0", .def_on = 1 },

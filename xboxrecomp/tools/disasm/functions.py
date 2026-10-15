@@ -546,12 +546,28 @@ class FunctionDetector:
         def in_code_section(addr: int) -> bool:
             return any(lo <= addr < hi for lo, hi in code_ranges)
 
+        # NFSU1 local change: an immediate in a *library* section (D3D, DSOUND,
+        # XPP, ...) never names a function of the title's own .text. (Library
+        # to library references stay: DSOUND stores a DOLBY function pointer
+        # at 0x1EAB5B.) The XDK's D3D
+        # code is full of NV2A register constants that happen to equal .text
+        # addresses (0x100A20, 0x100A50, 0x118700, 0xC181C, 0x1C527C): each was
+        # promoted to a function start, which cut NFSU1's sub_001009C0 (a jump
+        # table switch) in three and left its 0x100A48 tail unreachable.
+        def section_name(addr: int) -> str:
+            for sec in sections:
+                if sec.virtual_addr <= addr < sec.virtual_addr + sec.virtual_size:
+                    return sec.name
+            return ""
+
         targets = set()
         for insn in self.engine.instructions.values():
             target = insn.imm_ref
             if target is None or target in self.functions:
                 continue
             if inside_a_function(target) or not in_code_section(target):
+                continue
+            if section_name(target) == ".text" and section_name(insn.address) != ".text":
                 continue
             targets.add(target)
 

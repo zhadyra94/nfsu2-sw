@@ -59,7 +59,7 @@ static const LItem s_litems[] = {
     { .kind = LK_SEG, .title = "Render scale", .key = "RECOMP_GL_SCALE",
       .labels = "1x|1.5x|2x|3x", .values = "1|1.5|2|3", .def_val = "2" },
     { .kind = LK_SWITCH, .title = "Widescreen 16:9", .key = "RECOMP_WIDESCREEN",
-      .on = "1", .off = "0", .def_on = 1 },
+      .on = "1", .off = "0", .def_on = 0 },
     { .kind = LK_SWITCH, .title = "60 fps races",
       .key = "RECOMP_PRESENT_INTERVAL", .on = "1", .off = "0", .def_on = 1 },
     { .kind = LK_SLIDER, .title = "Brightness", .key = "NFSU2_GAMMA",
@@ -67,7 +67,7 @@ static const LItem s_litems[] = {
     { .kind = LK_SWITCH, .title = "Car reflections", .key = "RECOMP_VK_CUBE",
       .on = "1", .off = "0", .def_on = 1 },
     { .kind = LK_SWITCH, .title = "Fill screen with movies", .key = "NFSU2_MOVIE_CROP",
-      .on = "1", .off = "0", .def_on = 1 },
+      .on = "1", .off = "0", .def_on = 0 },
     { .kind = LK_SWITCH, .title = "Mipmaps", .key = "RECOMP_VK_MIPS",
       .on = "1", .off = "0", .def_on = 1 },
     { .kind = LK_SEG, .title = "Texture filtering", .key = "RECOMP_VK_ANISO",
@@ -343,7 +343,7 @@ static CGFloat ln_seg_row(Nfsu2LauncherVC *vc, UIView *card, int idx, CGFloat cy
     CGFloat x0 = floor((w - cw) / 2);
     CGFloat y = 16;
 
-    y = ln_place(sv, ln_label(@"Need for Speed: Underground 2", 26, [UIColor whiteColor], YES),
+    y = ln_place(sv, ln_label(@"Need for Speed: Underground", 26, [UIColor whiteColor], YES),
                  x0, y, cw);
     y += 2;
     y = ln_place(sv, ln_label([NSString stringWithFormat:@"Static recompilation port · build %s",
@@ -367,8 +367,8 @@ static CGFloat ln_seg_row(Nfsu2LauncherVC *vc, UIView *card, int idx, CGFloat cy
             cy = ln_place(card, ln_label(@"⚠︎ No game data found", 15, ln_amber(), YES),
                           14, cy, cw - 28);
             cy += 6;
-            cy = ln_place(card, ln_label(@"Copy NFSU2.iso (or the extracted disc folder) into "
-                                         @"Files > On My iPhone/iPad > NFSU2, then reopen the app.",
+            cy = ln_place(card, ln_label(@"Copy NFSU1.iso (or the extracted disc folder) into "
+                                         @"Files > On My iPhone/iPad > NFSU1, then reopen the app.",
                                          13, [UIColor lightGrayColor], NO), 14, cy, cw - 28);
         }
         cy += 12;
