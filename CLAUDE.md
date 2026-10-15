@@ -996,7 +996,7 @@ only, never files): `../IOS_IMPROVEMENT_MAP.md`.
   rx ry`), saved to `Documents/nfsu2_touch_layout_<phone|pad>.txt`.
   Pre-launch screen `src/ios_launcher.m` runs after cfg_load and before any
   thread / SDL_CreateWindow, exports only the keys it changed
-  (`nfsu2_cfg_export_changed`); `NFSU2_LAUNCHER=0` skips it.
+  (`nfsu2_cfg_export_changed`); off by default since v29 (see below).
 - **Steering (v25):** DRIVE strip default x 0.06-0.28 (51-239 pt on 852),
   RELATIVE by default (`NFSU2_STEER_MODE=relative|absolute`): the
   touch-down x is straight, d = (x - x_down) / (0.075 / sens), clamp, 0.04
@@ -1027,6 +1027,18 @@ only, never files): `../IOS_IMPROVEMENT_MAP.md`.
   dead zone 0.30 of the radius); PAD and classic Drive keep the quadrant rule
   with diagonals. One helper (`dpad_dirs`) feeds both the game state and the
   highlight. Layout editor keeps working (same zone id). Device-unverified.
+- **No launch screen at start (v29, iOS):** `NFSU2_LAUNCHER` now defaults to
+  off (`nfsu2_launcher_enabled`, main.c); `=1` shows `ios_launcher.m` as before,
+  and it is always shown when `nfsu2_game_data_status()` is 0 (no game folder,
+  no .iso: the only guidance for missing data). Log `nfsu2: launch screen off
+  (NFSU2_LAUNCHER=1 shows it)` / `shown (NFSU2_LAUNCHER=1)` / `shown: no game
+  data`. The launcher leaves nothing behind that SDL uses (SDL 2.30.9 makes its
+  own `UIWindow initWithFrame:`; the launcher's window is hidden and released),
+  so the skip path is the v13-v23 flow; the gear button (re-centred in
+  `adapt_feed` on every layout pass) opens the panel. The panel's old "Show
+  launch screen next time" row became "Launch screen at start" (Display, default
+  off); the launcher row default matches. Every other launcher row already had
+  the same key, values and default in the panel. Device-unverified.
 - **Layout geometry order** (`zones_rebuild_locked`): preset -> editor
   override -> Size -> aspect shape (round zones keep their phone shape in
   points when the window aspect is >10% off 852/393; `NFSU2_TOUCH_ROUND=0`)

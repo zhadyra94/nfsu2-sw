@@ -533,17 +533,15 @@ const char *nfsu2_build_label(void)
     return "v28 " __DATE__;
 }
 
-/* Is the launch screen on? NFSU2_LAUNCHER, default on; an odd value follows
- * the in-game panel's rule (0/n/f off, 1/y/t on, else the default). */
+/* Is the launch screen asked for? NFSU2_LAUNCHER, default OFF (v29): the game
+ * starts at once and the gear button opens the settings. 1/y/t on, anything
+ * else (0/n/f, an odd value, unset) off. Missing game data shows it anyway:
+ * see the call site in main(). */
 static int nfsu2_launcher_enabled(void)
 {
     const char *v = nfsu2_cfg_get("NFSU2_LAUNCHER");
 
-    if (!v || !v[0])
-        return 1;
-    if (*v == '0' || *v == 'n' || *v == 'N' || *v == 'f' || *v == 'F')
-        return 0;
-    return 1;
+    return v && (*v == '1' || *v == 'y' || *v == 'Y' || *v == 't' || *v == 'T');
 }
 
 /* What game_main will find, decided WITHOUT mounting or reading anything, so
@@ -937,19 +935,26 @@ int main(int argc, char **argv)
     }
     {
         /* Launch screen: AFTER cfg_load, BEFORE the defaults below, the
-         * window and every thread. It runs on this thread only, writes its
+         * window and every thread. Off by default (v29); shown when
+         * NFSU2_LAUNCHER=1, and always when there is no game data (it is the
+         * only guidance for that). It runs on this thread only, writes its
          * choices with nfsu2_cfg_set (table + file, no setenv) and returns
          * on Play; the changed keys are then exported once with overwrite
          * (safe: no other thread exists yet). Any failure inside the
-         * launcher is logged there and we go straight on to the game.
-         * NFSU2_LAUNCHER=0 skips it. */
+         * launcher is logged there and we go straight on to the game. The
+         * skip path creates nothing the window needs (SDL builds its own
+         * UIWindow), so it is the same flow as v13-v23. */
         extern int ios_launcher_run(void);
-        if (nfsu2_launcher_enabled()) {
+        char dd[1200];
+        int no_data = nfsu2_game_data_status(dd, sizeof dd) == 0;
+        if (no_data || nfsu2_launcher_enabled()) {
+            fprintf(stderr, no_data ? "nfsu2: launch screen shown: no game data\n"
+                                    : "nfsu2: launch screen shown (NFSU2_LAUNCHER=1)\n");
             fprintf(stderr, "nfsu2: launch screen %s\n",
                     ios_launcher_run() ? "done (Play)" : "not shown");
             nfsu2_cfg_export_changed();
         } else {
-            fprintf(stderr, "nfsu2: launch screen off (NFSU2_LAUNCHER=0)\n");
+            fprintf(stderr, "nfsu2: launch screen off (NFSU2_LAUNCHER=1 shows it)\n");
         }
     }
     {

@@ -3,7 +3,8 @@
  *
  * ios_launcher_run() is called once from main() (iOS) on the UIKit main
  * thread, after cfg_load and before the defaults, SDL_CreateWindow and every
- * other thread. It shows a full-screen UIWindow with
+ * other thread, only when NFSU2_LAUNCHER=1 or no game data was found (v29:
+ * off by default, the gear panel has the same rows). It shows a full-screen UIWindow with
  *   - whether game data was found (nfsu2_game_data_status, main.c),
  *   - the Display / Audio / Controls settings that otherwise only apply on
  *     the next launch,
@@ -84,7 +85,7 @@ static const LItem s_litems[] = {
 
     { .kind = LK_HEAD, .title = "Launch" },
     { .kind = LK_SWITCH, .title = "Show this screen at launch", .key = "NFSU2_LAUNCHER",
-      .on = "1", .off = "0", .def_on = 1 },
+      .on = "1", .off = "0", .def_on = 0 },
 };
 #define LITEM_COUNT ((int)(sizeof s_litems / sizeof s_litems[0]))
 

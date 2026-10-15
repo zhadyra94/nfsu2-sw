@@ -2314,6 +2314,11 @@ static const PanelItem s_items[] = {
       .on = "1", .off = "0", .def_on = 1 },
     { .kind = IK_SEG, .title = "Texture filtering", .key = "RECOMP_VK_ANISO",
       .labels = "Off|2x|4x|8x|16x", .values = "1|2|4|8|16", .def_val = "4" },
+    /* ios_launcher.m: the screen before boot (main.c reads the key). Off by
+     * default since v29; shown anyway when no game data is found. */
+    { .kind = IK_SWITCH, .title = "Launch screen at start",
+      .key = "NFSU2_LAUNCHER", .on = "1", .off = "0", .def_on = 0,
+      .note = "Off: the game starts at once (shown anyway with no game data)" },
 
     { .kind = IK_HEAD, .title = "Audio — applies on next launch" },
     { .kind = IK_SLIDER, .title = "Volume", .key = "RECOMP_AUDIO_VOLUME",
@@ -2346,9 +2351,6 @@ static const PanelItem s_items[] = {
      * splitting render passes; default off until measured on device. */
     { .kind = IK_SWITCH, .title = "Hoist texture uploads",
       .key = "RECOMP_VK_HOIST", .on = "1", .off = "0", .def_on = 0 },
-    /* ios_launcher.m: the screen before boot (main.c reads the key). */
-    { .kind = IK_SWITCH, .title = "Show launch screen next time",
-      .key = "NFSU2_LAUNCHER", .on = "1", .off = "0", .def_on = 1 },
 };
 #define ITEM_COUNT ((int)(sizeof s_items / sizeof s_items[0]))
 
@@ -2967,6 +2969,11 @@ static void adapt_feed(void)
                 (double)b.size.width, (double)b.size.height,
                 (double)(b.size.width / b.size.height));
     }
+    /* The gear is the only way in to the settings now that the launch screen
+     * is off by default: keep it centred under the top inset even when the
+     * overlay was installed before UIKit's first layout pass. */
+    if (s_gear)
+        s_gear.frame = CGRectMake(b.size.width / 2 - 22, sa.top + 4, 44, 44);
     if (fabs(sa.top - s_safe.top) > 0.01 || fabs(sa.left - s_safe.left) > 0.01) {
         s_safe = sa;
         fps_reposition();
