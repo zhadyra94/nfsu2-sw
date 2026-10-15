@@ -381,6 +381,10 @@ static int swap_interval_wanted(void)
     return v;
 }
 
+/* The value we replaced at 0x2F76FC, so it can be put back. */
+static int s_forced;
+static uint32_t s_forced_from, s_forced_to;
+
 static void force_interval(uint32_t slot)
 {
     static uint32_t last;
@@ -392,11 +396,23 @@ static void force_interval(uint32_t slot)
         fixed = 1u;
     if (fixed != cur) {
         MEM32(slot) = fixed;
+        s_forced = 1;
+        s_forced_from = cur;
+        s_forced_to = fixed;
         if (cur != last) {
             last = cur;
             fprintf(stderr, "[FPS] swap interval 0x%08X -> every vblank\n", cur);
         }
     }
+}
+
+/* Undo force_interval where the game still holds what we wrote. A value the
+ * game rewrote itself is left alone. */
+static void unforce_interval(uint32_t slot)
+{
+    if (s_forced && MEM32(slot) == s_forced_to)
+        MEM32(slot) = s_forced_from;
+    s_forced = 0;
 }
 
 /* ── 60 fps time floor (0x428EE8) at each swap ─────────────────
@@ -410,22 +426,30 @@ static void force_interval(uint32_t slot)
  * The swap runs after the game's NIS write and before the next iteration,
  * so the value set here applies to every step.
  *
+ * Cutscenes (NIS) step at 30 fps on a 1/30 floor, so 60 fps there would run
+ * them fast and put the cars out of step. Auto keeps the game's own cadence
+ * while the floor is above 1/60.
+ *
  * RECOMP_DT_FLOOR, only with RECOMP_PRESENT_INTERVAL=1:
- *   zero    (default) floor 0: time is conserved at any fps
+ *   auto    (default) floor 0 and 60 fps; the game's own interval and floor
+ *           while its floor is above 1/60 (cutscenes)
+ *   zero    floor 0 and 60 fps always (cutscenes too)
  *   clamp   floor above 1/60 -> 1/60
- *   game    leave the game's floor (the old behaviour, kill switch)
+ *   game    leave the game's floor, always 60 fps (the v24 behaviour)
  *   test30  force 1/30 (reproduces the 2x case)
- * Unset or unknown is zero. RECOMP_DT_LOG=1 prints a line per second. */
-enum { DT_ZERO, DT_CLAMP, DT_GAME, DT_TEST30 };
-static const char *const dt_names[] = { "zero", "clamp", "game", "test30" };
+ * Unset or unknown is auto. RECOMP_DT_LOG=1 prints a line per second. */
+enum { DT_AUTO, DT_ZERO, DT_CLAMP, DT_GAME, DT_TEST30 };
+static const char *const dt_names[] = { "auto", "zero", "clamp", "game", "test30" };
 
 static int dt_floor_mode(void)
 {
     static int v = -1;
     if (v < 0) {
         const char *e = getenv("RECOMP_DT_FLOOR");
-        v = DT_ZERO;
-        if (e && strcmp(e, "clamp") == 0)
+        v = DT_AUTO;
+        if (e && strcmp(e, "zero") == 0)
+            v = DT_ZERO;
+        else if (e && strcmp(e, "clamp") == 0)
             v = DT_CLAMP;
         else if (e && strcmp(e, "game") == 0)
             v = DT_GAME;
@@ -449,9 +473,15 @@ static uint32_t dt_bits(float f)
     return u;
 }
 
+/* The floor to store for the game's floor value. Above 1/60 + epsilon the
+ * game is in a cutscene: auto leaves its floor alone (the caller does not
+ * write it), zero and clamp would replace it. */
+#define DT_60_EPS (1.0f / 60.0f + 1e-5f)
+
 static float dt_use(int mode, float game)
 {
     switch (mode) {
+    case DT_AUTO:   return game > DT_60_EPS ? game : 0.0f;
     case DT_ZERO:   return 0.0f;
     case DT_CLAMP:  return game > 1.0f / 60.0f ? 1.0f / 60.0f : game;
     case DT_TEST30: return 1.0f / 30.0f;
@@ -459,17 +489,23 @@ static float dt_use(int mode, float game)
     }
 }
 
-static void dt_floor_at_swap(void)
+/* Called from both swap wrappers when RECOMP_PRESENT_INTERVAL=1, before the
+ * generated swap. Sets the floor, forces or unforces the interval, logs. */
+static void swap_pre(uint32_t slot)
 {
-    static int logon = -1, started;
+    static int logon = -1, started, seen, last_allow = 1;
     static uint32_t last_written, last_game;
-    static int seen;
     static unsigned swaps, n0;
     static uint64_t nsum;
     static double last_s;
     int mode = dt_floor_mode();
-    uint32_t mem = MEM32(0x428EE8u);
+    uint32_t mem = MEM32(0x428EE8u), slot_game;
+    int changed = 0, allow;
+    uint32_t prev_game = last_game;
     float game, use;
+
+    /* The game's value: our own write from last frame is not the game's. */
+    slot_game = (s_forced && MEM32(slot) == s_forced_to) ? s_forced_from : MEM32(slot);
 
     if (!started) {
         started = 1;
@@ -484,22 +520,38 @@ static void dt_floor_at_swap(void)
     if (!seen) {
         seen = 1;
         last_game = mem;
-        game = dt_f32(mem);
-        fprintf(stderr, "[dt] game floor %.6f (start), using %.6f\n", game, dt_use(mode, game));
+        changed = 2;                    /* start */
     } else if (mode == DT_GAME ? mem != last_game : mem != last_written) {
-        game = dt_f32(mem);
         if (mem != last_game) {
-            float prev = dt_f32(last_game);
             last_game = mem;
-            fprintf(stderr, "[dt] game floor %.6f -> %.6f, using %.6f\n", prev, game,
-                    dt_use(mode, game));
+            changed = 1;
         }
     }
     game = dt_f32(last_game);
-    use = dt_use(mode, game);
-    if (mode != DT_GAME)
-        MEM32(0x428EE8u) = dt_bits(use);
+    allow = !(mode == DT_AUTO && game > DT_60_EPS);
+
+    if (mode != DT_GAME && (mode != DT_AUTO || allow))
+        MEM32(0x428EE8u) = dt_bits(dt_use(mode, game));
+    if (allow)
+        force_interval(slot);
+    else
+        unforce_interval(slot);
     last_written = MEM32(0x428EE8u);
+    use = dt_f32(last_written);
+
+    if (changed == 2)
+        fprintf(stderr, "[dt] game floor %.6f (start), using %.6f, slot game 0x%08X swap 0x%08X\n",
+                game, use, slot_game, MEM32(slot));
+    else if (changed == 1)
+        fprintf(stderr, "[dt] game floor %.6f -> %.6f, using %.6f, slot game 0x%08X swap 0x%08X\n",
+                dt_f32(prev_game), game, use, slot_game, MEM32(slot));
+    if (mode == DT_AUTO && allow != last_allow) {
+        if (!allow)
+            fprintf(stderr, "[dt] cutscene (game floor %.6f): 30 fps\n", game);
+        else
+            fprintf(stderr, "[dt] cutscene over: 60 fps\n");
+        last_allow = allow;
+    }
 
     if (logon) {
         struct timespec ts;
@@ -513,8 +565,8 @@ static void dt_floor_at_swap(void)
         if (last_s == 0.0)
             last_s = now;
         if (now - last_s >= 1.0) {
-            fprintf(stderr, "[dt] wall=%.3f swaps=%u N0=%u sim_s=%.4f floor=%.6f\n",
-                    now - last_s, swaps, n0, (double)nsum / 3600.0, use);
+            fprintf(stderr, "[dt] wall=%.3f swaps=%u N0=%u sim_s=%.4f floor=%.6f slot=0x%08X\n",
+                    now - last_s, swaps, n0, (double)nsum / 3600.0, use, MEM32(slot));
             swaps = n0 = 0;
             nsum = 0;
             last_s = now;
@@ -524,19 +576,15 @@ static void dt_floor_at_swap(void)
 
 void sub_002EB4B0(void)
 {
-    if (swap_interval_wanted()) {
-        force_interval(0x2F76FCu);
-        dt_floor_at_swap();
-    }
+    if (swap_interval_wanted())
+        swap_pre(0x2F76FCu);
     sub_002EB4B0_gen();
 }
 
 void sub_002EB6A0(void)
 {
-    if (swap_interval_wanted()) {
-        force_interval(0x2F76FCu);
-        dt_floor_at_swap();
-    }
+    if (swap_interval_wanted())
+        swap_pre(0x2F76FCu);
     sub_002EB6A0_gen();
 }
 
@@ -698,11 +746,6 @@ void sub_00072F90(void)
  * buffers are swapped as the original does. The border is not filled in:
  * only On2's own motion compensation read it. NFSU2_NATIVE_VP6=0 runs the
  * lifted decoder, =2 runs both and compares the pictures. */
-#ifdef NFSU2_NATIVE_VP6
-#include "movie_vp6.h"
-
-extern void sub_002618F0_gen(void);
-
 typedef struct {
     uint32_t y, u, v, y_stride, uv_stride, w, h;
 } Vp6Planes;
@@ -719,6 +762,85 @@ static Vp6Planes vp6_planes(uint32_t dec, uint32_t buf)
     p.h = MEM32(dec + 0x1B4);
     return p;
 }
+
+/* White pictures from the lifted decoder (no FFmpeg, so no flash rule in
+ * src/movie_vp6.c). FMVOpening cuts between its clips with 1-3 flat white
+ * pictures; the lifted decoder shows them. Each decoded picture is tested
+ * with the rule of movie_vp6.c (luma >= 200 on every sample of the middle
+ * half, step 8) and its Y range recorded. The converter (sub_0025ECB4)
+ * blacks rows that come from a recorded white range. The decoder's buffers
+ * are not touched: +0x254 is the next frame's reference. NFSU2_MOVIE_FLASH=1
+ * keeps the white frames. */
+#define MOVIE_WHITE_SLOTS 4
+typedef struct {
+    uint32_t lo, hi;                    /* Y range [lo, hi) of one buffer */
+    int white;
+} MovieWhite;
+static MovieWhite s_white[MOVIE_WHITE_SLOTS];
+static unsigned s_white_next;
+static unsigned long s_white_found, s_rows_blacked, s_pictures;
+
+static int movie_flash_kept(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("NFSU2_MOVIE_FLASH");
+        v = (e && *e == '1');
+    }
+    return v;
+}
+
+static __attribute__((unused)) int vp6_flat_white(const Vp6Planes *p)
+{
+    uint32_t row, col;
+
+    if (!p->w || !p->h || p->w > 4096 || p->h > 4096)
+        return 0;
+    for (row = p->h / 4; row < p->h * 3 / 4; row += 8)
+        for (col = p->w / 4; col < p->w * 3 / 4; col += 8)
+            if (MEM8(p->y + row * p->y_stride + col) < 200)
+                return 0;
+    return 1;
+}
+
+static __attribute__((unused)) void movie_white_note(uint32_t lo, uint32_t hi, int white)
+{
+    unsigned i;
+    MovieWhite *s = NULL;
+
+    for (i = 0; i < MOVIE_WHITE_SLOTS; i++)
+        if (s_white[i].hi && s_white[i].lo == lo)
+            s = &s_white[i];
+    if (!s) {
+        s = &s_white[s_white_next];
+        s_white_next = (s_white_next + 1) % MOVIE_WHITE_SLOTS;
+    }
+    s->lo = lo;
+    s->hi = hi;
+    s->white = white;
+}
+
+static int movie_row_white(uint32_t y)
+{
+    unsigned i;
+
+    for (i = 0; i < MOVIE_WHITE_SLOTS; i++)
+        if (s_white[i].white && y >= s_white[i].lo && y < s_white[i].hi)
+            return 1;
+    return 0;
+}
+
+static void movie_counters(const char *when)
+{
+    fprintf(stderr, "[movie] white pictures found %lu (%lu pictures, %s)\n",
+            s_white_found, s_pictures, when);
+    fprintf(stderr, "[movie] rows blacked %lu\n", s_rows_blacked);
+}
+
+#ifdef NFSU2_NATIVE_VP6
+#include "movie_vp6.h"
+
+extern void sub_002618F0_gen(void);
 
 /* NFSU2_NATIVE_VP6=2: FFmpeg into a scratch picture, compared with what the
  * lifted decoder left at +0x254. */
@@ -784,9 +906,29 @@ void sub_002618F0(void)
     esp += 4;                           /* cdecl: the caller pops the arguments */
 }
 #else
-/* Built without FFmpeg (NFSU2_FFMPEG_DIR): the lifted decoder. */
+/* Built without FFmpeg (NFSU2_FFMPEG_DIR): the lifted decoder. Each picture
+ * it leaves at +0x254 is checked for the white flash (MOVIE_WHITE_SLOTS). */
 extern void sub_002618F0_gen(void);
-void sub_002618F0(void) { sub_002618F0_gen(); }
+
+void sub_002618F0(void)
+{
+    uint32_t dec = MEM32(esp + 4);
+    static unsigned long frames;
+    Vp6Planes p;
+    int white;
+
+    sub_002618F0_gen();
+    if (eax != 0)
+        return;
+    p = vp6_planes(dec, MEM32(dec + 0x254));
+    white = vp6_flat_white(&p);
+    movie_white_note(p.y, p.y + p.y_stride * p.h, white);
+    s_pictures++;
+    if (white)
+        s_white_found++;
+    if (++frames % 300 == 0)
+        movie_counters("every 300 frames");
+}
 #endif
 
 /* ── 4x4 matrix multiply, sub_002213EA ─────────────────────────
@@ -1706,6 +1848,26 @@ static void yuv_row_native(uint32_t y, uint32_t u, uint32_t v, uint8_t *out, uin
 #endif
 }
 
+/* The colour of (Y16, U128, V128): what a black row converts to. Same
+ * table lookups, wrap and saturation as yuv_row_native. */
+static void yuv_row_black(uint8_t *out, uint32_t n)
+{
+    const int16_t *ty = (const int16_t *)XBOX_PTR(0x003D0810u);
+    const int16_t *tu = (const int16_t *)XBOX_PTR(0x003D1010u);
+    const int16_t *tv = (const int16_t *)XBOX_PTR(0x003D1810u);
+    uint8_t px[8];
+    uint32_t i;
+    int k;
+
+    for (k = 0; k < 4; k++) {
+        int16_t c = (int16_t)(tu[4 * 128 + k] + tv[4 * 128 + k]);
+        px[k] = sat_u8((int16_t)(ty[4 * 16 + k] + c));
+        px[4 + k] = px[k];
+    }
+    for (i = 0; i < n; i++, out += 8)
+        memcpy(out, px, 8);
+}
+
 void sub_0025ECB4(void)
 {
     static int mode = -1;               /* 0 lifted, 1 native, 2 native + check */
@@ -1735,7 +1897,12 @@ void sub_0025ECB4(void)
         return;
     }
     nfsu2_movie_row = dst;
-    yuv_row_native(y, u, v, (uint8_t *)XBOX_PTR(dst), n);
+    if (!movie_flash_kept() && movie_row_white(y)) {
+        yuv_row_black((uint8_t *)XBOX_PTR(dst), n);
+        s_rows_blacked++;
+    } else {
+        yuv_row_native(y, u, v, (uint8_t *)XBOX_PTR(dst), n);
+    }
 
     /* What the last step leaves in the registers. */
     last = n - 1u;
@@ -1775,6 +1942,7 @@ void sub_00129610(void)
     for (i = 0; i < sizeof nfsu2_movie_name - 1 && MEM8(buf + i); i++)
         nfsu2_movie_name[i] = (char)MEM8(buf + i);
     nfsu2_movie_name[i] = 0;
+    movie_counters("movie change");
     fprintf(stderr, "[movie] %s\n", nfsu2_movie_name);
 }
 

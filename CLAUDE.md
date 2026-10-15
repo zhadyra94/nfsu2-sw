@@ -492,6 +492,19 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   middle half is all luma >= 200 as luma 16 (title's buffers only, FFmpeg's
   reference untouched). `NFSU2_MOVIE_FLASH=1` keeps them; off in
   NFSU2_NATIVE_VP6=2. `RECOMP_VK_CUBE=0` turns the car reflections off.
+  **Lifted decoder path (v26, no FFmpeg: iOS and the default Linux build):**
+  sub_002618F0 (recomp_manual.c) tests each decoded picture (+0x254, after
+  the lifted decode) with the same rule and records its Y range in 4 slots;
+  the native converter sub_0025ECB4 fills rows from a white range with the
+  colour of (Y16, U128, V128). The decoder's buffers are not changed (+0x254
+  stays the reference). Linux, FMVOpening with no Start presses (the trailer
+  plays through; the pad script's Start at 15/40 s cuts it short): whites at
+  decoded pictures 1627-2082 of the first play, all after the
+  `MOVIES\FMVOpening.vp6` line; `[movie] rows blacked 5280` in that run.
+  Dump f01651 (flash picture 1627 + 24) is black, f01650 normal. With
+  `NFSU2_MOVIE_FLASH=1` the same dump is white (mean 226.7). The dump offset
+  to the picture index changes per run (+24, +29). `RECOMP_NATIVE=0` (lifted
+  converter) does not black the rows.
 - **Version** (CMakeLists.txt `NFSU2_SWITCH_VERSION`) is a plain variable
   since 0.5: as a CACHE default the 0.4.5 NRO still said 0.4.3.
 - (Before the FFmpeg decoder) movie decoding ran on the game thread: MMX IDCT `sub_0026EB34`, YUV->RGB
@@ -720,6 +733,17 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   `[dt] game floor a -> b, using c` on each game change, `RECOMP_DT_LOG=1`
   per-second line. Interval 2 never reaches this code. Not yet measured at
   60 fps in a race: lavapipe races ran at 23-26 fps.
+  **v26 (cutscenes):** the NIS plays at 30 fps on its own 1/30 floor, so 60
+  fps there ran it fast and put the cars out of step. Default
+  `RECOMP_DT_FLOOR=auto` now leaves the game's interval and floor while its
+  floor is above 1/60 (cutscene), and forces 60 fps with floor 0 otherwise.
+  Measured (Linux, lavapipe, GL_SCALE=0.5, interval 1): zero (v25) intro
+  cutscene 25 swaps/s, auto 28.3 swaps/s with the swap value 0x80000002 and
+  floor 0.033333; auto finish cutscene 30.1 swaps/s; race after 23.3 swaps/s
+  with swap value 0x80000001 and floor 0. Logs: `[dt] cutscene (game floor
+  ...): 30 fps` and `[dt] cutscene over: 60 fps` once per change; game-floor
+  change lines carry the slot value the game had and the value passed to
+  the swap. `RECOMP_DT_FLOOR=zero` is v25 (60 fps in cutscenes).
 - **Clocks (switch_nx.c, opt-in):** NFSU2_CPU_MHZ / NFSU2_GPU_MHZ /
   NFSU2_MEM_MHZ via clkrst (8.0+) or pcv: highest listed rate <= the
   request, caps 1785 / 921.6 / 1600, old rates restored on exit (atexit +
