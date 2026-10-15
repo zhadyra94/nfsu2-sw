@@ -530,7 +530,7 @@ static const char *const nfsu2_ios_alts[] = { "NFSU2-data", "game", "nfsu2", "NF
 /* Build label for the launch screen. */
 const char *nfsu2_build_label(void)
 {
-    return "v28 " __DATE__;
+    return "v29 " __DATE__;
 }
 
 /* Is the launch screen asked for? NFSU2_LAUNCHER, default OFF (v29): the game
@@ -891,7 +891,7 @@ int main(int argc, char **argv)
     /* Redirect the log FIRST so main-thread init output is captured. */
     ios_log_to_documents();
     setvbuf(stderr, NULL, _IONBF, 0);
-    fprintf(stderr, "nfsu2: build v28 (v27 + full-press pedals, no floating sticks in Drive, bigger d-pad)\n");
+    fprintf(stderr, "nfsu2: build v29 (v28 + no launch screen at start, point-resolution drawable on big iPads)\n");
     fprintf(stderr, "nfsu2: HOME=%s TMPDIR=%s\n",
             getenv("CFFIXED_USER_HOME") ? getenv("CFFIXED_USER_HOME") : "(unset)",
             getenv("TMPDIR") ? getenv("TMPDIR") : "(unset)");
@@ -1155,7 +1155,7 @@ static int game_main(void)
 #ifdef NFSU2_IOS
     ios_log_to_documents();
     setvbuf(stderr, NULL, _IONBF, 0);
-    fprintf(stderr, "nfsu2: build v28 (v27 + full-press pedals, no floating sticks in Drive, bigger d-pad)\n");
+    fprintf(stderr, "nfsu2: build v29 (v28 + no launch screen at start, point-resolution drawable on big iPads)\n");
     fprintf(stderr, "nfsu2: HOME=%s CFFIXED_USER_HOME=%s TMPDIR=%s\n",
             getenv("HOME") ? getenv("HOME") : "(unset)",
             getenv("CFFIXED_USER_HOME") ? getenv("CFFIXED_USER_HOME") : "(unset)",
