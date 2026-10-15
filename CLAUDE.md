@@ -359,6 +359,79 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   XDK form (dp4 rows + rcc + mul + mad) evaluated directly. Only ~5% of the
   drag-line draws (the "half draw nothing" are occluded, not off screen);
   ~0.4 us/draw on x86.
+- **Mipmaps + anisotropy (v27, 2026-10-15, nv2a_vk.c only; changes the Linux and
+  Switch Vulkan output too, GL untouched):** the guest's chains were ignored
+  (one level, maxLod 0), so distant roads and foliage shimmered. Now
+  `tex_get` takes `levels` = SET_TEXTURE_FORMAT [19:16] clamped to
+  log2(max(w,h))+1 and uploads every level of a swizzled texture (each at its
+  own size, contiguous) or DXT texture (4x4 blocks rounded up) in ONE ring
+  allocation + one vkCmdCopyBufferToImage; a cube face carries its own chain
+  (`cube_face_bytes`). The hash covers the whole chain; `VkTex.levels` is part
+  of the cache match. Only DXT1/3/5 and swizzled A8R8G8B8/P8
+  (`swz_chain_ok`, the formats this title uses and the check verified) get a chain; render-target textures, `cube_from_surfaces`, linear
+  and rect textures and unknown formats keep one level. Sampler (uint64 key,
+  512 entries): guest min filter 3/4/5/6 = nearest/linear in-level x
+  nearest/linear between levels (1, 2, 7 = level 0 only, maxLod 0); min/max LOD
+  = TEXTURE_CONTROL0 [29:18]/[17:6] in 4.8 fixed, limited to levels-1; bias =
+  TEXTURE_FILTER [12:0] signed 4.8, clamped to the device limit. Anisotropy
+  only on mipped samplers with a linear min filter. Real values seen: every
+  texture has bias -511/256 (about -2.0; origin unexplained, the A/B with
+  `RECOMP_VK_LOD_BIAS=0` A/B in v27, see below), clamps
+  0..4095, filter 6 (TENT_TENT_LOD), mag 2; chains stop at 8x8 for 256x256
+  (`levels` field 6), so the smallest level is 8x8. The static car cube
+  0x812E7200 is A8R8G8B8 256x256 with ONE level (no chain, unchanged).
+  Env: `RECOMP_VK_MIPS=0` off (as before), `=2` A/B (odd frames sample with
+  maxLod 0 and no aniso; the dump at flip N shows draws of s_frame N-1, so
+  ODD files = mips on, EVEN = off; dumps at N and N+1 with an odd
+  `RECOMP_GL_DUMP` interval, like INSTANCE=2); `RECOMP_VK_ANISO=1|2|4|8|16`
+  (default 4 on iOS, 1 elsewhere: lavapipe 4x costs 5x, 26 -> 4.7 fps at car
+  select, GPUs do not); `RECOMP_VK_LOD_BIAS=<f>` replaces the guest bias;
+  `RECOMP_VK_MIP_LOG=1` names each chain (per-level offsets, last level end vs
+  chain size, closed form for square chains) and each sampler state, `=2` also
+  checks every level against a 2x2 box filter of the previous one.
+  Bias-0 A/B (v27, lavapipe, race start, MIPS=2 pairs, LOD_BIAS=0 ANISO=1;
+  the phone's effective state on A17 Pro, where MoltenVK drops the bias).
+  Render scale 1: glyph-masked edge energy mips on/off: menu text 0.65-0.84,
+  tach numerals 0.79, minimap 0.87, lap box text 1.00; far road 0.63, far
+  buildings 0.69, whole frame 0.81. Text is measurably softer at 1x (the diff
+  sits on the glyphs). Scale 2 (iOS default): menu and HUD text 0.99-1.00
+  (|off-on| about 0, text drawn at >= 1:1 stays on level 0); far road 0.76,
+  whole frame 0.91 (the diff is road/background only). Aniso 4 at scale 0.5
+  never reached the race in two 600 s runs.
+  Shader-side bias: MoltenVK 1.4.2 honours the sampler's mipLodBias only on
+  Apple10 GPUs (VkPhysicalDevicePortabilitySubsetFeaturesKHR.samplerMipLodBias,
+  mirrored locally), so an A17 Pro (Apple 9) ran with bias 0: soft text, smeared
+  far road. When the driver ignores it the bias goes into the fragment shader:
+  every `texture()` in gl_psh.c (Vulkan dialect only) takes `u_lodb.xyzw[stage]`,
+  a vec4 at the end of the fragment std140 block, and all samplers get
+  mipLodBias 0. `bind_stage` writes the value the sampler would have used (same
+  key, same device clamp, 0 for unmipped stages); a uniform, so the pipeline key
+  is unchanged. `RECOMP_VK_SHADER_LOD_BIAS=1|0` forces shader|sampler mode (Linux
+  lavapipe applies the sampler bias, so the two must match); `=2` alternates per
+  frame, dumps at N and N+1 like MIPS=2. Separate runs desync (pad script is
+  wall-clock), so test with `=2` and pause the race with Start: scale 1 pairs are
+  byte-identical outside the animated pause icon, and the main-menu text boxes
+  (title, Quick Race, No Profile, Help) are byte-identical at scales 1 and 2; at scale 2 the only differences are 1 px columns at x = 64k-1 (0.5%,
+  max 76) that also differ between same-mode frames and in the pre-change binary
+  (llvmpipe tile seams), none elsewhere. Control with the shader bias zeroed:
+  27% of pixels differ (max 251), 66-76% inside the menu text boxes. No `textureLod`/`texelFetch` in the guest shaders. Init log `[VK] mipmaps on|off,
+  anisotropy Nx (device max M), lod bias applied by driver|in shader[ (forced)]`; with
+  RECOMP_FPS_LOG a `[vk-mip]` line per 10 s (mipped textures, levels,
+  evictions, MB); budget evictions log (first 8). iOS: "Mipmaps" and "Texture
+  filtering" rows in the panel and the launcher. A/B on lavapipe (race start,
+  one run, pairs from RECOMP_VK_MIPS=2): edge energy of the 3D area -15%, of
+  the far road band -31%, of the near road/HUD band -0.6%; HUD, menu text
+  and the car paint within 0-4% (ratio 0.96-1.0, the rest is the moving
+  background); Layout check (RECOMP_VK_MIP_LOG=2): box-filter error per level 0.0-11
+  (DXT quantisation, P8 0.0-6) for ~400 textures (unique addresses over several runs), DXT1/3, P8 and
+  A8R8G8B8, square and non-square, no jumps. lavapipe fps: car
+  select about 26 both ways, race start 17.9 -> 16.3 (-9%) with ANISO=1 (single
+  runs, another job shared the machine).
+  Validation: only the old VUID-vkCmdSetVertexInputEXT-None-04790 and
+  VkGraphicsPipelineCreateInfo-pDynamicStates-04807 (same with MIPS=0),
+  also with ANISO=4 (that run only reached car select) and RECOMP_GL_DXT=0 (CPU
+  decode of every level; reached the race, checks clean).
+  Mipped textures use 1.33x the memory.
 - **Eden cannot run NVK** (2026-09-29): instance, device, swapchain (only
   IMMEDIATE; FIFO creation hangs) and command recording work, but no GPU
   submission ever completes -- vktest's first fence times out (also with

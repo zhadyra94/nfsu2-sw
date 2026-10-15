@@ -239,6 +239,12 @@ static int input_stage(const Nv2aPshKey *k, int t)
 
 static void tex_fetch(Out *o, int t, uint32_t mode, const Nv2aPshKey *k)
 {
+    /* Vulkan: the guest's LOD bias rides in u_lodb when the driver drops the
+     * sampler's (MoltenVK below Apple10); 0 otherwise. */
+    char lb[16] = "";
+
+    if (nv2a_shader_vk)
+        snprintf(lb, sizeof lb, ", u_lodb.%c", "xyzw"[t & 3]);
     switch (mode) {
     case 15:                                         /* DEPENDENT_AR */
     case 16:                                         /* DEPENDENT_GB */
@@ -250,8 +256,8 @@ static void tex_fetch(Out *o, int t, uint32_t mode, const Nv2aPshKey *k)
             emit(o, "    vec4 T%d = vec4(0.0);\n", t);
             break;
         }
-        emit(o, "    vec4 T%d = texture(t%d, T%d.%s);\n", t, t, input_stage(k, t),
-             mode == 15 ? "ar" : "gb");
+        emit(o, "    vec4 T%d = texture(t%d, T%d.%s%s);\n", t, t, input_stage(k, t),
+             mode == 15 ? "ar" : "gb", lb);
         break;
     case 0:                                          /* NONE */
         emit(o, "    vec4 T%d = vec4(0.0);\n", t);
@@ -268,14 +274,14 @@ static void tex_fetch(Out *o, int t, uint32_t mode, const Nv2aPshKey *k)
          * (xemu does the same). Vulkan only: nv2a_vk binds cube views,
          * nv2a_gl does not, so GL still reads black. */
         if (nv2a_shader_vk)
-            emit(o, "    vec4 T%d = texture(t%d, vT%d.xyz);\n", t, t, t);
+            emit(o, "    vec4 T%d = texture(t%d, vT%d.xyz%s);\n", t, t, t, lb);
         else
             emit(o, "    vec4 T%d = vec4(0.0);\n", t);
         break;
     default: {                                       /* 2D (+ the rest, for now) */
         emit(o, "    vec2 tc%d = (abs(vT%d.w) > 1e-8 && %d == 1) ? vT%d.xy / vT%d.w : vT%d.xy;\n",
              t, t, mode == 1 ? 1 : 0, t, t, t);
-        emit(o, "    vec4 T%d = texture(t%d, tc%d * u_tscale[%d]);\n", t, t, t, t);
+        emit(o, "    vec4 T%d = texture(t%d, tc%d * u_tscale[%d]%s);\n", t, t, t, t, lb);
         break;
     }
     }
@@ -310,6 +316,7 @@ int nv2a_gl_psh(const Nv2aPshKey *k, char *buf, size_t cap)
             "    vec4 u_fc0; vec4 u_fc1;\n"
             "    vec4 u_fogcolor;\n"
             "    int u_alpha_func; float u_alpha_ref;\n"
+            "    vec4 u_lodb;\n"
             "};\n"
             "layout(location = 0) out vec4 fragColor;\n"
             "void main() {\n");

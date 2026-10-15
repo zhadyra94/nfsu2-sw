@@ -2254,6 +2254,11 @@ static const PanelItem s_items[] = {
       .on = "1", .off = "0", .def_on = 1 },
     { .kind = IK_SWITCH, .title = "Fill screen with movies", .key = "NFSU2_MOVIE_CROP",
       .on = "1", .off = "0", .def_on = 1 },
+    /* nv2a_vk.c: guest mip chains + anisotropic filtering of mipped textures. */
+    { .kind = IK_SWITCH, .title = "Mipmaps", .key = "RECOMP_VK_MIPS",
+      .on = "1", .off = "0", .def_on = 1 },
+    { .kind = IK_SEG, .title = "Texture filtering", .key = "RECOMP_VK_ANISO",
+      .labels = "Off|2x|4x|8x|16x", .values = "1|2|4|8|16", .def_val = "4" },
 
     { .kind = IK_HEAD, .title = "Audio — applies on next launch" },
     { .kind = IK_SLIDER, .title = "Volume", .key = "RECOMP_AUDIO_VOLUME",

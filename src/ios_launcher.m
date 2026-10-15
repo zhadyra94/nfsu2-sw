@@ -66,6 +66,10 @@ static const LItem s_litems[] = {
       .on = "1", .off = "0", .def_on = 1 },
     { .kind = LK_SWITCH, .title = "Fill screen with movies", .key = "NFSU2_MOVIE_CROP",
       .on = "1", .off = "0", .def_on = 1 },
+    { .kind = LK_SWITCH, .title = "Mipmaps", .key = "RECOMP_VK_MIPS",
+      .on = "1", .off = "0", .def_on = 1 },
+    { .kind = LK_SEG, .title = "Texture filtering", .key = "RECOMP_VK_ANISO",
+      .labels = "Off|2x|4x|8x|16x", .values = "1|2|4|8|16", .def_val = "4" },
 
     { .kind = LK_HEAD, .title = "Audio" },
     { .kind = LK_SLIDER, .title = "Volume", .key = "RECOMP_AUDIO_VOLUME",

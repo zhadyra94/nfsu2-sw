@@ -103,6 +103,12 @@ static VkDeviceSize     s_ubo_align = 256;
 static uint32_t         s_ubo_range = 16384;
 static VkFormat         s_depth_fmt = VK_FORMAT_D24_UNORM_S8_UINT;
 static int              s_have_bc, s_have_depth_clamp;
+static int              s_have_aniso;           /* samplerAnisotropy */
+static float            s_max_aniso_dev = 1.0f; /* limits.maxSamplerAnisotropy */
+static int              s_bias_applied = 1;     /* driver honours VkSamplerCreateInfo.mipLodBias */
+static float            s_max_lod_bias = 2.0f;  /* limits.maxSamplerLodBias */
+static int              s_bias_shader;          /* LOD bias in the fragment UBO (u_lodb), samplers get 0 */
+static int              s_bias_alt;             /* RECOMP_VK_SHADER_LOD_BIAS=2: shader mode on odd frames */
 
 static PFN_vkCmdPushDescriptorSetKHR  p_push_desc;
 static PFN_vkCmdSetVertexInputEXT     p_vertex_input;
@@ -562,16 +568,16 @@ static void image_to_general(VkImage img, VkImageAspectFlags aspect)
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.image = img;
     b.subresourceRange.aspectMask = aspect;
-    b.subresourceRange.levelCount = 1;
+    b.subresourceRange.levelCount = VK_REMAINING_MIP_LEVELS;   /* texture chains */
     b.subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &b);
 }
 
-/* layers: 1 = a 2D image, 6 = a cube map (cube view). */
-static int make_image_n(uint32_t w, uint32_t h, uint32_t layers, VkFormat fmt,
-                        VkImageUsageFlags usage, VkImageAspectFlags aspect,
-                        VkImage *img, VkImageView *view, VkDeviceMemory *mem)
+/* layers: 1 = a 2D image, 6 = a cube map (cube view); levels: mip chain. */
+static int make_image_nl(uint32_t w, uint32_t h, uint32_t layers, uint32_t levels, VkFormat fmt,
+                         VkImageUsageFlags usage, VkImageAspectFlags aspect,
+                         VkImage *img, VkImageView *view, VkDeviceMemory *mem)
 {
     VkImageCreateInfo ci = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
     VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
@@ -582,7 +588,7 @@ static int make_image_n(uint32_t w, uint32_t h, uint32_t layers, VkFormat fmt,
     ci.extent.width = w;
     ci.extent.height = h;
     ci.extent.depth = 1;
-    ci.mipLevels = 1;
+    ci.mipLevels = levels;
     ci.arrayLayers = layers;
     if (layers == 6)
         ci.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
@@ -604,7 +610,7 @@ static int make_image_n(uint32_t w, uint32_t h, uint32_t layers, VkFormat fmt,
     vi.viewType = layers == 6 ? VK_IMAGE_VIEW_TYPE_CUBE : VK_IMAGE_VIEW_TYPE_2D;
     vi.format = fmt;
     vi.subresourceRange.aspectMask = aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT;
-    vi.subresourceRange.levelCount = 1;
+    vi.subresourceRange.levelCount = levels;
     vi.subresourceRange.layerCount = layers;
     if (aspect & VK_IMAGE_ASPECT_DEPTH_BIT)
         vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
@@ -616,6 +622,13 @@ static int make_image_n(uint32_t w, uint32_t h, uint32_t layers, VkFormat fmt,
     }
     image_to_general(*img, aspect);
     return 1;
+}
+
+static int make_image_n(uint32_t w, uint32_t h, uint32_t layers, VkFormat fmt,
+                        VkImageUsageFlags usage, VkImageAspectFlags aspect,
+                        VkImage *img, VkImageView *view, VkDeviceMemory *mem)
+{
+    return make_image_nl(w, h, layers, 1, fmt, usage, aspect, img, view, mem);
 }
 
 static int make_image(uint32_t w, uint32_t h, VkFormat fmt, VkImageUsageFlags usage,
@@ -763,8 +776,145 @@ typedef struct {
     uint32_t face;              /* cube map: bytes per face; 0 = 2D */
     VkImage image; VkImageView view; VkDeviceMemory mem;
     VkFormat fmt;
+    uint32_t levels;            /* mip levels in the image (1 = no chain) */
     uint32_t used, checked;
 } VkTex;
+
+/* ── Mip chains ───────────────────────────────────────────────────────
+ * Guest textures carry their chain right behind level 0 (swizzled: each
+ * level swizzled at its own size; DXT: each level in 4x4 blocks, rounded
+ * up). RECOMP_VK_MIPS=0 keeps one level (the old look), =2 alternates per
+ * frame for A/B dumps: the file dumped at flip N shows the draws made with
+ * s_frame N-1, so odd-numbered files have mips on and even ones sample as if
+ * there were no chain (dumps at N and N+1 are written, like INSTANCE=2).
+ * RECOMP_VK_ANISO=1|2|4|8|16 sets the anisotropy of mipped, linear-min
+ * samplers. RECOMP_VK_MIP_LOG=1 names each chain and sampler state once,
+ * =2 also checks every level against a box filter of the previous one. */
+#define MIP_MAX 16
+static int      s_mips_on = 1;
+static int      s_mips_alt;
+static uint32_t s_aniso = 1;
+static int      s_mip_log;
+static int      s_bias_force = -1;      /* RECOMP_VK_LOD_BIAS=<float>: replaces the guest's bias */
+static uint32_t s_mip_tex, s_mip_lvls, s_mip_evict;     /* per 10 s window */
+
+static int mips_active(void)
+{
+    return s_mips_on && !(s_mips_alt && (s_frame & 1));
+}
+
+static void mip_cfg_init(void)
+{
+    const char *e = getenv("RECOMP_VK_MIPS");
+#ifdef NFSU2_IOS
+    uint32_t want = 4;          /* real GPU: cheap */
+#else
+    uint32_t want = 1;          /* lavapipe: 4x costs 5x in the frame rate; opt in */
+#endif
+    uint32_t max = s_have_aniso ? (uint32_t)s_max_aniso_dev : 1;
+    int forced = 0;
+
+    s_mips_on = !(e && *e == '0');
+    s_mips_alt = s_mips_on && e && *e == '2';
+    e = getenv("RECOMP_VK_LOD_BIAS");
+    if (e && *e)
+        s_bias_force = (int)(strtod(e, NULL) * 256.0) & 0x1FFF;
+    e = getenv("RECOMP_VK_MIP_LOG");
+    s_mip_log = e ? atoi(e) : 0;
+    /* A driver that drops the sampler's bias (MoltenVK below Apple10, the
+     * A17 Pro) gets it in the shader; RECOMP_VK_SHADER_LOD_BIAS=1|0 forces, =2 alternates
+     * per frame (A/B: dumps at N and N+1, like RECOMP_VK_MIPS=2). */
+    s_bias_shader = !s_bias_applied;
+    e = getenv("RECOMP_VK_SHADER_LOD_BIAS");
+    if (e && *e) {
+        forced = 1;
+        s_bias_shader = *e != '0';
+        s_bias_alt = *e == '2';
+    }
+    e = getenv("RECOMP_VK_ANISO");
+    if (e && atoi(e) > 0)
+        want = (uint32_t)atoi(e);
+    if (want > 16) want = 16;
+    while (want & (want - 1))               /* round down to a power of two */
+        want &= want - 1;
+    if (want > max) want = max;
+    if (want < 1) want = 1;
+    s_aniso = want;
+    fprintf(stderr, "[VK] mipmaps %s, anisotropy %ux (device max %u), lod bias %s%s\n",
+            s_mips_on ? (s_mips_alt ? "on (A/B alternate)" : "on") : "off", s_aniso, max,
+            s_bias_alt ? "alternating shader/driver" : s_bias_shader ? "in shader" : "applied by driver",
+            forced && !s_bias_alt ? " (forced)" : "");
+}
+
+static uint32_t mip_dim(uint32_t d, uint32_t l)
+{
+    d >>= l;
+    return d ? d : 1;
+}
+
+static uint32_t dxt_block_bytes(uint32_t color)
+{
+    return color == 0x0C ? 8 : (color == 0x0E || color == 0x0F) ? 16 : 0;
+}
+
+/* Bytes per texel of the swizzled formats the CPU decoder handles; 0 for
+ * anything else (such a texture keeps one level). */
+static uint32_t swz_bpp(uint32_t color)
+{
+    switch (color) {
+    case 0x00: case 0x0B: case 0x19:                    return 1;
+    case 0x02: case 0x03: case 0x04: case 0x05:         return 2;
+    case 0x06: case 0x07:                               return 4;
+    default:                                            return 0;
+    }
+}
+
+/* Formats whose chains are uploaded: DXT1/3/5 plus the swizzled A8R8G8B8 and
+ * P8 (the only ones this title uses; the box-filter check of
+ * RECOMP_VK_MIP_LOG=2 verified their layout). Any other format keeps one
+ * level. */
+static int swz_chain_ok(uint32_t color)
+{
+    return color == 0x06 || color == 0x0B;
+}
+
+/* Guest bytes of one level. An unknown format counts 4 a texel, like
+ * tex_bytes. */
+static uint32_t level_bytes(uint32_t color, uint32_t lw, uint32_t lh)
+{
+    uint32_t bb = dxt_block_bytes(color), bpp;
+    if (bb)
+        return ((lw + 3) / 4) * ((lh + 3) / 4) * bb;
+    bpp = swz_bpp(color);
+    return lw * lh * (bpp ? bpp : 4);
+}
+
+static uint32_t mip_max_levels(uint32_t w, uint32_t h)
+{
+    uint32_t m = 1, d = w > h ? w : h;
+    while (d > 1) { d >>= 1; m++; }
+    return m;
+}
+
+/* Levels to upload for a texture whose SET_TEXTURE_FORMAT field says `raw`. */
+static uint32_t mip_levels(uint32_t color, uint32_t w, uint32_t h, uint32_t pitch, uint32_t raw)
+{
+    uint32_t m;
+    if (!s_mips_on || pitch || raw <= 1)
+        return 1;
+    if (!dxt_block_bytes(color) && !swz_chain_ok(color))
+        return 1;
+    m = mip_max_levels(w, h);
+    return raw < m ? raw : m;
+}
+
+static uint32_t chain_bytes(uint32_t color, uint32_t w, uint32_t h, uint32_t levels)
+{
+    uint32_t n = 0, l;
+    for (l = 0; l < levels; l++)
+        n += level_bytes(color, mip_dim(w, l), mip_dim(h, l));
+    return n;
+}
 
 #define VK_MAX_TEX 1024
 #define TEX_BUCKETS 2048
@@ -908,21 +1058,34 @@ static void tex_account(VkTex *t, uint32_t bytes)
         }
         if (!lru)
             break;
+        {
+            static int logged;
+            s_mip_evict++;
+            if (logged++ < 8)
+                fprintf(stderr, "[vk] texture budget %u MB: evicted %08X fmt %02X %ux%u"
+                        " (%u levels, %.1f KB), %.1f MB resident\n", (unsigned)(budget >> 20),
+                        lru->va, lru->color, lru->w, lru->h, lru->levels, lru->bytes / 1024.0,
+                        s_tex_bytes / 1048576.0);
+        }
         tex_free(lru);
     }
 }
 
-/* Copy `bytes` at `src` (row length `row_texels`, 0 = tight) into the image. */
-static void tex_upload(VkTex *t, const void *src, uint32_t bytes, uint32_t row_texels,
-                       uint32_t layer)
+/* Copy `bytes` at `src` into the image: `nlev` levels of one layer, level l
+ * at byte offs[l] of src (row length `row_texels`, 0 = tight). One ring
+ * allocation and one copy command for the whole chain. Returns 0 when the
+ * ring has no room. */
+static int tex_upload(VkTex *t, const void *src, uint32_t bytes, uint32_t row_texels,
+                      uint32_t layer, uint32_t nlev, const uint32_t *offs)
 {
     void *dst;
     VkDeviceSize at = ring_alloc(bytes, 16, &dst);
-    VkBufferImageCopy rg;
+    VkBufferImageCopy rg[MIP_MAX];
     VkCommandBuffer cb = s_cb;
+    uint32_t l;
 
     if (!dst)
-        return;
+        return 0;
     memcpy(dst, src, bytes);
 #ifdef NFSU2_IOS
     s_ios_uploads++;
@@ -938,16 +1101,20 @@ static void tex_upload(VkTex *t, const void *src, uint32_t bytes, uint32_t row_t
         end_rendering();
         barrier_all();
     }
-    memset(&rg, 0, sizeof rg);
-    rg.bufferOffset = at;
-    rg.bufferRowLength = row_texels;
-    rg.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    rg.imageSubresource.baseArrayLayer = layer;
-    rg.imageSubresource.layerCount = 1;
-    rg.imageExtent.width = t->w;
-    rg.imageExtent.height = t->h;
-    rg.imageExtent.depth = 1;
-    vkCmdCopyBufferToImage(cb, s_f->ring, t->image, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
+    memset(rg, 0, sizeof rg);
+    for (l = 0; l < nlev; l++) {
+        rg[l].bufferOffset = at + offs[l];
+        rg[l].bufferRowLength = row_texels;
+        rg[l].imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        rg[l].imageSubresource.mipLevel = l;
+        rg[l].imageSubresource.baseArrayLayer = layer;
+        rg[l].imageSubresource.layerCount = 1;
+        rg[l].imageExtent.width = mip_dim(t->w, l);
+        rg[l].imageExtent.height = mip_dim(t->h, l);
+        rg[l].imageExtent.depth = 1;
+    }
+    vkCmdCopyBufferToImage(cb, s_f->ring, t->image, VK_IMAGE_LAYOUT_GENERAL, nlev, rg);
+    return 1;
 }
 
 /* Cube map faces follow each other, each with its mip chain, padded to 128
@@ -959,6 +1126,12 @@ static uint32_t cube_face_bytes(uint32_t color, uint32_t w, uint32_t h, uint32_t
 
     if (!levels)
         levels = 1;
+    if (s_mips_on) {
+        /* The real chain (hardware stops at 1x1), formats by their true size. */
+        uint32_t m = mip_max_levels(w, h);
+        n = chain_bytes(color, w, h, levels < m ? levels : m);
+        return (n + 127) & ~127u;
+    }
     for (l = 0; l < levels; l++) {
         n += tex_bytes(color, w, h, 0);
         w = w > 1 ? w / 2 : 1;
@@ -967,62 +1140,153 @@ static uint32_t cube_face_bytes(uint32_t color, uint32_t w, uint32_t h, uint32_t
     return (n + 127) & ~127u;
 }
 
-/* One 2D image (layer 0) or cube face from guest memory at va. */
-static void tex_fill(VkTex *t, uint32_t va, uint32_t layer)
+/* Debug (RECOMP_VK_MIP_LOG=2): decode every level of the chain through the
+ * CPU decoder and compare it with a 2x2 box filter of the level before. A
+ * right layout gives small errors on every level (art mips are box filters);
+ * a wrong offset gives noise from the first level that is off. */
+static void mip_check(const VkTex *t, uint32_t va)
+{
+    uint32_t nl = t->levels, l, goff = 0;
+    uint32_t *prev = NULL, *cur = NULL;
+    uint32_t pw = 0, ph = 0;
+    double mae[MIP_MAX];
+
+    for (l = 0; l < nl; l++) {
+        uint32_t lw = mip_dim(t->w, l), lh = mip_dim(t->h, l), x, y, c;
+        Nv2aTexture nt;
+        cur = (uint32_t *)malloc((size_t)lw * lh * 4);
+        if (!cur) break;
+        memset(&nt, 0, sizeof nt);
+        nt.offset = va + goff; nt.width = lw; nt.height = lh; nt.color = t->color;
+        nt.addr_u = nt.addr_v = 1;
+        if (!(t->color == 0x0B ? decode_indexed(va + goff, lw, lh, cur)
+                               : nv2a_backend_decode_texture(&nt, cur))) {
+            free(cur); cur = NULL;
+            mae[l] = -1;
+        } else if (prev) {
+            double sum = 0;
+            for (y = 0; y < lh; y++)
+                for (x = 0; x < lw; x++) {
+                    uint32_t x0 = x * 2 < pw ? x * 2 : pw - 1, x1 = x * 2 + 1 < pw ? x * 2 + 1 : pw - 1;
+                    uint32_t y0 = y * 2 < ph ? y * 2 : ph - 1, y1 = y * 2 + 1 < ph ? y * 2 + 1 : ph - 1;
+                    uint32_t p[4] = { prev[y0 * pw + x0], prev[y0 * pw + x1],
+                                      prev[y1 * pw + x0], prev[y1 * pw + x1] };
+                    for (c = 0; c < 32; c += 8) {
+                        int avg = (int)(((p[0] >> c & 255) + (p[1] >> c & 255) +
+                                         (p[2] >> c & 255) + (p[3] >> c & 255) + 2) / 4);
+                        int d = avg - (int)(cur[y * lw + x] >> c & 255);
+                        sum += d < 0 ? -d : d;
+                    }
+                }
+            mae[l] = sum / ((double)lw * lh * 4);
+        } else {
+            mae[l] = 0;
+        }
+        free(prev);
+        prev = cur; pw = lw; ph = lh;
+        goff += level_bytes(t->color, lw, lh);
+    }
+    free(prev);
+    fprintf(stderr, "[mip] check %08X fmt %02X %ux%u: box-filter error per level (0-255):",
+            va, t->color, t->w, t->h);
+    for (l = 1; l < nl; l++)
+        fprintf(stderr, " L%u=%.2f", l, mae[l]);
+    fputc('\n', stderr);
+}
+
+static void mip_describe(const VkTex *t, uint32_t va, uint32_t face)
+{
+    uint32_t nl = t->levels, l, off = 0, closed = 0;
+    fprintf(stderr, "[mip] %08X fmt %02X %ux%u %u levels%s%s:", va, t->color, t->w, t->h, nl,
+            face ? " cube" : "", t->fmt == VK_FORMAT_B8G8R8A8_UNORM ? " (decoded)" : " (BC)");
+    for (l = 0; l < nl; l++) {
+        uint32_t lw = mip_dim(t->w, l), lh = mip_dim(t->h, l);
+        fprintf(stderr, " L%u %ux%u @%u", l, lw, lh, off);
+        off += level_bytes(t->color, lw, lh);
+    }
+    /* Closed form for a full square chain down to 1x1: bpp * (4 w^2 - 1) / 3. */
+    if (t->w == t->h && !dxt_block_bytes(t->color) && swz_bpp(t->color)
+        && (t->w >> (nl - 1)) == 1)
+        closed = (uint32_t)(((uint64_t)t->w * t->w * 4 - 1) / 3 * swz_bpp(t->color));
+    fprintf(stderr, " | last level ends at %u, chain %u", off,
+            chain_bytes(t->color, t->w, t->h, nl));
+    if (closed)
+        fprintf(stderr, ", closed form %u", closed);
+    fputc('\n', stderr);
+    if (s_mip_log >= 2)
+        mip_check(t, va);
+}
+
+/* One 2D image (layer 0) or cube face from guest memory at va: all
+ * t->levels levels, in one upload. Returns 0 when the upload failed. */
+static int tex_fill(VkTex *t, uint32_t va, uint32_t layer)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t color = t->color, w = t->w, h = t->h, pitch = t->pitch;
+    uint32_t nl = t->levels, l, goff[MIP_MAX], hoff[MIP_MAX], gtot = 0, texels = 0;
     Nv2aTexture nt;
 
+    for (l = 0; l < nl; l++) {
+        uint32_t lw = mip_dim(w, l), lh = mip_dim(h, l);
+        goff[l] = gtot;
+        hoff[l] = texels * 4;
+        gtot += level_bytes(color, lw, lh);
+        texels += lw * lh;
+    }
     if (t->fmt != VK_FORMAT_B8G8R8A8_UNORM) {              /* DXT as it is */
-        tex_upload(t, mem + va, tex_bytes(color, w, h, 0), 0, layer);
-        return;
+        return tex_upload(t, mem + va, gtot, 0, layer, nl, goff);
     }
     if (color == 0x12 && pitch && !(pitch & 3) && pitch / 4 >= w) {
         /* Linear A8R8G8B8 (movie frames): the bytes are B8G8R8A8 already. */
-        tex_upload(t, mem + va, pitch * (h - 1) + w * 4, pitch / 4, layer);
-        return;
+        uint32_t zero = 0;
+        return tex_upload(t, mem + va, pitch * (h - 1) + w * 4, pitch / 4, layer, 1, &zero);
     }
-    if ((size_t)w * h > s_decode_cap) {
+    if ((size_t)texels > s_decode_cap) {
         free(s_decode);
-        s_decode_cap = (size_t)w * h;
+        s_decode_cap = (size_t)texels;
         s_decode = (uint32_t *)malloc(s_decode_cap * 4);
     }
     if (!s_decode)
-        return;
-    if (color == 0x06 || color == 0x07) {
-        const uint32_t *src = (const uint32_t *)(mem + va);
-        uint32_t x, y, fill = color == 0x07 ? 0xFF000000u : 0;
-        for (y = 0; y < h; y++)
-            for (x = 0; x < w; x++)
-                s_decode[(size_t)y * w + x] = src[swizzle_index(x, y, w, h)] | fill;
-    } else {
-        int ok;
-        memset(&nt, 0, sizeof nt);
-        nt.offset = va; nt.width = w; nt.height = h; nt.pitch = pitch; nt.color = color;
-        nt.addr_u = nt.addr_v = 1;
-        ok = color == 0x0B ? decode_indexed(va, w, h, s_decode)
-                           : nv2a_backend_decode_texture(&nt, s_decode);
-        if (!ok) {
-            uint32_t k;
-            for (k = 0; k < w * h; k++)
-                s_decode[k] = 0xFFFF00FFu;
-            if (s_trace)
-                LOGE("texture 0x%08X format 0x%02X not decodable\n", va, color);
+        return 0;
+    for (l = 0; l < nl; l++) {
+        uint32_t lw = mip_dim(w, l), lh = mip_dim(h, l);
+        uint32_t *out = s_decode + hoff[l] / 4;
+        uint32_t lva = va + goff[l];
+        if (color == 0x06 || color == 0x07) {
+            const uint32_t *src = (const uint32_t *)(mem + lva);
+            uint32_t x, y, fill = color == 0x07 ? 0xFF000000u : 0;
+            for (y = 0; y < lh; y++)
+                for (x = 0; x < lw; x++)
+                    out[(size_t)y * lw + x] = src[swizzle_index(x, y, lw, lh)] | fill;
+        } else {
+            int ok;
+            memset(&nt, 0, sizeof nt);
+            nt.offset = lva; nt.width = lw; nt.height = lh; nt.pitch = pitch; nt.color = color;
+            nt.addr_u = nt.addr_v = 1;
+            ok = color == 0x0B ? decode_indexed(lva, lw, lh, out)
+                               : nv2a_backend_decode_texture(&nt, out);
+            if (!ok) {
+                uint32_t k;
+                for (k = 0; k < lw * lh; k++)
+                    out[k] = 0xFFFF00FFu;
+                if (s_trace)
+                    LOGE("texture 0x%08X format 0x%02X not decodable\n", lva, color);
+            }
         }
     }
-    tex_upload(t, s_decode, w * h * 4, 0, layer);
+    return tex_upload(t, s_decode, texels * 4, 0, layer, nl, hoff);
 }
 
-/* face: bytes per cube face (cube_face_bytes), 0 for a 2D texture. */
+/* face: bytes per cube face (cube_face_bytes), 0 for a 2D texture. levels:
+ * mip levels to upload (mip_levels); a cube face carries its own chain. */
 static VkImageView tex_get(uint32_t va, uint32_t color, uint32_t w, uint32_t h, uint32_t pitch,
-                           uint32_t face)
+                           uint32_t face, uint32_t levels)
 {
     VkTex *t = NULL, *victim = NULL;
     uint32_t i, hash;
     VkFormat fmt = VK_FORMAT_B8G8R8A8_UNORM;
     uint32_t layers = face ? 6 : 1, f, size;
-    int was_used, hoist;
+    int was_used, hoist, ok = 1;
 
     for (i = s_tex_head[tex_bucket(va, color, w, h)]; i; i = s_tex_next[i - 1]) {
         VkTex *c = &s_tex[i - 1];
@@ -1032,12 +1296,19 @@ static VkImageView tex_get(uint32_t va, uint32_t color, uint32_t w, uint32_t h, 
             break;
         }
     }
+    if (t && t->levels != levels) {         /* chain length changed: new image */
+        tex_free(t);
+        t = NULL;
+    }
     was_used = t && t->used == s_frame;     /* sampled earlier this frame; before we stamp it */
     if (t && t->checked == s_frame) {
         t->used = s_frame;
         return t->view;
     }
-    hash = bytes_hash(va, face ? face * 6 : tex_bytes(color, w, h, pitch));
+    /* The whole chain's guest range is hashed, not just level 0. */
+    hash = bytes_hash(va, face ? face * 6
+                               : levels > 1 ? chain_bytes(color, w, h, levels)
+                                            : tex_bytes(color, w, h, pitch));
     if (color == 0x0B)
         hash ^= bytes_hash(s_palette_va, 1024) * 31u;
     if (t && t->hash == hash) {
@@ -1070,10 +1341,11 @@ static VkImageView tex_get(uint32_t va, uint32_t color, uint32_t w, uint32_t h, 
             tex_free(t);
         t->va = va; t->color = color; t->w = w; t->h = h; t->pitch = pitch; t->fmt = fmt;
         t->face = face;
+        t->levels = levels;
         VT("texture %08X fmt %02X %ux%u pitch %u%s\n", va, color, w, h, pitch,
            face ? " cube" : "");
         s_trans_pre = hoist;
-        i = make_image_n(w, h, layers, fmt,
+        i = make_image_nl(w, h, layers, levels, fmt,
                          VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                          VK_IMAGE_ASPECT_COLOR_BIT, &t->image, &t->view, &t->mem);
         s_trans_pre = 0;
@@ -1091,9 +1363,26 @@ static VkImageView tex_get(uint32_t va, uint32_t color, uint32_t w, uint32_t h, 
 
     s_up_hoist = hoist;
     for (f = 0; f < layers; f++)
-        tex_fill(t, va + f * face, f);
+        ok &= tex_fill(t, va + f * face, f);
     s_up_hoist = 0;
-    size = fmt != VK_FORMAT_B8G8R8A8_UNORM ? tex_bytes(color, w, h, 0) : w * h * 4;
+    if (!ok)
+        t->hash ^= 0x5A5A5A5Au;             /* ring had no room: refill next time */
+    if (fmt != VK_FORMAT_B8G8R8A8_UNORM) {
+        size = chain_bytes(color, w, h, levels);
+    } else {
+        uint32_t l;
+        for (size = 0, l = 0; l < levels; l++)
+            size += mip_dim(w, l) * mip_dim(h, l) * 4;
+    }
+    if (levels > 1) {
+        s_mip_tex++;
+        s_mip_lvls += levels * layers;
+    }
+    if (s_mip_log && (levels > 1 || face)) {
+        static int seen;
+        if (seen++ < 400)
+            mip_describe(t, va, face);
+    }
     tex_account(t, size * layers);
     return t->view;
 }
@@ -1179,9 +1468,13 @@ static VkImageView cube_from_surfaces(uint32_t va, uint32_t w, uint32_t h, uint3
     return c->view;
 }
 
-/* Samplers: wrap u, wrap v, mag, min. */
-typedef struct { uint32_t key; VkSampler s; } SamplerEnt;
-static SamplerEnt s_samplers[64];
+/* Samplers. Key: wrap u [3:0], wrap v [11:8], mag nearest 16, min nearest
+ * 17, mip mode [19:18] (0 none, 1 nearest, 2 linear), min LOD [31:20] and
+ * max LOD [43:32] (guest 4.8 fixed, already limited to the level count),
+ * LOD bias [56:44] (guest signed 4.8), anisotropy [61:57]. */
+typedef struct { uint64_t key; VkSampler s; } SamplerEnt;
+#define MAX_SAMPLERS 512
+static SamplerEnt s_samplers[MAX_SAMPLERS];
 static int s_nsamplers;
 
 static VkSamplerAddressMode wrap_mode(uint32_t m)
@@ -1195,9 +1488,29 @@ static VkSamplerAddressMode wrap_mode(uint32_t m)
     }
 }
 
-static VkSampler sampler_get(uint32_t key)
+static int bias_in_shader(void)
+{
+    return s_bias_alt ? (int)(s_frame & 1) : s_bias_shader;
+}
+
+/* The bias the sampler path applies for this key: the guest's, clamped to
+ * the device limit; 0 on a sampler without mip levels. */
+static float key_lod_bias(uint64_t key)
+{
+    int32_t b = (int32_t)((key >> 44) & 0x1FFF);
+    float bias, lim = s_max_lod_bias;
+
+    if (!((key >> 18) & 3))
+        return 0.0f;
+    if (b & 0x1000) b -= 0x2000;                        /* signed 13 bits */
+    bias = (float)b / 256.0f;
+    return bias > lim ? lim : bias < -lim ? -lim : bias;
+}
+
+static VkSampler sampler_get(uint64_t key)
 {
     VkSamplerCreateInfo ci = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+    uint32_t mip = (uint32_t)(key >> 18) & 3, aniso = (uint32_t)(key >> 57) & 31;
     int i;
     for (i = 0; i < s_nsamplers; i++)
         if (s_samplers[i].key == key)
@@ -1207,11 +1520,29 @@ static VkSampler sampler_get(uint32_t key)
     ci.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     ci.magFilter = (key & 0x10000) ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
     ci.minFilter = (key & 0x20000) ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
-    ci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    ci.maxLod = 0.0f;
+    ci.mipmapMode = mip == 2 ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    if (mip) {
+        ci.mipLodBias = key_lod_bias(key);
+        ci.minLod = (float)((key >> 20) & 0xFFF) / 256.0f;
+        ci.maxLod = (float)((key >> 32) & 0xFFF) / 256.0f;
+        if (ci.maxLod < ci.minLod)
+            ci.maxLod = ci.minLod;
+    } else {
+        ci.maxLod = 0.0f;
+    }
+    if (aniso > 1 && s_have_aniso) {
+        ci.anisotropyEnable = VK_TRUE;
+        ci.maxAnisotropy = (float)aniso > s_max_aniso_dev ? s_max_aniso_dev : (float)aniso;
+    } else {
+        ci.maxAnisotropy = 1.0f;
+    }
     ci.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
-    if (s_nsamplers == 64)
-        s_nsamplers = 0;                    /* never in practice: 4 x 4 x 4 keys */
+    if (s_nsamplers == MAX_SAMPLERS) {
+        static int warned;
+        if (!warned++)
+            LOGE("sampler table full (%d): using the default\n", MAX_SAMPLERS);
+        return s_samplers[0].s;
+    }
     if (vkCreateSampler(s_dev, &ci, NULL, &s_samplers[s_nsamplers].s) != VK_SUCCESS)
         return VK_NULL_HANDLE;
     s_samplers[s_nsamplers].key = key;
@@ -1231,11 +1562,11 @@ static void rt_scale(uint32_t w, uint32_t h, uint32_t sw, uint32_t sh,
     if (h < lh) scale[1] *= (float)h / (float)lh;
 }
 
-/* Stage i: its image view (a surface or a cached texture), sampler and
- * texcoord scale. Records uploads, so call it outside rendering or accept
+/* Stage i: its image view (a surface or a cached texture), sampler, texcoord
+ * scale and the LOD bias the shader adds (u_lodb; 0 unless s_bias_shader). Records uploads, so call it outside rendering or accept
  * that it ends the pass. */
-static void bind_stage(const uint32_t *regs, int i, float scale[2], VkDescriptorImageInfo *out,
-                       VkSurf **sampled)
+static void bind_stage(const uint32_t *regs, int i, float scale[2], float *lodb,
+                       VkDescriptorImageInfo *out, VkSurf **sampled)
 {
     /* Texture mode CUBE_MAP: the shader declares a samplerCube (gl_psh.c),
      * so the descriptor must be a cube view whatever is bound. */
@@ -1251,10 +1582,12 @@ static void bind_stage(const uint32_t *regs, int i, float scale[2], VkDescriptor
     uint32_t control0 = regs[base + 3];
     uint32_t format = regs[base + 1];
     uint32_t color = (format >> 8) & 0xFF;
-    uint32_t va, w, h, pitch = 0, addr, filter, key;
+    uint32_t va, w, h, pitch = 0, addr, filter, levels = 1, raw_levels = (format >> 16) & 0xF;
+    uint64_t key;
     VkSurf *rt;
 
     scale[0] = scale[1] = 1.0f;
+    *lodb = 0.0f;
     out->imageView = cube ? s_dummy_cube_view : s_dummy_view;
     out->imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     out->sampler = sampler_get(0);
@@ -1281,7 +1614,7 @@ static void bind_stage(const uint32_t *regs, int i, float scale[2], VkDescriptor
     if (cube) {
         /* SET_TEXTURE_FORMAT bit 2: CUBEMAP_ENABLE; mip levels in [19:16]. */
         if (cube_on && (format & 4)) {
-            uint32_t face = cube_face_bytes(color, w, h, (format >> 16) & 0xF), f;
+            uint32_t face = cube_face_bytes(color, w, h, raw_levels), f;
             VkSurf *faces[6];
             int any = 0;
             for (f = 0; f < 6; f++)
@@ -1291,7 +1624,8 @@ static void bind_stage(const uint32_t *regs, int i, float scale[2], VkDescriptor
             } else {
                 uint32_t texs = s_hz_texs;
                 uint64_t t0 = hz_now();
-                out->imageView = tex_get(va, color, w, h, 0, face);
+                levels = mip_levels(color, w, h, 0, raw_levels);
+                out->imageView = tex_get(va, color, w, h, 0, face, levels);
                 if (s_hz_texs != texs)
                     s_hz_tex_ns += hz_now() - t0;
             }
@@ -1303,7 +1637,8 @@ static void bind_stage(const uint32_t *regs, int i, float scale[2], VkDescriptor
     } else {
         uint32_t texs = s_hz_texs;
         uint64_t t0 = hz_now();
-        out->imageView = tex_get(va, color, w, h, pitch, 0);
+        levels = mip_levels(color, w, h, pitch, raw_levels);
+        out->imageView = tex_get(va, color, w, h, pitch, 0, levels);
         if (s_hz_texs != texs)
             s_hz_tex_ns += hz_now() - t0;
     }
@@ -1312,6 +1647,56 @@ static void bind_stage(const uint32_t *regs, int i, float scale[2], VkDescriptor
     key = (addr & 0xF0F);
     if (((filter >> 24) & 0xF) == 1) key |= 0x10000;
     if (((filter >> 16) & 0xFF) == 1) key |= 0x20000;
+    if (levels > 1 && mips_active()) {
+        /* Guest min filter: 3 BOX_NEARESTLOD, 4 TENT_NEARESTLOD, 5
+         * BOX_TENT_LOD, 6 TENT_TENT_LOD (in-level filter, then between
+         * levels); 1, 2 and the rest read level 0 only. */
+        uint32_t minf = (filter >> 16) & 0xFF, mip = 0;
+        int nearest_min = 0;
+        switch (minf) {
+        case 3: mip = 1; nearest_min = 1; break;
+        case 4: mip = 1; break;
+        case 5: mip = 2; nearest_min = 1; break;
+        case 6: mip = 2; break;
+        default: break;
+        }
+        if (mip) {
+            uint32_t cap = (levels - 1) * 256;
+            uint32_t lo = (regs[base + 3] >> 18) & 0xFFF, hi = (regs[base + 3] >> 6) & 0xFFF;
+            if (hi > cap) hi = cap;
+            if (lo > hi) lo = hi;
+            key &= ~0x20000ull;
+            if (nearest_min) key |= 0x20000;
+            key |= (uint64_t)mip << 18;
+            key |= (uint64_t)lo << 20;
+            key |= (uint64_t)hi << 32;
+            key |= (uint64_t)(s_bias_force >= 0 ? (uint32_t)s_bias_force : (filter & 0x1FFF)) << 44;
+            if (!nearest_min && s_aniso > 1)
+                key |= (uint64_t)s_aniso << 57;
+        }
+        if (s_mip_log) {
+            static uint32_t seen[256];
+            static int n;
+            uint32_t sig = va ^ (filter * 31u) ^ (regs[base + 3] * 7u), k;
+            for (k = 0; k < (uint32_t)n && seen[k] != sig; k++) { }
+            if (k == (uint32_t)n && n < 256) {
+                seen[n++] = sig;
+                fprintf(stderr, "[mip] stage %d %08X fmt %02X %ux%u levels %u (field %u): "
+                        "min filter %u mag %u bias %d/256, lod clamp %u..%u /256 -> mip mode %u"
+                        " minLod %u maxLod %u aniso %u\n", i, va, color, w, h, levels,
+                        raw_levels, minf, (filter >> 24) & 0xF,
+                        (int)((filter & 0x1000) ? (int)(filter & 0x1FFF) - 0x2000
+                                                : (int)(filter & 0x1FFF)),
+                        (regs[base + 3] >> 18) & 0xFFF, (regs[base + 3] >> 6) & 0xFFF, mip,
+                        (unsigned)((key >> 20) & 0xFFF), (unsigned)((key >> 32) & 0xFFF),
+                        (unsigned)((key >> 57) & 31));
+            }
+        }
+    }
+    if (bias_in_shader()) {
+        *lodb = key_lod_bias(key);
+        key &= ~(0x1FFFull << 44);              /* the sampler gets bias 0 */
+    }
     out->sampler = sampler_get(key);
 }
 
@@ -2641,6 +3026,23 @@ static int ready(void)
     return ok;
 }
 
+/* VK_KHR_portability_subset is a beta header (VK_ENABLE_BETA_EXTENSIONS):
+ * mirror the features struct exactly (vulkan_beta.h, 1.3.296). MoltenVK
+ * reports samplerMipLodBias only on Apple10-family GPUs; elsewhere it
+ * drops the sampler's mipLodBias. Query only, never enabled by this code. */
+#define PS_FEATURES_STYPE ((VkStructureType)1000163000)
+typedef struct {
+    VkStructureType sType;
+    void           *pNext;
+    VkBool32        constantAlphaColorBlendFactors, events,
+                    imageViewFormatReinterpretation, imageViewFormatSwizzle,
+                    imageView2DOn3DImage, multisampleArrayImage,
+                    mutableComparisonSamplers, pointPolygons, samplerMipLodBias,
+                    separateStencilMaskRef, shaderSampleRateInterpolationFunctions,
+                    tessellationIsolines, tessellationPointMode, triangleFans,
+                    vertexAttributeAccessBeyondStride;
+} PortabilityFeatures;
+
 static int ready_impl(void)
 {
     VkApplicationInfo ai = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
@@ -2662,6 +3064,7 @@ static int ready_impl(void)
     VkPhysicalDeviceFeatures have;
     const char *dext[8];
     uint32_t ndext = 0;
+    int have_psub = 0;
 #ifdef NFSU2_IOS
     VkDeviceQueueGlobalPriorityCreateInfoEXT gpi =
         { VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_EXT };
@@ -2770,6 +3173,8 @@ static int ready_impl(void)
             VK_API_VERSION_MINOR(pp.apiVersion), VK_API_VERSION_PATCH(pp.apiVersion));
     s_ubo_align = pp.limits.minUniformBufferOffsetAlignment;
     s_ubo_range = pp.limits.maxUniformBufferRange;
+    s_max_aniso_dev = pp.limits.maxSamplerAnisotropy;
+    s_max_lod_bias = pp.limits.maxSamplerLodBias;
     {
         const char *e = getenv("RECOMP_GL_SCALE");
         double k = e ? strtod(e, NULL) : 1.0;
@@ -2788,6 +3193,7 @@ static int ready_impl(void)
     vkGetPhysicalDeviceFeatures(s_pd, &have);
     s_have_bc = have.textureCompressionBC;
     s_have_depth_clamp = have.depthClamp;
+    s_have_aniso = have.samplerAnisotropy && s_max_aniso_dev >= 2.0f;
     {
         VkFormatProperties fp;
         vkGetPhysicalDeviceFormatProperties(s_pd, VK_FORMAT_D24_UNORM_S8_UINT, &fp);
@@ -2846,6 +3252,7 @@ static int ready_impl(void)
     f2.pNext = &f13;
     f2.features.textureCompressionBC = s_have_bc ? VK_TRUE : VK_FALSE;
     f2.features.depthClamp = s_have_depth_clamp ? VK_TRUE : VK_FALSE;
+    f2.features.samplerAnisotropy = s_have_aniso ? VK_TRUE : VK_FALSE;
     if (!s_headless)
         dext[ndext++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
     dext[ndext++] = VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME;
@@ -2866,6 +3273,8 @@ static int ready_impl(void)
                     if (!strcmp(props[di].extensionName,
                                 VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME))
                         s_dyn_vertex_input = 1;
+                    if (!strcmp(props[di].extensionName, "VK_KHR_portability_subset"))
+                        have_psub = 1;
 #ifdef NFSU2_IOS
                     if (!strcmp(props[di].extensionName,
                                 VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME))
@@ -2874,6 +3283,15 @@ static int ready_impl(void)
                 }
                 free(props);
             }
+        }
+        if (have_psub) {
+            VkPhysicalDeviceFeatures2 q2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+            PortabilityFeatures ps;
+            memset(&ps, 0, sizeof ps);
+            ps.sType = PS_FEATURES_STYPE;
+            q2.pNext = &ps;
+            vkGetPhysicalDeviceFeatures2(s_pd, &q2);
+            s_bias_applied = ps.samplerMipLodBias ? 1 : 0;
         }
         fprintf(stderr, "[VKINIT] dynamic vertex input: %s\n",
                 s_dyn_vertex_input ? "yes" : "NO - per-layout pipelines"); fflush(stderr);
@@ -3036,6 +3454,7 @@ static int ready_impl(void)
         return 0;
     clear_image_color(s_dummy_cube_img, 0, 0, 0, 0);
     s_state = 1;
+    mip_cfg_init();
     fprintf(stderr, "  [VK] ready%s: BC %s, depth %s, depth clamp %s, UBO align %u\n",
             s_headless ? " (headless)" : "", s_have_bc ? "yes" : "no",
             s_depth_fmt == VK_FORMAT_D24_UNORM_S8_UINT ? "D24S8" : "D32S8",
@@ -3618,6 +4037,7 @@ typedef struct {
     int32_t afunc;
     float aref;
     float pad[2];
+    float lodb[4];               /* per-stage LOD bias (vec4) */
 } FsBlock;
 
 /* ── Instancing ───────────────────────────────────────────────────────
@@ -3815,7 +4235,7 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
     uint32_t n, i, cls;
     VkPrimitiveTopology topo;
     VkDescriptorImageInfo img[4];
-    float tscale[4][2];
+    float tscale[4][2], lodb[4];
     PipeKey key;
     VkPipeline pipe;
     VkDescriptorBufferInfo ub[3];
@@ -3881,7 +4301,7 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
 
     /* Textures first: uploads end the rendering pass. */
     for (i = 0; i < 4; i++)
-        bind_stage(r, (int)i, tscale[i], &img[i], &sampled[i]);
+        bind_stage(r, (int)i, tscale[i], &lodb[i], &img[i], &sampled[i]);
     for (i = 0; i < 4; i++)
         if (sampled[i] && sampled[i]->dirty && sampled[i] != s) {
             end_rendering();                 /* next begin_rendering barriers */
@@ -3991,6 +4411,7 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
             for (i = 0; i < 4; i++) {
                 fb->tscale[i][0] = tscale[i][0];
                 fb->tscale[i][1] = tscale[i][1];
+                fb->lodb[i] = lodb[i];
             }
             for (i = 0; i < 8; i++) {
                 argb_vec4(r[0xA60 / 4 + i], fb->c0[i]);
@@ -4331,6 +4752,11 @@ static void vk_flip(void)
                 xbox_vblank_report(dt, vb, sizeof vb);
                 fprintf(stderr, "[fps] %.1f fps (frame %u), %s\n",
                         (s_frame - last_frame) / dt, s_frame, vb);
+                if (s_mips_on)
+                    fprintf(stderr, "[vk-mip] 10 s: %u mipped textures uploaded (%u levels), "
+                            "%u evicted, %.1f MB texture memory\n", s_mip_tex, s_mip_lvls,
+                            s_mip_evict, s_tex_bytes / 1048576.0);
+                s_mip_tex = s_mip_lvls = s_mip_evict = 0;
                 last_frame = s_frame;
                 last = now;
             }
@@ -4353,7 +4779,7 @@ static void vk_flip(void)
     s_rt = NULL;
     s_rt_depth = NULL;
     if (s && s_drew_any && dump_every && ((s_frame % (uint32_t)dump_every) == 0
-                                          || (s_inst_alt && s_frame % (uint32_t)dump_every == 1))) {
+                                          || ((s_inst_alt || s_mips_alt || s_bias_alt) && s_frame % (uint32_t)dump_every == 1))) {
         char path[320];
         snprintf(path, sizeof path, "%s%05u.bmp", dump_prefix, s_frame);
         dump_surface(s, path);
