@@ -128,6 +128,14 @@ else()
     endif()
     set_source_files_properties(${RECOMP_GEN_SOURCES} PROPERTIES
         COMPILE_OPTIONS "${NFSU2_GEN_FLAGS}")
+    # Clang (the iOS build) fuses a*b+c into one FMA by default and ignores
+    # GCC's optimize("fp-contract=off"), so the native math overrides drifted
+    # from the lifted code in the last bit (211 fused ops on arm64). The
+    # lifted code is one op per statement and is not affected.
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+        set_property(SOURCE src/recomp_manual.c APPEND PROPERTY
+            COMPILE_OPTIONS "-ffp-contract=off")
+    endif()
     target_link_libraries(${PROJECT_NAME} PRIVATE m)
 endif()
 
