@@ -1277,6 +1277,47 @@ static int tex_fill(VkTex *t, uint32_t va, uint32_t layer)
     return tex_upload(t, s_decode, texels * 4, 0, layer, nl, hoff);
 }
 
+/* Freed-texture guard (RECOMP_VK_FREED_GUARD, default on; 0 = off).
+ * NFSU2 (sub_0004ED90) and NFSU1 (sub_00124310) fill a heap block with 0xEE
+ * bytes when they free it. Both free the loading screen's textures while the
+ * executor may still draw the last frame that uses them (NFSU2 with
+ * RECOMP_FRAME_LAG=1, the iOS default; NFSU1 without it). The changed hash
+ * then re-uploads the 0xEE memory, and a DXT 0xEEEE block is a flat tan
+ * (221,206,107): the yellow square for one frame around loading. A cached
+ * texture whose level 0 starts with that fill keeps its GPU copy and its old
+ * hash, so the same data coming back uploads nothing. */
+static int s_freed_guard = -1;
+static uint32_t s_freed_kept;
+
+static int freed_guard_on(void)
+{
+    if (s_freed_guard < 0) {
+        const char *e = getenv("RECOMP_VK_FREED_GUARD");
+        s_freed_guard = !(e && *e == '0');
+        fprintf(stderr, "  [VK] freed-texture guard %s (RECOMP_VK_FREED_GUARD)\n",
+                s_freed_guard ? "on" : "off");
+    }
+    return s_freed_guard;
+}
+
+/* True when the first 128 bytes (all of it when shorter) of the guest range
+ * are 0xEE. Not the whole range: the game reuses a freed block at once, and
+ * by the time the executor looks, the tail may already hold the next load. */
+static int guest_freed_fill(uint32_t va, uint32_t bytes)
+{
+    const uint32_t *w = (const uint32_t *)((const uint8_t *)xbox_GetMemoryOffset() + va);
+    uint32_t n = bytes / 4, i;
+
+    if (n < 4)
+        return 0;
+    if (n > 32)
+        n = 32;
+    for (i = 0; i < n; i++)
+        if (w[i] != 0xEEEEEEEEu)
+            return 0;
+    return 1;
+}
+
 /* face: bytes per cube face (cube_face_bytes), 0 for a 2D texture. levels:
  * mip levels to upload (mip_levels); a cube face carries its own chain. */
 static VkImageView tex_get(uint32_t va, uint32_t color, uint32_t w, uint32_t h, uint32_t pitch,
@@ -1312,6 +1353,19 @@ static VkImageView tex_get(uint32_t va, uint32_t color, uint32_t w, uint32_t h, 
     if (color == 0x0B)
         hash ^= bytes_hash(s_palette_va, 1024) * 31u;
     if (t && t->hash == hash) {
+        t->used = t->checked = s_frame;
+        return t->view;
+    }
+    /* Level 0 only: the hashed chain can run past the freed block. */
+    if (t && freed_guard_on() && guest_freed_fill(va, pitch ? tex_bytes(color, w, h, pitch) : level_bytes(color, w, h))) {
+        static uint32_t last_logged, lines;
+        s_freed_kept++;
+        if ((s_freed_kept <= 24 || last_logged != s_frame) && lines++ < 400) {
+            last_logged = s_frame;
+            fprintf(stderr, "[VK] freed-texture guard: frame %u kept the GPU copy of %08X fmt %02X "
+                    "%ux%u (guest memory starts with 0xEE fill; %u kept so far)\n",
+                    s_frame, va, color, w, h, s_freed_kept);
+        }
         t->used = t->checked = s_frame;
         return t->view;
     }

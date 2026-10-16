@@ -71,3 +71,11 @@ cap slows the game clock (lavapipe races at 11-18 fps run at 0.6-0.85 of real
 time, with or without this change). `RECOMP_DT_CAP=8` (test only) raises it.
 Widescreen: the title never queries the video flags and renders 4:3, so
 `RECOMP_WIDESCREEN=1` only stretches the 4:3 picture to 16:9: leave it 0.
+
+## Yellow square after loading
+
+The title fills freed heap blocks with 0xEE (`sub_00124310`) while the
+executor can still draw the last frame that used them; DXT 0xEEEE is a flat
+tan. `nv2a_vk.c` keeps the GPU copy of a cached texture whose level 0 starts
+with that fill (`RECOMP_VK_FREED_GUARD`, default on). On Linux it fires at
+menu -> loading and loading -> race. Same guard as NFSU2 v30.
