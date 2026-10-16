@@ -326,6 +326,243 @@ uint32_t g_nfsu2_gamma_gen;
 uint32_t nfsu2_movie_row;
 char nfsu2_movie_name[64];
 
+/* ── Swap present-interval forcing (0x001CF380 / 0x001CF570) ─
+ *
+ * NFSU2 twins (masked-opcode match): 0x002EB4B0 -> 0x001CF380, 0x002EB6A0 ->
+ * 0x001CF570. Both read D3D's present interval at 0x1DE94C (NFSU2 0x2F76FC):
+ * `cmp [0x1DE94C], 0x80000000` (D3D.asm 0x001CF43A, 0x001CF637) and
+ * `mov edx, [0x1DE94C]` (0x001CF45B, 0x001CF511, 0x001CF5D5). D3D's own
+ * setter (0x001D3B70..0x001D3BD1) stores 1/2/4 or 0x8000000n there; EA's
+ * wrapper writes it from 0x0016D1BB and 0x0016DB08. The race cap is 2 (or
+ * 0x80000002, every second vblank). Rewrite it to every-vblank before each
+ * swap whenever RECOMP_PRESENT_INTERVAL=1 and leave it there: every reader
+ * is inside the two swap functions. s_forced_from only feeds the log.
+ *
+ * Time step: NFSU1 differs from NFSU2. The main loop (sub_0004DF80, one
+ * iteration per frame) measures dt (sub_00123280 clock, x0.001) and calls
+ * sub_001410D0, which clamps it to [1/60, 3/60] (NTSC; [0.02, 0.06] when
+ * sub_001408A0 returns 0, i.e. PAL) with the float constants at 0x1F8190,
+ * 0x1F84A8 and [0x25314C] = 3.0. Those are .rdata constants shared with
+ * other code, not a variable like NFSU2's 0x428EE8, so there is no floor
+ * to rewrite. The clamped dt goes to [0x253164]; sub_00141200 turns it
+ * into N = max(1, int(acc*60)) sim ticks of 1/60 (N at [0x253148], running
+ * sum at [0x253144], the game clock: the lap timer follows it, measured
+ * 310.57 s of lap time against 310.62 s of sum over the same 306.9 s).
+ * Game time follows measured dt, so there is no frame-locked 30 Hz step to
+ * break at 60 fps. But the 1/60 floor is a literal in the code. Present
+ * intervals are a whole number of vblanks only on average: a frame that
+ * takes 15 ms counts as 16.67 ms, and the clock runs fast (menus at 60
+ * swaps/s on lavapipe: 1.07-1.13 against the game's own 1.0167). Fix, see
+ * dt_step_wrap: hand the excess back through the game's own remainder. */
+extern void sub_001CF380_gen(void);
+extern void sub_001CF570_gen(void);
+extern void sub_001410D0_gen(void);
+
+#define PRESENT_SLOT    0x1DE94Cu
+#define SIM_TICKS_SUM   0x253144u       /* running sum of N (sub_00141200) */
+
+static int swap_interval_wanted(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("RECOMP_PRESENT_INTERVAL");
+        v = (e && strcmp(e, "1") == 0);
+        if (v)
+            fprintf(stderr, "[FPS] RECOMP_PRESENT_INTERVAL=1: swap flips every vblank\n");
+    }
+    return v;
+}
+
+/* The value we replaced at the slot, so it can be put back. */
+static int s_forced;
+static uint32_t s_forced_from, s_forced_to;
+
+static void force_interval(uint32_t slot)
+{
+    static uint32_t last;
+    uint32_t cur = MEM32(slot);
+    uint32_t fixed = cur;
+    if (cur == 0x80000002u)
+        fixed = 0x80000001u;
+    else if (cur == 2u)
+        fixed = 1u;
+    if (fixed != cur) {
+        MEM32(slot) = fixed;
+        s_forced = 1;
+        s_forced_from = cur;
+        s_forced_to = fixed;
+        if (cur != last) {
+            last = cur;
+            fprintf(stderr, "[FPS] swap interval 0x%08X -> every vblank\n", cur);
+        }
+    }
+}
+
+/* RECOMP_DT_FLOOR, only with RECOMP_PRESENT_INTERVAL=1:
+ *   auto  (default) hand the floor's excess back, see dt_step_wrap
+ *   game  leave the game's step alone (kill switch, the v24-like behaviour)
+ * Unset or anything else is auto. NFSU2's zero, clamp and test30 do not
+ * exist here: the floor is not a variable, and NFSU1's step has no
+ * cutscene floor to tell apart. */
+enum { DT_AUTO, DT_GAME };
+
+static int dt_floor_mode(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("RECOMP_DT_FLOOR");
+        v = (e && strcmp(e, "game") == 0) ? DT_GAME : DT_AUTO;
+    }
+    return v;
+}
+
+static float dt_f32(uint32_t raw)
+{
+    float f;
+    memcpy(&f, &raw, sizeof f);
+    return f;
+}
+
+static uint32_t dt_bits(float f)
+{
+    uint32_t u;
+    memcpy(&u, &f, sizeof u);
+    return u;
+}
+
+/* Floor excess seen by sub_001410D0 since the last log line. */
+static unsigned dt_frames, dt_floored;
+static double dt_excess_s;
+
+/* The main-loop time step, sub_001410D0 (one call per frame from 0x0004E03F,
+ * cdecl, dt in seconds at [esp+4]). Normal path:
+ *   raw = dt * 1.0167 + rem            rem = float[0x2CA430]
+ *   t   = min(max(raw, floor), cap)    floor = 1/60 (NTSC, [0x25313C] != 0)
+ *                                      or 0.02; cap = float[0x25314C] * floor
+ *   rem = t - round(t*4000)/4000, float[0x253164] = quantized t
+ * [0x2CA14C] != 0 is the replay branch; left alone.
+ * A frame shorter than the floor is counted as a full floor, the clock gains
+ * the difference. Writing the floor to 0 does not help: sub_00141200 then
+ * takes N = max(1, int(acc*60)) ticks and an empty step still costs 1/60.
+ * So let the floor stand and take the excess e = floor - raw back out of
+ * rem. The next raw is e smaller and the game's own carry pays it off:
+ * sum(ft) = 1.0167 * wall + rem_first - rem_last, exact. rem is held above
+ * -3/60 so a stretch above 60 fps cannot owe more than 3 frames. */
+void sub_001410D0(void)
+{
+    uint32_t arg = MEM32(esp + 4);
+    uint32_t rem_in = MEM32(0x2CA430u);
+    uint32_t replay = MEM32(0x2CA14Cu);
+    float floor_s = MEM32(0x25313Cu) ? dt_f32(0x3C888889u) : dt_f32(0x3CA3D70Au);
+
+    sub_001410D0_gen();
+    if (!swap_interval_wanted() || replay)
+        return;
+    {
+        float raw = dt_f32(arg) * dt_f32(0x3F82233Au) + dt_f32(rem_in);
+        dt_frames++;
+        if (raw < floor_s) {
+            float e = floor_s - raw, rem = dt_f32(MEM32(0x2CA430u));
+            dt_floored++;
+            dt_excess_s += e;
+            if (dt_floor_mode() == DT_AUTO) {
+                rem -= e;
+                if (rem < -3.0f / 60.0f)
+                    rem = -3.0f / 60.0f;
+                MEM32(0x2CA430u) = dt_bits(rem);
+            }
+        }
+    }
+}
+
+/* Called from both swap wrappers when RECOMP_PRESENT_INTERVAL=1, before the
+ * generated swap. Forces the interval and logs. RECOMP_DT_LOG=1 prints a
+ * line per second: sim_s is the game's own tick sum (1/60 s per tick), fl
+ * the steps whose dt the floor raised, ex_ms the time it added. */
+static void swap_pre(uint32_t slot)
+{
+    static int logon = -1, started;
+    static uint32_t last_slot = 0xFFFFFFFFu, last_sum;
+    static unsigned swaps;
+    static double last_s;
+
+    if (!started) {
+        started = 1;
+        fprintf(stderr, "[dt] 60 fps time floor: %s (RECOMP_DT_FLOOR)\n",
+                dt_floor_mode() == DT_GAME ? "game" : "auto");
+    }
+    if (logon < 0) {
+        const char *e = getenv("RECOMP_DT_LOG");
+        logon = (e && strcmp(e, "1") == 0);
+    }
+    {
+        uint32_t cur = (s_forced && MEM32(slot) == s_forced_to) ? s_forced_from : MEM32(slot);
+        if (cur != last_slot) {
+            fprintf(stderr, "[dt] game swap interval 0x%08X (was 0x%08X)\n", cur, last_slot);
+            last_slot = cur;
+        }
+    }
+    force_interval(slot);
+
+    /* Test knob, not a feature: the step clamps dt at cap/60 s, cap =
+     * float[0x25314C] = 3.0 (read only by sub_001410D0). Below 20 fps the
+     * game clock then runs slower than the wall clock, which lavapipe's
+     * 12-18 fps in a race hits. RECOMP_DT_CAP=8 lets the clock keep up so
+     * sim_s/wall can be measured there. Unset: the game's own 3.0. */
+    {
+        static int cap_init;
+        if (!cap_init) {
+            const char *e = getenv("RECOMP_DT_CAP");
+            float c = e ? (float)atof(e) : 0.0f;
+            cap_init = 1;
+            if (c >= 1.0f && c <= 30.0f) {
+                uint32_t bits;
+                memcpy(&bits, &c, sizeof bits);
+                MEM32(0x25314Cu) = bits;
+                fprintf(stderr, "[dt] RECOMP_DT_CAP=%g: dt clamp raised to %g/60 s (test only)\n",
+                        (double)c, (double)c);
+            }
+        }
+    }
+
+    if (logon) {
+        struct timespec ts;
+        double now;
+        uint32_t sum = MEM32(SIM_TICKS_SUM);
+        swaps++;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        now = (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+        if (last_s == 0.0) {
+            last_s = now;
+            last_sum = sum;
+        }
+        if (now - last_s >= 1.0) {
+            fprintf(stderr, "[dt] wall=%.3f swaps=%u steps=%u fl=%u ex_ms=%.1f sim_s=%.4f slot=0x%08X\n",
+                    now - last_s, swaps, dt_frames, dt_floored, dt_excess_s * 1e3,
+                    (double)(int32_t)(sum - last_sum) / 60.0, MEM32(slot));
+            swaps = 0;
+            dt_frames = dt_floored = 0;
+            dt_excess_s = 0.0;
+            last_sum = sum;
+            last_s = now;
+        }
+    }
+}
+
+void sub_001CF380(void)
+{
+    if (swap_interval_wanted())
+        swap_pre(PRESENT_SLOT);
+    sub_001CF380_gen();
+}
+
+void sub_001CF570(void)
+{
+    if (swap_interval_wanted())
+        swap_pre(PRESENT_SLOT);
+    sub_001CF570_gen();
+}
+
 /* ── Manual function overrides ─────────────────────────────── */
 
 /*
