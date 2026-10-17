@@ -743,13 +743,207 @@ void xbox_gil_resume(int depth)
     }
 }
 
-/* RECOMP_SPIN_HINT's periodic yield: a poll loop waits for another thread,
- * an interrupt or a DPC -- all of which need the lock. */
-void recomp_spin_yield(void)
+/* A plain yield: let every other guest thread, ISR and DPC have the lock. */
+static void gil_yield(void)
 {
     int d = xbox_gil_suspend();
     SwitchToThread();
     xbox_gil_resume(d);
+}
+
+/* ── Sleeping in a D3D fence wait ────────────────────────────
+ *
+ * The title's fence wait (D3D BlockOnTime) polls the GPU semaphore until it
+ * reaches the fence. The poll loop's yield above only hands over the guest
+ * lock, so the thread still ran a core flat out for as long as the GPU
+ * took. On a phone that is heat and battery, and it competes with the
+ * renderer for the cores.
+ *
+ * The wrapper around the wait (recomp_manual.c) says which semaphore and
+ * which fence this thread waits for. The poll loop's yield then sleeps on a
+ * condition variable instead, for at most a millisecond, and the pushbuffer
+ * executor broadcasts it as it writes the semaphore (recomp_fence_signal).
+ * The wait is re-checked under the mutex after the waiter count went up, so
+ * a release between the loop's last read and the sleep is not lost.
+ *
+ * Waits nest: D3D's ring-space path (sub_002E8E60 -> 0x2E91D0 -> 0x2E9090)
+ * calls the wrapped function again from inside a wait. Only the innermost
+ * one is the loop that polls.
+ *
+ * Other poll loops reached from inside a wait take the same sleep: the
+ * PGRAPH pattern-colour poll in D3D's fence helper (the executor latches
+ * that register just ahead of the semaphore release, so the wake lands a
+ * method later). The kickoff's flush poll is answered by recomp_spin_wake
+ * and then only yields. One that waits for anything else is capped by the
+ * millisecond. The loop compares against the fence of a ring record
+ * (sub_002E8A50) on one path, not the argument; that is the argument's own
+ * fence or a later one, and a later one only makes the test here false
+ * earlier, which is the plain yield again.
+ *
+ * RECOMP_FENCE_SLEEP=0 gives the plain yield again. Windows keeps it. */
+#if !defined(_WIN32)
+#include <pthread.h>
+#include <time.h>
+
+void recomp_spin_wake(void);        /* xbox_memory_layout.c */
+unsigned recomp_spin_flush_acks(void);
+
+#define FENCE_NEST 4
+static RECOMP_TLS struct {
+    uint32_t sem_va, wseq_va, fence;
+    uint64_t t0;                    /* RECOMP_FPS_LOG: wait started */
+} t_fence[FENCE_NEST];
+static RECOMP_TLS unsigned t_flush_seen;    /* recomp_spin_flush_acks at the last sleep */
+static RECOMP_TLS int t_fence_depth;        /* waits open, may exceed FENCE_NEST */
+static pthread_mutex_t s_fence_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  s_fence_cond = PTHREAD_COND_INITIALIZER;
+static int      s_fence_waiters;            /* atomic: threads in the cond wait */
+static unsigned s_fence_sleeps, s_fence_timeouts;   /* atomic, RECOMP_FPS_LOG */
+
+static int fence_sleep_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_FENCE_SLEEP");
+        on = !(e && *e == '0');
+        fprintf(stderr, on ? "[D3D] fence wait: sleep on the GPU semaphore "
+                             "(RECOMP_FENCE_SLEEP=0 spins)\n"
+                           : "[D3D] fence wait: spin (RECOMP_FENCE_SLEEP=0)\n");
+    }
+    return on;
+}
+
+/* RECOMP_FPS_LOG=1: waits, wall time in them and sleeps, every 10 s. */
+static int fence_log_on(void)
+{
+    static int log = -1;
+    if (log < 0) {
+        const char *e = getenv("RECOMP_FPS_LOG");
+        log = e && *e == '1';
+    }
+    return log;
+}
+
+static uint64_t fence_now_ns(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000u + (uint64_t)t.tv_nsec;
+}
+
+void recomp_fence_wait_begin(uint32_t sem_va, uint32_t wseq_va, uint32_t fence)
+{
+    int i = t_fence_depth++;
+    if (i >= FENCE_NEST)
+        return;
+    t_fence[i].t0 = i == 0 && fence_log_on() ? fence_now_ns() : 0;
+    /* sem_va 0 = no semaphore (no device yet): never sleeps. */
+    t_fence[i].sem_va = fence_sleep_on() ? sem_va : 0;
+    t_fence[i].wseq_va = wseq_va;
+    t_fence[i].fence = fence;
+}
+
+static void fence_log_counts(uint64_t waited_ns)
+{
+    static uint64_t last_ns, wait_ns;
+    static unsigned waits;
+    uint64_t now = fence_now_ns();
+    wait_ns += waited_ns;
+    waits++;
+    if (now - last_ns >= 10000000000ull) {
+        if (last_ns)
+            fprintf(stderr, "[D3D] fence waits %u, %.0f ms in them (game thread); "
+                            "sleeps %u, timed out %u\n",
+                    waits, wait_ns / 1e6,
+                    __atomic_exchange_n(&s_fence_sleeps, 0, __ATOMIC_RELAXED),
+                    __atomic_exchange_n(&s_fence_timeouts, 0, __ATOMIC_RELAXED));
+        last_ns = now;
+        wait_ns = 0;
+        waits = 0;
+    }
+}
+
+void recomp_fence_wait_end(void)
+{
+    int i = --t_fence_depth;
+    if (i == 0 && t_fence[0].t0)
+        fence_log_counts(fence_now_ns() - t_fence[0].t0);
+}
+
+/* The innermost wait, if it is one this thread records. */
+static int fence_cur(void)
+{
+    int i = t_fence_depth - 1;
+    return i >= 0 && i < FENCE_NEST && t_fence[i].sem_va ? i : -1;
+}
+
+/* The lifted loop's test (unsigned): wseq - fence below wseq - semaphore. */
+static int fence_behind(int i)
+{
+    uint32_t w = BRIDGE_MEM32(t_fence[i].wseq_va);
+    uint32_t s = __atomic_load_n((volatile uint32_t *)((uintptr_t)t_fence[i].sem_va
+                                 + g_xbox_mem_offset), __ATOMIC_ACQUIRE);
+    return (w - t_fence[i].fence) < (w - s);
+}
+
+static void fence_sleep(int i)
+{
+    struct timespec ts;
+    int d, timed_out = 0;
+
+    recomp_spin_wake();
+    /* A kickoff's flush poll that this wake just answered is done: no sleep. */
+    if (recomp_spin_flush_acks() != t_flush_seen) {
+        t_flush_seen = recomp_spin_flush_acks();
+        gil_yield();
+        return;
+    }
+    d = xbox_gil_suspend();
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_nsec += 1000000L;
+    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+    pthread_mutex_lock(&s_fence_lock);
+    __atomic_add_fetch(&s_fence_waiters, 1, __ATOMIC_SEQ_CST);
+    if (fence_behind(i))
+        timed_out = pthread_cond_timedwait(&s_fence_cond, &s_fence_lock, &ts) != 0;
+    __atomic_sub_fetch(&s_fence_waiters, 1, __ATOMIC_SEQ_CST);
+    pthread_mutex_unlock(&s_fence_lock);
+    xbox_gil_resume(d);
+    __atomic_add_fetch(&s_fence_sleeps, 1, __ATOMIC_RELAXED);
+    if (timed_out)
+        __atomic_add_fetch(&s_fence_timeouts, 1, __ATOMIC_RELAXED);
+}
+
+/* The executor, right after it stored a semaphore release. */
+void recomp_fence_signal(void)
+{
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);    /* the store, then the count */
+    if (!__atomic_load_n(&s_fence_waiters, __ATOMIC_SEQ_CST))
+        return;
+    pthread_mutex_lock(&s_fence_lock);
+    pthread_cond_broadcast(&s_fence_cond);
+    pthread_mutex_unlock(&s_fence_lock);
+}
+#else
+void recomp_fence_wait_begin(uint32_t sem_va, uint32_t wseq_va, uint32_t fence)
+{ (void)sem_va; (void)wseq_va; (void)fence; }
+void recomp_fence_wait_end(void) { }
+void recomp_fence_signal(void) { }
+#define fence_cur() (-1)
+#define fence_behind(i) 0
+#define fence_sleep(i) gil_yield()
+#endif
+
+/* RECOMP_SPIN_HINT's periodic yield: a poll loop waits for another thread,
+ * an interrupt or a DPC -- all of which need the lock. Inside a fence wait
+ * that is still short of its fence it sleeps instead. */
+void recomp_spin_yield(void)
+{
+    int i = fence_cur();
+    if (i >= 0 && fence_behind(i))
+        fence_sleep(i);
+    else
+        gil_yield();
 }
 
 /* RECOMP_PREEMPT: someone is waiting -- yield, unless this is an ISR or DPC
@@ -762,7 +956,7 @@ void recomp_preempt(void)
 {
     if (t_gil_depth <= 0 || t_gil_nopreempt || xbox_thread_holds_dispatch())
         return;
-    recomp_spin_yield();
+    gil_yield();
 }
 
 #define GUEST_CALL(f) do { xbox_gil_enter(); (f)(); xbox_gil_leave(); } while (0)

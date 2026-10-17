@@ -191,6 +191,8 @@ void sub_001EA5B2(void)
 #define NFSU1_D3D_DEVICE_PTR 0x001DE9E8u
 extern void nv2a_pb_set_semaphore_target(uint32_t guest_va);
 extern void sub_001D0340_gen(void);
+extern void recomp_fence_wait_begin(uint32_t sem_va, uint32_t wseq_va, uint32_t fence);
+extern void recomp_fence_wait_end(void);
 
 void sub_001D0340(void)
 {
@@ -203,7 +205,12 @@ void sub_001D0340(void)
         fprintf(stderr, "[D3D] GPU semaphore at 0x%08X\n", sem);
         registered = sem;
     }
+    /* The wait's poll loop sleeps on the executor's semaphore writes
+     * instead of spinning (kernel_bridge.c, RECOMP_FENCE_SLEEP=0 spins).
+     * +0x2C is the write sequence the loop's test is relative to. */
+    recomp_fence_wait_begin(sem, dev + 0x2C, MEM32(esp + 4));
     sub_001D0340_gen();
+    recomp_fence_wait_end();
 }
 
 /* ── D3D interrupt handlers at DISPATCH_LEVEL ────────────────

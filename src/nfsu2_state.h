@@ -1,7 +1,7 @@
 /* nfsu2_state.h -- reads the game's race state from guest memory.
- * Found by reverse engineering; validated in one Linux run (menus, loading,
- * flyby, driving, pause, resume). Free roam and quit-to-menu are NOT
- * validated. Single racy 32-bit reads, by design. */
+ * NFSU1 build (the file keeps the NFSU2 names). Found by reverse engineering
+ * default.xbe; validated on Linux: menus, loading, countdown, driving, pause,
+ * resume, Quick Race and Career. Single racy 32-bit reads, by design. */
 #ifndef NFSU2_STATE_H
 #define NFSU2_STATE_H
 
@@ -10,11 +10,14 @@ extern "C" {
 #endif
 
 /* 1 = driving, 0 = menus / loading / paused, -1 = unknown (no guest memory,
- * pre-race flyby, a state not understood). */
+ * race countdown, replay, a state not understood). */
 int nfsu2_in_race(void);
 
-/* The three words behind the last answer. Any pointer may be NULL.
- * Returns 0 and writes zeros when there is no guest memory. */
+/* The words behind the last answer. Any pointer may be NULL.
+ * NFSU1: gameflow = GAMEFLOW_STATE word; mode = RCSTATE read through the race
+ * controller pointer (0xFFFFFFFF when there is no valid object); flag = 1 when
+ * that pointer is valid, else 0. Returns 0 and writes zeros when there is no
+ * guest memory. */
 int nfsu2_state_words(unsigned *gameflow, unsigned *mode, unsigned *flag);
 
 /* Debounce for the automatic Pad/Drive layout. *state starts at 0 (zero

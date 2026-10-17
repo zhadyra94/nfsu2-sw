@@ -530,7 +530,7 @@ static const char *const nfsu2_ios_alts[] = { "NFSU1-data", "game", "nfsu1", "NF
 /* Build label for the launch screen. */
 const char *nfsu2_build_label(void)
 {
-    return "u1-3 " __DATE__;
+    return "u1-4 " __DATE__;
 }
 
 /* Is the launch screen asked for? NFSU2_LAUNCHER, default OFF (v29): the game
@@ -915,7 +915,7 @@ int main(int argc, char **argv)
     /* Redirect the log FIRST so main-thread init output is captured. */
     ios_log_to_documents();
     setvbuf(stderr, NULL, _IONBF, 0);
-    fprintf(stderr, "nfsu1: build u1-3 (u1-2 + no yellow square after loading)\n");
+    fprintf(stderr, "nfsu1: build u1-4 (u1-3 + EA Trax crash fixed, Auto Pad/Drive reads NFSU1, GPU wait sleeps)\n");
     fprintf(stderr, "nfsu2: HOME=%s TMPDIR=%s\n",
             getenv("CFFIXED_USER_HOME") ? getenv("CFFIXED_USER_HOME") : "(unset)",
             getenv("TMPDIR") ? getenv("TMPDIR") : "(unset)");
@@ -1184,7 +1184,7 @@ static int game_main(void)
 #ifdef NFSU2_IOS
     ios_log_to_documents();
     setvbuf(stderr, NULL, _IONBF, 0);
-    fprintf(stderr, "nfsu1: build u1-3 (u1-2 + no yellow square after loading)\n");
+    fprintf(stderr, "nfsu1: build u1-4 (u1-3 + EA Trax crash fixed, Auto Pad/Drive reads NFSU1, GPU wait sleeps)\n");
     fprintf(stderr, "nfsu2: HOME=%s CFFIXED_USER_HOME=%s TMPDIR=%s\n",
             getenv("HOME") ? getenv("HOME") : "(unset)",
             getenv("CFFIXED_USER_HOME") ? getenv("CFFIXED_USER_HOME") : "(unset)",

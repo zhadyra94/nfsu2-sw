@@ -18,5 +18,17 @@
  {
   "start": "0x001EFCB2",
   "note": "ICALL target; follows ret 8 (XPP)"
+ },
+ {
+  "start": "0x000C3F4D",
+  "note": "EA Trax: message-hash dispatch after sub_000C3F1C's ret, reached by ja from sub_000C3EA0 (was an empty stub: crash opening Options > EA Trax)"
+ },
+ {
+  "start": "0x000C3F92",
+  "note": "EA Trax: call + pop esi; ret 16, reached by je from sub_000C3EA0"
+ },
+ {
+  "start": "0x000C3F9A",
+  "note": "EA Trax: pop esi; ret 16, reached by jne from sub_000C3EA0 (the ret-16 stub skipped the pop)"
  }
 ]
