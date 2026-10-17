@@ -18,6 +18,7 @@
 #include "video_player.h"
 #include "d3d/d3d8_xbox.h"
 #include "d3d/d3d8_internal.h"
+#include "platform/cpu_report.h"
 
 #define VP_WINDOW_W 640
 #define VP_WINDOW_H 480
@@ -60,6 +61,8 @@ static DWORD WINAPI vp_thread(LPVOID unused)
     IDirect3D8 *d3d;
     IDirect3DDevice8 *dev = NULL;
     D3DPRESENT_PARAMETERS pp;
+
+    xbox_thread_name("video");
     HWND hwnd;
     HRESULT hr;
     DWORD last;

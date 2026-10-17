@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <time.h>
+#include "platform/cpu_report.h"
 
 /* The generated register model (g_eax/g_esp are thread-local there) and the
  * XBOX_PTR/MEM32 accessors; the register names below are its macros. */
@@ -500,14 +501,14 @@ static float dt_use(int mode, float game)
  * generated swap. Sets the floor, forces or unforces the interval, logs. */
 static void swap_pre(uint32_t slot)
 {
-    static int logon = -1, started, seen, last_allow = 1;
+    static int logon = -1, started, seen, last_cut;
     static uint32_t last_written, last_game;
     static unsigned swaps, n0;
     static uint64_t nsum;
     static double last_s;
     int mode = dt_floor_mode();
     uint32_t mem = MEM32(0x428EE8u), slot_game;
-    int changed = 0, allow;
+    int changed = 0, allow, cut, hot;
     uint32_t prev_game = last_game;
     float game, use;
 
@@ -535,7 +536,9 @@ static void swap_pre(uint32_t slot)
         }
     }
     game = dt_f32(last_game);
-    allow = !(mode == DT_AUTO && game > DT_60_EPS);
+    cut = mode == DT_AUTO && game > DT_60_EPS;      /* cutscene: the game's 30 fps */
+    hot = xbox_power_hot_cap();                     /* heat or Low Power Mode */
+    allow = !cut && !hot;
 
     if (mode != DT_GAME && (mode != DT_AUTO || allow))
         MEM32(0x428EE8u) = dt_bits(dt_use(mode, game));
@@ -552,12 +555,14 @@ static void swap_pre(uint32_t slot)
     else if (changed == 1)
         fprintf(stderr, "[dt] game floor %.6f -> %.6f, using %.6f, slot game 0x%08X swap 0x%08X\n",
                 dt_f32(prev_game), game, use, slot_game, MEM32(slot));
-    if (mode == DT_AUTO && allow != last_allow) {
-        if (!allow)
+    /* Cutscene lines follow the cutscene only. Heat is logged by the power
+     * module. */
+    if (mode == DT_AUTO && cut != last_cut) {
+        if (cut)
             fprintf(stderr, "[dt] cutscene (game floor %.6f): 30 fps\n", game);
         else
-            fprintf(stderr, "[dt] cutscene over: 60 fps\n");
-        last_allow = allow;
+            fprintf(stderr, "[dt] cutscene over: %s\n", hot ? "still 30 fps (hot)" : "60 fps");
+        last_cut = cut;
     }
 
     if (logon) {

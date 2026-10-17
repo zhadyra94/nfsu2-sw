@@ -23,6 +23,7 @@
 #include "apu.h"
 #include "apu_xaudio2.h"
 #include "fpconv.h"
+#include "platform/cpu_report.h"
 
 /* ============================================================
  * Globals
@@ -546,6 +547,7 @@ static void se_frame(MCPXAPUState *d)
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+    xbox_thread_name("apu");
     /* Audio misses are audible, a late game frame is not: stay ahead of the
      * game's busy threads for the few microseconds a block takes. */
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);

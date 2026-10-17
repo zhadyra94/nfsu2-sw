@@ -41,6 +41,7 @@
 #include "../nv2a_gl/gl_psh.h"
 #include "../nv2a_gl/gl_vsh.h"
 #include "../kernel/nv2a_backend.h"
+#include "../platform/cpu_report.h"
 
 #if defined(__SWITCH__)
 #include <switch.h>
@@ -145,6 +146,16 @@ void nv2a_vk_set_window(void *win)
     s_window_required = 1;      /* main.c decided the window question already */
     if (s_win)
         s_headless = 0;
+}
+
+/* iOS: called on the creating thread right after SDL_Vulkan_CreateSurface and
+ * before create_swapchain. main.c uses it to shrink the CAMetalLayer drawable
+ * (the surface's currentExtent follows the layer), see ios_launcher.m. */
+static void (*s_surface_hook)(void *win);
+
+void nv2a_vk_set_surface_hook(void (*fn)(void *win))
+{
+    s_surface_hook = fn;
 }
 #endif
 
@@ -1839,6 +1850,14 @@ static void *compile_thread(void *arg)
     return NULL;
 }
 
+/* The pthread entry only: the fallback calls compile_thread() on the caller's
+ * own thread, which must keep its name. */
+static void *compile_thread_named(void *arg)
+{
+    xbox_thread_name("glslang");
+    return compile_thread(arg);
+}
+
 /* ── Caches across runs ───────────────────────────────────────────
  *
  * A program compiled at first use stalled a race start for ~1 s (glslang,
@@ -1982,7 +2001,7 @@ static VkShaderModule compile(glslang_stage_t stage, const char *src)
        (unsigned)strlen(src));
     pthread_attr_init(&at);
     pthread_attr_setstacksize(&at, 4u << 20);
-    if (pthread_create(&t, &at, compile_thread, &j) == 0)
+    if (pthread_create(&t, &at, compile_thread_named, &j) == 0)
         pthread_join(t, NULL);
     else
         compile_thread(&j);
@@ -3287,6 +3306,8 @@ static int ready_impl(void)
         LOGE("SDL_Vulkan_CreateSurface: %s\n", SDL_GetError());
         s_headless = 1;
     }
+    if (!s_headless && s_surface_hook)
+        s_surface_hook(s_win);
 #endif
 
     qci.queueFamilyIndex = s_qfam;

@@ -8,6 +8,7 @@
  */
 #include "ohci.h"
 #include "../platform/mmio_decode.h"
+#include "../platform/cpu_report.h"
 #include "../kernel/xbox_memory_layout.h"
 #include "../kernel/kernel.h"
 #include "usb_gamepad.h"
@@ -1093,6 +1094,7 @@ static void ohci_plug(OhciController *hc, unsigned d, int on)
 
 static DWORD WINAPI ohci_thread(LPVOID unused)
 {
+    xbox_thread_name("ohci");
     /* This thread calls recompiled code, so it needs what any thread running
      * recompiled code needs: its own TIB. The guest register set is already
      * thread-local and the ISR gets a worker stack, but fs:[0] is the SEH

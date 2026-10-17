@@ -22,7 +22,9 @@
  */
 
 #import <UIKit/UIKit.h>
+#import <QuartzCore/QuartzCore.h>
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,6 +39,22 @@ extern const char *nfsu2_build_label(void);
 
 int ios_launcher_run(void);
 int ios_point_res_wanted(char *desc, size_t n);
+void ios_drawable_after_surface(void *sdl_window);
+
+/* SDL_syswm.h subset, the same one main.c uses (no SDL header in this file):
+ * SDL_GetWindowWMInfo(SDL_Window*, SDL_SysWMinfo*) as in SDL 2.30.x. The
+ * version is three single bytes (SDL_VERSION(&info.version) = 2.30.9), then an
+ * int subsystem, then the union; the UIKit member starts with the UIWindow. */
+struct ios_syswm_info {
+    uint8_t version_major, version_minor, version_patch;
+    int subsystem;
+    union {
+        struct { void *window; uint32_t framebuffer, colorbuffer, resolveframebuffer; } uikit;
+        uint8_t dummy[64];
+    } info;
+};
+extern int SDL_GetWindowWMInfo(void *window, struct ios_syswm_info *info);
+#define IOS_SYSWM_UIKIT 5
 
 /* ── Settings table (a copy of the overlay panel's rows for these keys) ── */
 
@@ -562,6 +580,8 @@ int ios_launcher_run(void)
  * and every iPhone stay native). The long and short side are used, not
  * width and height: the bounds follow the interface orientation. desc gets
  * the text for the log line, e.g. "852x393 pt, x3". */
+static int s_point_res;             /* the decision, for ios_drawable_after_surface */
+
 int ios_point_res_wanted(char *desc, size_t n)
 {
     const char *v = nfsu2_cfg_get("NFSU2_POINT_RES");
@@ -579,6 +599,7 @@ int ios_point_res_wanted(char *desc, size_t n)
                    strcasecmp(v, "off") == 0))
         mode = 0;
     point = mode < 0 ? (lw >= 1280.0 && sh >= 720.0) : mode;
+    s_point_res = point;
     if (desc && n) {
         if (point)
             snprintf(desc, n, "%gx%g pt, x1; NFSU2_POINT_RES=%s", (double)lw, (double)sh,
@@ -588,4 +609,99 @@ int ios_point_res_wanted(char *desc, size_t n)
                      (double)scr.nativeScale, mode == 0 ? "; NFSU2_POINT_RES=0" : "");
     }
     return point;
+}
+
+/* ── Screen buffer at render size (v32) ── */
+
+/* First view in the tree (depth first) whose layer is a CAMetalLayer: SDL's
+ * SDL_uikitmetalview, added to the window by SDL_Vulkan_CreateSurface. */
+static UIView *ios_find_metal_view(UIView *v)
+{
+    if ([v.layer isKindOfClass:[CAMetalLayer class]])
+        return v;
+    for (UIView *sub in v.subviews) {
+        UIView *f = ios_find_metal_view(sub);
+        if (f)
+            return f;
+    }
+    return nil;
+}
+
+/* nv2a_vk surface hook: runs right after SDL_Vulkan_CreateSurface and before
+ * create_swapchain, on the thread that created the renderer (the main thread
+ * for the eager init). The swapchain size is MoltenVK's currentExtent = layer
+ * bounds * contentsScale, and SDL's metal view recomputes drawableSize from
+ * layer.contentsScale in layoutSubviews. So set the scale to s = render rows /
+ * picture rows in points and lay the view out again: the swapchain is about
+ * the render size (iPhone 15 Pro: 2556x1179 -> ~2080x960) and the compositor
+ * scales it. Picture aspect is unchanged and touch is in points.
+ * NFSU2_COMPACT_DRAWABLE: 1 (default) on, 0 native pixels. Nothing to do on
+ * the point-resolution path (already x1). */
+void ios_drawable_after_surface(void *sdl_window)
+{
+    if (![NSThread isMainThread]) {
+        fprintf(stderr, "nfsu2: drawable scale skipped (not on the main thread)\n");
+        return;
+    }
+    const char *v = nfsu2_cfg_get("NFSU2_COMPACT_DRAWABLE");
+    if (v && (*v == '0' || *v == 'n' || *v == 'N' || *v == 'f' || *v == 'F' ||
+              strcasecmp(v, "off") == 0)) {
+        fprintf(stderr, "nfsu2: drawable at native pixels (NFSU2_COMPACT_DRAWABLE=0)\n");
+        return;
+    }
+    if (s_point_res)
+        return;
+
+    const char *gs = getenv("RECOMP_GL_SCALE");
+    double gscale = gs ? strtod(gs, NULL) : 0.0;
+    if (!(gscale > 0.0))
+        gscale = 2.0;
+    int rows = (int)(480.0 * gscale + 0.5);
+    const char *ws = getenv("RECOMP_WIDESCREEN");
+    double aspect = (ws && ws[0] == '0') ? 4.0 / 3.0 : 16.0 / 9.0;
+
+    struct ios_syswm_info info;
+    memset(&info, 0, sizeof info);
+    info.version_major = 2; info.version_minor = 30; info.version_patch = 9;   /* SDL_VERSION */
+    if (!sdl_window || !SDL_GetWindowWMInfo(sdl_window, &info) ||
+        info.subsystem != IOS_SYSWM_UIKIT || !info.info.uikit.window) {
+        fprintf(stderr, "nfsu2: drawable scale skipped (no UIKit window)\n");
+        return;
+    }
+    UIView *mv = ios_find_metal_view((__bridge UIWindow *)info.info.uikit.window);
+    if (!mv) {
+        fprintf(stderr, "nfsu2: drawable scale skipped (no Metal view)\n");
+        return;
+    }
+    CGSize bs = mv.bounds.size;
+    double lw = bs.width > bs.height ? bs.width : bs.height;
+    double sh = bs.width > bs.height ? bs.height : bs.width;
+    UIScreen *scr = mv.window.screen;
+    if (!scr || scr.nativeScale < 1.0)
+        scr = [UIScreen mainScreen];
+    double native = scr.nativeScale;
+    if (!(lw > 0.0) || !(sh > 0.0) || !(native >= 1.0)) {
+        fprintf(stderr, "nfsu2: drawable scale skipped (view %gx%g pt, native x%g)\n",
+                lw, sh, native);
+        return;
+    }
+    double ph = lw / aspect < sh ? lw / aspect : sh;      /* picture height in points */
+    double sc = (double)rows / ph;
+    if (sc < 1.0)
+        sc = 1.0;
+    if (sc > native)
+        sc = native;
+    if (sc >= native - 0.05) {
+        fprintf(stderr, "nfsu2: drawable stays native (render %d rows, picture %.0f pt high, native x%g)\n",
+                rows, ph, native);
+        return;
+    }
+    mv.contentScaleFactor = (CGFloat)sc;
+    mv.layer.contentsScale = (CGFloat)sc;
+    [mv setNeedsLayout];
+    [mv layoutIfNeeded];
+    CGSize ds = ((CAMetalLayer *)mv.layer).drawableSize;
+    fprintf(stderr, "nfsu2: drawable at render size: scale %.2f (render %d rows, picture %.0f pt high, "
+            "native x%g) -> %.0fx%.0f (NFSU2_COMPACT_DRAWABLE=0 for native)\n",
+            sc, rows, ph, native, (double)ds.width, (double)ds.height);
 }

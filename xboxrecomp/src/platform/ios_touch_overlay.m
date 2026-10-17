@@ -27,6 +27,7 @@
 #include <string.h>
 #include <strings.h>
 #include <stdlib.h>
+#include "cpu_report.h"
 
 /* Mirror the XBOX_IOS_TOUCH_ZONE layout (xinput_ios.h) instead of including
  * it: that header pulls the Win32 vocabulary, and its `typedef int BOOL`
@@ -2303,6 +2304,9 @@ static const PanelItem s_items[] = {
       .on = "1", .off = "0", .def_on = 1 },
     { .kind = IK_SWITCH, .title = "60 fps races",
       .key = "RECOMP_PRESENT_INTERVAL", .on = "1", .off = "0", .def_on = 1 },
+    /* Hot or Low Power Mode: the 60 fps races run at 30 (cpu_report.c). */
+    { .kind = IK_SEG, .title = "30 fps when hot", .key = "NFSU2_HOT_30",
+      .labels = "Off|Low Power|Hot|Warm", .values = "off|lpm|serious|fair", .def_val = "serious" },
     { .kind = IK_SLIDER, .title = "Brightness", .key = "NFSU2_GAMMA",
       .lo = 0.5f, .hi = 2.0f, .def = 1.0f, .decimals = 2 },
     { .kind = IK_SWITCH, .title = "Car reflections", .key = "RECOMP_VK_CUBE",
@@ -2319,6 +2323,10 @@ static const PanelItem s_items[] = {
      * bigger (13" Pro/Air), native pixels elsewhere. */
     { .kind = IK_SEG, .title = "Point resolution (big iPads)", .key = "NFSU2_POINT_RES",
       .labels = "Auto|On|Off", .values = "auto|1|0", .def_val = "auto" },
+    /* ios_launcher.m ios_drawable_after_surface: the Metal layer's scale is set
+     * so the swapchain is about the render size and the system scales it. */
+    { .kind = IK_SWITCH, .title = "Screen buffer at render size", .key = "NFSU2_COMPACT_DRAWABLE",
+      .on = "1", .off = "0", .def_on = 1 },
     /* ios_launcher.m: the screen before boot (main.c reads the key). Off by
      * default since v29; shown anyway when no game data is found. */
     { .kind = IK_SWITCH, .title = "Launch screen at start",
@@ -2333,6 +2341,10 @@ static const PanelItem s_items[] = {
       .on = "", .off = "playback", .def_on = 1 },
 
     { .kind = IK_HEAD, .title = "Advanced — applies on next launch" },
+    /* xbox_memory_layout.c xbox_qos_class: auto = user interactive at 60 fps
+     * (RECOMP_PRESENT_INTERVAL=1), user initiated at 30 fps. */
+    { .kind = IK_SEG, .title = "Top thread priority", .key = "RECOMP_QOS",
+      .labels = "60 fps only|Always|Off", .values = "auto|1|0", .def_val = "auto" },
     { .kind = IK_SWITCH, .title = "Async GPU submits",
       .key = "MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS",
       .on = "0", .off = "1", .def_on = 1 },
@@ -2735,6 +2747,26 @@ static void panel_hide(void)
  * through a small helper object. */
 static void auto_layout_poll(void);
 
+/* Device state for the "[cpu]" log line (cpu_report.c): thermal state, Low
+ * Power Mode and battery percent (-1 while the battery level is unknown).
+ * Main thread. fpsTick calls it every 0.5 s; without the overlay a 2 s timer
+ * does (ios_power_timer_start). */
+static void power_sample(void)
+{
+    static BOOL s_battery_on;
+    UIDevice *dev = [UIDevice currentDevice];
+    NSProcessInfo *pi = [NSProcessInfo processInfo];
+    float bl;
+
+    if (!s_battery_on) {
+        dev.batteryMonitoringEnabled = YES;
+        s_battery_on = YES;
+    }
+    bl = dev.batteryLevel;
+    xbox_power_update((int)pi.thermalState, pi.lowPowerModeEnabled ? 1 : 0,
+                      bl < 0.0f ? -1 : (int)(bl * 100.0f + 0.5f));
+}
+
 @interface Nfsu2GearTarget : NSObject
 - (void)fpsTick;
 @end
@@ -2850,6 +2882,7 @@ static void auto_layout_poll(void);
     NSProcessInfo *pi = [NSProcessInfo processInfo];
     NSInteger ts = (NSInteger)pi.thermalState;
     NSInteger lpm = pi.lowPowerModeEnabled ? 1 : 0;
+    power_sample();
     if (ts != s_last_thermal) {
         s_last_thermal = ts;
         fprintf(stderr, "nfsu2: thermal state %ld\n", (long)ts);
@@ -3192,4 +3225,32 @@ void ios_touch_overlay_set_visible(int v)
         if (s_ov)
             [s_ov applyVisibility:v ? YES : NO];
     });
+}
+
+/* For the paths that skip ios_touch_overlay_install (NFSU2_OVERLAY=0, no
+ * UIKit window): the power fields of the "[cpu]" line still need a sampler.
+ * Called from main.c on the main thread. */
+@interface Nfsu2PowerTarget : NSObject
+- (void)powerTick;
+@end
+@implementation Nfsu2PowerTarget
+- (void)powerTick
+{
+    power_sample();
+}
+@end
+
+void ios_power_timer_start(void)
+{
+    static Nfsu2PowerTarget *s_power_target;
+
+    if (s_power_target)
+        return;
+    s_power_target = [[Nfsu2PowerTarget alloc] init];
+    power_sample();
+    [NSTimer scheduledTimerWithTimeInterval:2.0
+                                     target:s_power_target
+                                   selector:@selector(powerTick)
+                                   userInfo:nil
+                                    repeats:YES];
 }

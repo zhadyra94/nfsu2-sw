@@ -515,7 +515,7 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   of the wake slowed the game (every kickoff waited) — don't go back to that.
 - **D3D fence wait sleeps (v31, `RECOMP_FENCE_SLEEP=0` = old spin).** The
   poll at 0x2E9057 (NFSU1 0x1D0470) used to spin; its yield now sleeps on a
-  condvar (<= 1 ms) while this thread's wrapped BlockOnTime is short of its
+  condvar (<= 4 ms since v32, `RECOMP_FENCE_SLEEP_US`) while this thread's wrapped BlockOnTime is short of its
   fence, and `nv2a_pb_exec.c` broadcasts after the 0x1D70 semaphore store
   (`recomp_fence_*` in kernel_bridge.c; waiters counted, no lock otherwise).
   Linux/lavapipe: the spin only exists while the game boots (first 14 s,
@@ -538,6 +538,37 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   the other; "outstanding 4"). Cause undetermined: a title lock order or a
   release this runtime dropped (see `crt_lock_trace` in kernel_rtl.c); next
   step `RECOMP_CS_TRACE_CRT=1` on a hung run.
+- **Fewer wakeups (v32).** At 30 fps the threads wait most of the time, but
+  timers woke the CPU thousands of times a second. Changes, each with a kill
+  switch (old behaviour in brackets):
+  - Guest lock: 16 condition variables by ticket; the unlock wakes only the
+    next ticket. The first wait is 1 ms (it raises `g_gil_contended`), later
+    waits 20 ms (safety net); eager mode keeps 1 ms
+    [`RECOMP_GIL_WAKE_ALL=1`]. The rule for the contended flag is unchanged.
+  - KeTickCount: `xbox_tick_refresh()` stores the clock forward only (CAS).
+    Callers: `gil_lock` after the lock is taken, the executor, and the tick
+    thread, which now sleeps 4 ms [`RECOMP_TICK_MS=1`; 1 ms when
+    `RECOMP_GIL=0`].
+  - Fence sleep timeout 4 ms [`RECOMP_FENCE_SLEEP_US=1000`].
+  - nv2a flag thread wait: the parameter exists, but the default stays 1 ms
+    [`RECOMP_FLAG_WAIT_US=4000` tries 4 ms]. Proof failed: with 4 ms, 70-550
+    timed-out passes per 10 s cleared a bit (all `PCRTC_INTR_0`, which the
+    vblank handler acks itself). Counter line with `RECOMP_FPS_LOG=1`:
+    `[nv2a] flag thread: N passes, M timed out, K of them cleared a bit`.
+  Linux A/B, voluntary switches/s: race 21.7k -> 17.8k (fps equal, 15-17
+  drifts between runs); intro movies 34.8k -> 23.5k, intro fps 15-19 ->
+  24-26 (from the guest-lock change: `RECOMP_GIL_WAKE_ALL=1` gives the old
+  numbers). APU stale ring samples 18-25% -> 4-11% (`RECOMP_APU_RING_STATS=1`).
+  Boot hang rate unchanged (1/26 old, 2/35 new). Device-unverified.
+- **`[cpu]` line and thread names (v32).** `xboxrecomp/src/platform/cpu_report.c`.
+  Every host thread has a name (`game`, `nv2a-exec`, `nv2a-flag`, `tick`,
+  `ktimer`, `ohci`, `apu`, `g:<start VA>` for guest threads, ...). The
+  reporter prints every `RECOMP_CPU_LOG` s (iOS default 10, elsewhere 0):
+  CPU % of the top 8 threads, others, wakeups/s, thermal state, Low Power
+  Mode, battery (iOS: sampled by the overlay, or by `ios_power_timer_start`
+  without it). It starts in `game_main` after the memory layout: from
+  `main()` the contiguous guest window failed to map. On Linux, lavapipe
+  threads fill the top 8: use a per-thread /proc sampler for analysis.
 - `tools/recomp/spin_hint.py` marks the title's poll loops (45 in NFSU2: D3D
   fence 0x2E9057, PGRAPH polls, DirectSound's APU-clock polls on 0xFE820010)
   with `RECOMP_SPIN_HINT()`: pause, wake hardware threads every 16, yield
@@ -925,7 +956,12 @@ only, never files): `../IOS_IMPROVEMENT_MAP.md`.
 - **Threads:** main thread = SDL/UIKit loop (main.c iOS `main`), eager
   renderer init on it (surface/swapchain need UIKit), game on a 16 MB
   pthread, Vulkan only from the executor (`vk_flip`, `flush_frame_wait`).
-  QoS USER_INTERACTIVE on game + ack threads (`RECOMP_QOS=0` off).
+  QoS (`xbox_qos_apply`, xbox_memory_layout.c) on game + ack threads:
+  `RECOMP_QOS=auto` (v32 default) = USER_INTERACTIVE at
+  `RECOMP_PRESENT_INTERVAL=1`, USER_INITIATED at 30 fps; `1` = always
+  interactive; `0` = off. Panel row "Top thread priority". Before v32 the
+  executor's QoS code never compiled on iOS (it tested `NFSU2_IOS`, which
+  that file does not get); it now tests clang's iOS predefine.
 - **Settings:** `Documents/nfsu2_env.txt` (or `$NFSU2_GAME_DIR`), loaded by
   `cfg_load` BEFORE `SDL_CreateWindow`, every key exported once with
   `setenv(k, v, 0)`. `s_cfg` key buffer is 64 bytes
@@ -1082,6 +1118,28 @@ only, never files): `../IOS_IMPROVEMENT_MAP.md`.
   resolution (1376x1032 pt, x1; NFSU2_POINT_RES=auto)`; the device check is
   `[VK] swapchain 1376x1032`. Idea from nfsmw-ios (GPLv3), no code taken.
   Device-unverified.
+- **Screen buffer at render size (v32, iOS):** The swapchain was the native
+  screen size (iPhone 15 Pro 2556x1179, x3). Each flip cleared all of it and
+  blitted the 1280x960 render into it. Now `main.c` sets a surface hook
+  (`nv2a_vk_set_surface_hook`). `nv2a_vk.c` calls it right after
+  `SDL_Vulkan_CreateSurface` and before `create_swapchain`.
+  `ios_drawable_after_surface` (ios_launcher.m) runs on the main thread only.
+  It finds SDL's CAMetalLayer view (`SDL_GetWindowWMInfo`, then a walk of the
+  window's views). It sets `contentScaleFactor` and `layer.contentsScale` to
+  s = render rows / picture rows in points, then calls `setNeedsLayout` and
+  `layoutIfNeeded`. Render rows = 480 * `RECOMP_GL_SCALE`. Picture height =
+  min(short side, long side / aspect), with aspect 16:9 (4:3 if
+  `RECOMP_WIDESCREEN=0`). s is clamped to 1 .. `nativeScale`. SDL's
+  `layoutSubviews` computes `drawableSize` from `layer.contentsScale`, and
+  MoltenVK `currentExtent` follows. Expected: 2556x1179 -> about 2081x960
+  (2.0 MP instead of 3.0 MP). The compositor scales it to the screen. Touch is
+  in points: unaffected. The point-resolution path (big iPads) is left alone.
+  `NFSU2_COMPACT_DRAWABLE=1|0` (default 1; panel row "Screen buffer at render
+  size" in Display, next launch). Log `nfsu2: drawable at render size: scale
+  2.44 (render 960 rows, ...) -> ~2081x960`; the device check is
+  `[VK] swapchain ~2081x960` (2081 or 2082). If UIKit resets the scale on a rotation, the
+  rebuilt swapchain is native again (the `[VK] swapchain WxH` line shows it).
+  Device-unverified.
 - **Layout geometry order** (`zones_rebuild_locked`): preset -> editor
   override -> Size -> aspect shape (round zones keep their phone shape in
   points when the window aspect is >10% off 852/393; `NFSU2_TOUCH_ROUND=0`)
@@ -1117,6 +1175,20 @@ only, never files): `../IOS_IMPROVEMENT_MAP.md`.
   and launch-screen row is "60 fps races" (no "experimental") with
   `def_on = 1`, so it shows ON when the key is absent. Cutscenes stay at 30
   fps (v26 `RECOMP_DT_FLOOR=auto`). Device-unverified.
+- **30 fps when hot (v32, iOS):** `xbox_power_hot_cap()` (cpu_report.c) is
+  called once per swap from `swap_pre`; 1 means "run the 60 fps races at 30".
+  `allow = !cutscene && !hot`, so a hot phone gets the game's own interval
+  (unforce) as in a cutscene. Key `NFSU2_HOT_30` (panel row "30 fps when hot",
+  Display section): `off`, `lpm` (Low Power Mode), `serious` (default: thermal
+  serious or critical, or Low Power Mode), `fair`. It engages at once and
+  releases after `RECOMP_HOT_HOLD_S` (default 60) seconds without the
+  condition. Unknown values (-1) count as not hot. Log lines:
+  `[power] 30 fps when hot: serious (NFSU2_HOT_30)`, `[power] hot (thermal
+  serious): 60 fps races -> 30 fps (NFSU2_HOT_30=serious)`, `[power] cool for
+  60 s (...): back to 60 fps`. The cutscene `[dt]` lines stay for cutscenes
+  only. Linux test source: `RECOMP_THERMAL_TEST="2@40,0@70"` (thermal value @
+  seconds since the first `xbox_power_thermal()` call; overlay updates are
+  ignored while it is set). NFSU1 has the same policy. Device-unverified.
 - **Log noise (v27):** iOS default `MVK_CONFIG_LOG_LEVEL=1` (errors only),
   set before `SDL_CreateWindow` next to the other MVK default; level 2 printed
   `[mvk-warn] ... Metal does not support disabling primitive restart` for every

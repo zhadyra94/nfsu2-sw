@@ -29,6 +29,7 @@
 #include "xbox_memory_layout.h"
 #include "guest_vmem.h"
 #include "recomp_icall_feedback.h"
+#include "platform/cpu_report.h"
 #include <stdio.h>
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
  * makes malloc return `int`, so bridge_spawn_thread truncated its heap pointer
@@ -299,7 +300,7 @@ static void kernel_data_init(void)
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_FILE_OBJ_TYPE)      = XBOX_KERNEL_DATA_BASE + KDATA_FILE_OBJ_TYPE;
 
     /* KeTimeIncrement (ordinal 157) - 100ns units per clock tick. 0x2710 is
-     * 1 ms, which is what KeTickCount above is updated at. A title dividing by
+     * 1 ms, the unit of KeTickCount above. A title dividing by
      * this to convert ticks to time gets a division by zero if it is left 0. */
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_TIME_INCREMENT) = 0x2710;
 
@@ -579,20 +580,46 @@ static uint32_t guest_thread_by_tid(DWORD tid)
  * per thread: t_gil_depth counts entries, and a kernel call parks the whole
  * count and restores it. */
 static CRITICAL_SECTION   s_gil_cs;
-static CONDITION_VARIABLE s_gil_cv;
 static volatile uint64_t  s_gil_next, s_gil_serving;
 static volatile int       s_gil_on = -1;
 static RECOMP_TLS int     t_gil_depth;
+
+/* Who wakes when the lock is handed over.
+ *
+ * One condition variable woke every waiter at every handover. Each compared
+ * its ticket with s_gil_serving and all but one went back to sleep: in the
+ * intro movies (9000 handovers a second between the game and the EA mixer)
+ * and with a dozen guest threads parked, that was thousands of wakeups a
+ * second that did no work. They keep the CPU out of deep idle, which is heat
+ * on a phone.
+ *
+ * Now a waiter with ticket `me` sleeps on s_gil_cvs[me & 15] and the unlock
+ * wakes only the one for the ticket now served. With more than 16 waiters
+ * a thread of ticket serving+16 may wake with it and sleep again. The order
+ * (FIFO) and every other rule stay as they were.
+ *
+ * RECOMP_GIL_WAKE_ALL=1 gives the old behaviour: one condition variable,
+ * woken for all, 1 ms timeouts. It is read once, with the lock's init, so
+ * waiters and unlock always agree. */
+#define GIL_CVS 16
+static CONDITION_VARIABLE s_gil_cvs[GIL_CVS];
+static int                s_gil_wake_all;
 
 static int gil_enabled(void)
 {
     if (s_gil_on < 0) {
         const char *e = getenv("RECOMP_GIL");
+        const char *wa = getenv("RECOMP_GIL_WAKE_ALL");
+        int k;
         InitializeCriticalSection(&s_gil_cs);
-        InitializeConditionVariable(&s_gil_cv);
+        for (k = 0; k < GIL_CVS; k++)
+            InitializeConditionVariable(&s_gil_cvs[k]);
+        s_gil_wake_all = wa && *wa == '1';
         s_gil_on = !(e && *e == '0');
         if (s_gil_on)
             fprintf(stderr, "  [THREAD] guest code serialised under one lock (RECOMP_GIL)\n");
+        if (s_gil_on && s_gil_wake_all)
+            fprintf(stderr, "  [THREAD] guest lock wakes every waiter (RECOMP_GIL_WAKE_ALL)\n");
     }
     return s_gil_on;
 }
@@ -664,6 +691,7 @@ static void gil_lock(void)
 {
     uint64_t me;
     int eager = gil_eager(), prio = eager ? gil_prio_now() : 0, counted = 0;
+    int timed_out = 0;
     EnterCriticalSection(&s_gil_cs);
     me = s_gil_next++;
     if (me != s_gil_serving && eager) {
@@ -678,9 +706,22 @@ static void gil_lock(void)
     if (me != s_gil_serving && xbox_thread_holds_dispatch()) {
         g_gil_contended = 1;
     }
-    while (me != s_gil_serving)
-        if (!SleepConditionVariableCS(&s_gil_cv, &s_gil_cs, 1))
+    /* The first wait is 1 ms: if the ticket is still not served then, the
+     * flag goes up (above). It stays up while this thread waits: a new
+     * holder clears it only when nobody is behind it, and this thread is.
+     * So in the default mode the later waits are a safety net of 20 ms, not
+     * a timer. In eager mode a new holder recomputes the flag, and lower
+     * waiters must raise it again: 1 ms every time. A wake meant for
+     * another ticket on the same condition variable does not count as the
+     * first timeout. */
+    while (me != s_gil_serving) {
+        DWORD ms = (timed_out && !eager && !s_gil_wake_all) ? 20 : 1;
+        if (!SleepConditionVariableCS(&s_gil_cvs[s_gil_wake_all ? 0 : (me & (GIL_CVS - 1))],
+                                      &s_gil_cs, ms)) {
             g_gil_contended = 1;           /* 1 ms and still waiting */
+            timed_out = 1;
+        }
+    }
     if (eager) {
         if (counted)
             s_gil_waiting[prio]--;
@@ -698,13 +739,18 @@ static void gil_lock(void)
         g_gil_contended = 0;               /* nobody behind us */
     }
     LeaveCriticalSection(&s_gil_cs);
+    /* Guest code reads KeTickCount from memory. The tick thread writes it
+     * only every few milliseconds (RECOMP_TICK_MS), so a thread that
+     * resumes -- after a kernel call, a yield, a DPC or an ISR -- stores a
+     * fresh value first: one clock read and one compare-and-swap. */
+    xbox_tick_refresh();
 }
 
 static void gil_unlock(void)
 {
     EnterCriticalSection(&s_gil_cs);
     s_gil_serving++;
-    WakeAllConditionVariable(&s_gil_cv);
+    WakeAllConditionVariable(&s_gil_cvs[s_gil_wake_all ? 0 : (s_gil_serving & (GIL_CVS - 1))]);
     LeaveCriticalSection(&s_gil_cs);
 }
 
@@ -761,7 +807,7 @@ static void gil_yield(void)
  *
  * The wrapper around the wait (recomp_manual.c) says which semaphore and
  * which fence this thread waits for. The poll loop's yield then sleeps on a
- * condition variable instead, for at most a millisecond, and the pushbuffer
+ * condition variable instead, for a few milliseconds at most, and the pushbuffer
  * executor broadcasts it as it writes the semaphore (recomp_fence_signal).
  * The wait is re-checked under the mutex after the waiter count went up, so
  * a release between the loop's last read and the sleep is not lost.
@@ -779,6 +825,12 @@ static void gil_yield(void)
  * (sub_002E8A50) on one path, not the argument; that is the argument's own
  * fence or a later one, and a later one only makes the test here false
  * earlier, which is the plain yield again.
+ *
+ * The millisecond became 4: the executor's signal ends the sleep at once, so
+ * the timeout only covers a wake that does not come. A device log (NFSU1,
+ * menus) showed 5929 of 6542 sleeps in 10 s ending on the timeout: the thread
+ * woke every millisecond of a 13 ms wait to sleep again.
+ * RECOMP_FENCE_SLEEP_US=<us> sets it (1000 = the old value).
  *
  * RECOMP_FENCE_SLEEP=0 gives the plain yield again. Windows keeps it. */
 #if !defined(_WIN32)
@@ -811,6 +863,20 @@ static int fence_sleep_on(void)
                            : "[D3D] fence wait: spin (RECOMP_FENCE_SLEEP=0)\n");
     }
     return on;
+}
+
+/* The safety timeout of one sleep, in microseconds; default 4000. Read once. */
+static long fence_sleep_us(void)
+{
+    static long us = -1;
+    if (us < 0) {
+        const char *e = getenv("RECOMP_FENCE_SLEEP_US");
+        long v = e ? atol(e) : 0;
+        us = v >= 100 && v <= 100000 ? v : 4000;
+        if (us != 4000)
+            fprintf(stderr, "[D3D] fence sleep timeout %ld us (RECOMP_FENCE_SLEEP_US)\n", us);
+    }
+    return us;
 }
 
 /* RECOMP_FPS_LOG=1: waits, wall time in them and sleeps, every 10 s. */
@@ -900,8 +966,8 @@ static void fence_sleep(int i)
     }
     d = xbox_gil_suspend();
     clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_nsec += 1000000L;
-    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+    ts.tv_nsec += fence_sleep_us() * 1000L;
+    while (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
     pthread_mutex_lock(&s_fence_lock);
     __atomic_add_fetch(&s_fence_waiters, 1, __ATOMIC_SEQ_CST);
     if (fence_behind(i))
@@ -979,6 +1045,7 @@ struct bridge_thread_start {
     recomp_func_t fn;
     uint32_t ctx1, ctx2, stack_top;
     uint32_t tib;          /* allocated at creation: it is also the KTHREAD */
+    uint32_t start_va;     /* the VA the thread is named by (bridge_thread_name_va) */
 };
 
 static void bridge_write_handle(uint32_t handle_va, HANDLE h);
@@ -1002,6 +1069,8 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     struct bridge_thread_start *s = (struct bridge_thread_start *)param;
     recomp_func_t fn = s->fn;
     uint32_t ctx1 = s->ctx1, ctx2 = s->ctx2;
+
+    xbox_thread_namef("g:%08X", (unsigned)s->start_va);
 
     /* Own register set (RECOMP_TLS), own simulated stack -- and own TIB.
      *
@@ -1081,9 +1150,19 @@ static void pending_start_flush(DWORD creator)
     ReleaseSRWLockExclusive(&g_pending_lock);
 }
 
+/* The VA a guest thread is named by in the host's thread list. XAPI starts
+ * every thread through one trampoline (start routine 0x0021C8E6) and passes
+ * the real routine as StartContext1: when that is code, name by it. */
+static uint32_t bridge_thread_name_va(uint32_t start_routine, uint32_t ctx1)
+{
+    if (ctx1 && (recomp_lookup(ctx1) || recomp_lookup_manual(ctx1)))
+        return ctx1;
+    return start_routine;
+}
+
 static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
                                   uint32_t ctx2, uint32_t stack_top,
-                                  int create_suspended)
+                                  int create_suspended, uint32_t start_va)
 {
     struct bridge_thread_start *s = malloc(sizeof(*s));
     HANDLE th;
@@ -1091,6 +1170,7 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
 
     if (!s) return NULL;
     s->fn = fn; s->ctx1 = ctx1; s->ctx2 = ctx2; s->stack_top = stack_top;
+    s->start_va = start_va;
     s->tib = xbox_AllocThreadTib();
 
     th = CreateThread(NULL, 0, bridge_thread_main, s, CREATE_SUSPENDED, NULL);
@@ -1240,7 +1320,9 @@ static void bridge_PsCreateSystemThreadEx(void)
                 } else {
                     HANDLE th = bridge_spawn_thread(fn, start_context1,
                                                     start_context2, stack_top,
-                                                    (uint8_t)STACK_ARG(7));
+                                                    (uint8_t)STACK_ARG(7),
+                                                    bridge_thread_name_va(start_routine,
+                                                                          start_context1));
                     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: spawned "
                             "worker 0x%08X (ctx=0x%08X, stack top 0x%08X)\n",
                             start_routine, start_context1, stack_top);
@@ -3370,6 +3452,7 @@ long long kernel_vblank_clock_us(void)
  * "30@30,60@60" switches the rate (Low Power Mode, 120 Hz): hz@seconds. */
 static DWORD WINAPI lk_test_thread(LPVOID unused)
 {
+    xbox_thread_name("lk-test");
     const char *g = getenv("RECOMP_VBLANK_LINK_TEST_GAP_AT");
     double gap_at = g && atof(g) > 0 ? atof(g) : 90.0;
     const char *gl = getenv("RECOMP_VBLANK_LINK_TEST_GAP_S");
@@ -3787,6 +3870,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
     int slot = xbox_worker_stack_alloc();
 
     (void)unused;
+    xbox_thread_name("ktimer");
     xbox_guest_pin(1);             /* DPCs and vblank: interrupt-like, guest core */
     if (slot < 0) {
         fprintf(stderr, "  [KERNEL] timer thread has no worker stack; "
@@ -9110,7 +9194,9 @@ static void bridge_PsCreateSystemThread(void)
                     bridge_run_thread_inline(fn, start_context1, start_context2);
                 } else {
                     HANDLE th = bridge_spawn_thread(fn, start_context1,
-                                                    start_context2, stack_top, 0);
+                                                    start_context2, stack_top, 0,
+                                                    bridge_thread_name_va(start_routine,
+                                                                          start_context1));
                     if (xbox_handle_ptr && th)
                         bridge_write_handle(xbox_handle_ptr, th);
                 }
