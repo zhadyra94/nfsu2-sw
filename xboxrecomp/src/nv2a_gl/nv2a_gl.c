@@ -38,6 +38,7 @@
 #include "gl_psh.h"
 #include "gl_vsh.h"
 #include "../kernel/nv2a_backend.h"
+#include "../platform/cpu_report.h"
 
 #include <SDL.h>
 #include <stdio.h>
@@ -2441,6 +2442,7 @@ static void *q_gl_thread(void *arg)
     extern void xbox_nx_spread_thread(void);
     extern void xbox_nx_track_thread(void *entry);
     (void)arg;
+    xbox_thread_name("gl-submit");
     xbox_nx_spread_thread();
     xbox_nx_track_thread((void *)q_gl_thread);
     for (;;) {

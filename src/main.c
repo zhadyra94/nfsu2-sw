@@ -31,6 +31,7 @@
 #include <signal.h>
 
 #include <xbox/xboxrecomp.h>
+#include "platform/cpu_report.h"
 
 #ifdef __SWITCH__
 /* libnx lives in switch_nx.c: <switch.h> and the Win32 vocabulary collide. */
@@ -530,7 +531,7 @@ static const char *const nfsu2_ios_alts[] = { "NFSU1-data", "game", "nfsu1", "NF
 /* Build label for the launch screen. */
 const char *nfsu2_build_label(void)
 {
-    return "u1-4 " __DATE__;
+    return "u1-5 " __DATE__;
 }
 
 /* Is the launch screen asked for? NFSU2_LAUNCHER, default OFF (v29): the game
@@ -813,6 +814,7 @@ void xbox_nx_track_thread(void *entry);   /* win32_compat.c: Switch [perf] repor
 
 static void *game_thread(void *arg)
 {
+    xbox_thread_name("game");
     xbox_nx_spread_thread();
     xbox_nx_track_thread(NULL);          /* "game:" in the [perf] report */
     *(int *)arg = game_main();
@@ -850,12 +852,12 @@ int main(int argc, char **argv)
  * services SDL events. */
 static void *ios_game_thread(void *arg)
 {
+    xbox_thread_name("game");
 #if defined(NFSU2_HAS_QOS)
-    const char *q = getenv("RECOMP_QOS");
-    if (!q || strcmp(q, "0") != 0) {     /* default on, RECOMP_QOS=0 off */
-        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-        fprintf(stderr, "[QOS] game thread -> user interactive\n");
-    }
+    /* xbox_memory_layout.c: RECOMP_QOS = auto | 1 | 0; the executor asks the
+     * same function, so both threads get the same class. */
+    extern void xbox_qos_apply(const char *who);
+    xbox_qos_apply("game thread");
 #endif
     *(int *)arg = game_main();
     return NULL;
@@ -869,6 +871,7 @@ static void *ios_diag_thread(void *arg)
     extern int nv2a_vk_diag(void);
     int i;
     (void)arg;
+    xbox_thread_name("diag");
     for (i = 0; i < 12; i++) {
         sleep(5);
         fprintf(stderr, "[DIAG] t=%ds renderer=0x%x (1 tried 2 ok 4 headless 8 dyn-vi)\n",
@@ -915,7 +918,8 @@ int main(int argc, char **argv)
     /* Redirect the log FIRST so main-thread init output is captured. */
     ios_log_to_documents();
     setvbuf(stderr, NULL, _IONBF, 0);
-    fprintf(stderr, "nfsu1: build u1-4 (u1-3 + EA Trax crash fixed, Auto Pad/Drive reads NFSU1, GPU wait sleeps)\n");
+    xbox_thread_name("main");
+    fprintf(stderr, "nfsu1: build u1-5 (u1-4 + less heat: fewer wakeups, screen buffer at render size, 30 fps when hot, [cpu] log)\n");
     fprintf(stderr, "nfsu2: HOME=%s TMPDIR=%s\n",
             getenv("CFFIXED_USER_HOME") ? getenv("CFFIXED_USER_HOME") : "(unset)",
             getenv("TMPDIR") ? getenv("TMPDIR") : "(unset)");
@@ -1019,6 +1023,8 @@ int main(int argc, char **argv)
     }
     {
         extern void nv2a_vk_set_window(void *win);
+        extern void nv2a_vk_set_surface_hook(void (*fn)(void *win));
+        extern void ios_drawable_after_surface(void *sdl_window);
         SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
         /* Defer all edge gestures: a steering thumb sliding off the bottom
          * edge must not leave the game. */
@@ -1040,6 +1046,10 @@ int main(int argc, char **argv)
                                      (point_res ? 0 : SDL_WINDOW_ALLOW_HIGHDPI));
         fprintf(stderr, "nfsu2: window=%p (%s)\n", win, win ? "ok" : SDL_GetError());
         nv2a_vk_set_window(win);
+        /* Screen buffer at render size (v32): after the Vulkan surface exists
+         * and before the swapchain, ios_launcher.m shrinks the Metal layer's
+         * drawable to about the render size. */
+        nv2a_vk_set_surface_hook(ios_drawable_after_surface);
         if (!win)
             fprintf(stderr, "nfsu2: FATAL no window; refusing off-main fallback\n");
         else {
@@ -1060,13 +1070,17 @@ int main(int argc, char **argv)
              * breaks launch. */
             const char *ov = getenv("NFSU2_OVERLAY");
             if (ov && ov[0] == '0') {
+                extern void ios_power_timer_start(void);   /* the overlay's fpsTick samples otherwise */
                 fprintf(stderr, "nfsu2: touch overlay off (NFSU2_OVERLAY=0)\n");
+                ios_power_timer_start();
             } else if (SDL_GetWindowWMInfo(win, &smi) && smi.subsystem == SDL_SYSWM_UIKIT) {
                 extern void ios_touch_overlay_install(void *uiwindow);
                 ios_touch_overlay_install(smi.info.uikit.window);
                 fprintf(stderr, "nfsu2: touch overlay installed\n");
             } else {
+                extern void ios_power_timer_start(void);
                 fprintf(stderr, "nfsu2: touch overlay unavailable (syswm=%u)\n", smi.subsystem);
+                ios_power_timer_start();
             }
         }
     }
@@ -1150,6 +1164,7 @@ int main(int argc, char **argv)
 static void *linux_game_thread(void *arg)
 {
     (void)arg;
+    xbox_thread_name("game");
     game_main();
     return NULL;
 }
@@ -1184,7 +1199,7 @@ static int game_main(void)
 #ifdef NFSU2_IOS
     ios_log_to_documents();
     setvbuf(stderr, NULL, _IONBF, 0);
-    fprintf(stderr, "nfsu1: build u1-4 (u1-3 + EA Trax crash fixed, Auto Pad/Drive reads NFSU1, GPU wait sleeps)\n");
+    fprintf(stderr, "nfsu1: build u1-5 (u1-4 + less heat: fewer wakeups, screen buffer at render size, 30 fps when hot, [cpu] log)\n");
     fprintf(stderr, "nfsu2: HOME=%s CFFIXED_USER_HOME=%s TMPDIR=%s\n",
             getenv("HOME") ? getenv("HOME") : "(unset)",
             getenv("CFFIXED_USER_HOME") ? getenv("CFFIXED_USER_HOME") : "(unset)",
@@ -1300,6 +1315,13 @@ static int game_main(void)
     g_xbox_mem_offset = xbox_GetMemoryOffset();
     printf("Xbox memory mapped at host offset 0x%llX\n",
            (unsigned long long)g_xbox_mem_offset);
+#ifndef __SWITCH__
+    /* Here and not in main(): started from main() it ran while the layout
+     * maps its fixed ranges, and the contiguous window failed to map (seen on
+     * Linux). This thread also owns the setenv()s, so the getenv() inside
+     * does not race. [cpu] line every RECOMP_CPU_LOG s (iOS: 10). */
+    cpu_report_start();
+#endif
 
     /* NFSU2 raised a sim-step cap in .data here (0x3A4C64); that address is
      * outside NFSU1's image, so NFSU1 has no such patch. */

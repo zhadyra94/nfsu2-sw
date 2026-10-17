@@ -216,6 +216,7 @@ extern NSString *const NSKernAttributeName;
 @property CGSize shadowOffset; @property CGPathRef shadowPath;
 - (void)addSublayer:(CALayer*)l; - (void)removeFromSuperlayer;
 @end
+@interface CAMetalLayer : CALayer @property CGSize drawableSize; @end
 @interface CAShapeLayer : CALayer
 @property CGPathRef path; @property CGColorRef fillColor, strokeColor; @property CGFloat lineWidth;
 @property (copy) NSString *lineCap, *lineJoin; @property (copy) NSArray *lineDashPattern;
@@ -253,7 +254,9 @@ double CACurrentMediaTime(void);
 @interface UIPinchGestureRecognizer : UIGestureRecognizer @property CGFloat scale; @end
 @interface UIDevice : NSObject
 + (UIDevice*)currentDevice; @property (readonly) NSInteger userInterfaceIdiom;
+@property (getter=isBatteryMonitoringEnabled) BOOL batteryMonitoringEnabled; @property (readonly) float batteryLevel;
 @end
+@class UIWindow, UIScreen;
 @interface UIView : NSObject
 - (id)initWithFrame:(CGRect)f;
 @property CGRect frame, bounds; @property (readonly) CALayer *layer; @property CGFloat alpha;
@@ -266,6 +269,7 @@ double CACurrentMediaTime(void);
 - (void)layoutSubviews; - (void)safeAreaInsetsDidChange; - (void)addSubview:(UIView*)v; - (void)removeFromSuperview;
 - (void)bringSubviewToFront:(UIView*)v; - (UIView*)viewWithTag:(NSInteger)t;
 - (CGSize)sizeThatFits:(CGSize)s;
+@property CGFloat contentScaleFactor; @property (readonly) UIWindow *window; - (void)setNeedsLayout; - (void)layoutIfNeeded;
 - (void)addGestureRecognizer:(UIGestureRecognizer*)g;
 @end
 @interface UILabel : UIView
@@ -301,6 +305,7 @@ double CACurrentMediaTime(void);
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations; - (BOOL)shouldAutorotate;
 @end
 @interface UIWindow : UIView
+@property (readonly) UIScreen *screen;
 @property (readonly) UIWindowScene *windowScene; @property CGFloat windowLevel;
 @property (nonatomic, strong) UIViewController *rootViewController;
 - (instancetype)initWithWindowScene:(UIWindowScene*)s; - (void)makeKeyAndVisible;

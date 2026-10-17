@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "platform/cpu_report.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -247,6 +248,8 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     HWND hwnd;
     HDC hdc;
     BITMAPINFO bi;
+
+    xbox_thread_name("fb");
     RECT r;
 
     (void)unused;

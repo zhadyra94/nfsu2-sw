@@ -91,6 +91,24 @@ time, with or without this change). `RECOMP_DT_CAP=8` (test only) raises it.
 Widescreen: the title never queries the video flags and renders 4:3, so
 `RECOMP_WIDESCREEN=1` only stretches the 4:3 picture to 16:9: leave it 0.
 
+Heat and Low Power Mode: the swap wrappers had only `force_interval`. They now
+also have `unforce_interval` (puts the game's value back when the slot still
+holds ours). `swap_pre` calls it instead of `force_interval` while
+`xbox_power_hot_cap()` is 1 (key `NFSU2_HOT_30`, default `serious`, hold
+`RECOMP_HOT_HOLD_S` = 60 s, see cpu_report.c), so the race runs at the game's
+30 fps. `sub_001410D0` needs no change: it pays back the floor excess only for
+frames shorter than 1/60 s, and at 30 fps there are none. Device-unverified.
+
+## Heat (u1-5)
+
+The shared runtime changes of NFSU2 v32 are in this tree too (see
+nfsu2-sw-v30/CLAUDE.md, "Fewer wakeups (v32)", "`[cpu]` line and thread
+names (v32)", "Screen buffer at render size (v32, iOS)" and the QoS note under
+Threads). Same keys and kill switches: `RECOMP_CPU_LOG`,
+`NFSU2_COMPACT_DRAWABLE`, `RECOMP_GIL_WAKE_ALL`, `RECOMP_TICK_MS`,
+`RECOMP_FENCE_SLEEP_US`, `RECOMP_FLAG_WAIT_US`, `RECOMP_QOS`, `NFSU2_HOT_30`.
+Linux: boots to the main menu with them; tick thread at 4 ms. Device-unverified.
+
 ## Yellow square after loading
 
 The title fills freed heap blocks with 0xEE (`sub_00124310`) while the

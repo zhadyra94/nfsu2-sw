@@ -9,7 +9,7 @@ src=$(readlink -f "$1")
 tmp=$(mktemp -d)
 sed -e 's/^#import </#include </' "$src" > "$tmp/x.m"
 clang-14 -fsyntax-only -fobjc-runtime=gnustep-2.0 -fobjc-arc -fblocks -Wall -Wextra \
-    -Wno-unused-parameter -I"$d" -include "$d/Mock.h" "$tmp/x.m" 2>&1 | head -"${2:-40}"
+    -Wno-unused-parameter -I"$d" -I"$(dirname "$src")" -include "$d/Mock.h" "$tmp/x.m" 2>&1 | head -"${2:-40}"
 rc=${PIPESTATUS[0]}
 rm -rf "$tmp"
 exit $rc

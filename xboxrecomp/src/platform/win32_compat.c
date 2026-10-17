@@ -16,6 +16,7 @@
 #define __STDC_WANT_LIB_EXT1__ 1
 
 #include "win32_compat.h"
+#include "cpu_report.h"
 
 #include <pthread.h>
 #include <stdlib.h>
@@ -1293,6 +1294,7 @@ static void *timer_thread(void *arg)
     w32_object *o = (w32_object *)arg;
     int once = (o->timer_period == 0);
 
+    xbox_thread_name("w32-timer");
     xbox_nx_spread_thread();
 
     /* initial due time */
@@ -1369,6 +1371,7 @@ struct w32_tp_args { PTP_SIMPLE_CALLBACK cb; PVOID ctx; };
 static void *w32_tp_trampoline(void *arg)
 {
     struct w32_tp_args *a = (struct w32_tp_args *)arg;
+    xbox_thread_name("w32-pool");
     xbox_nx_spread_thread();
     a->cb(NULL, a->ctx);
     free(a);

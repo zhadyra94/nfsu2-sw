@@ -221,6 +221,12 @@ void xbox_Nv2aVblankDrop(void);
 /* Called by a project's wrapper around the title's vblank handler. */
 void xbox_Nv2aVblankTaken(void);
 
+/* Store the host clock into KeTickCount (kernel data page), forward only.
+ * Several threads call it (the tick thread, the executor, every guest thread
+ * that takes the guest lock): the slot never moves back. Does nothing until
+ * the guest memory is mapped. */
+void xbox_tick_refresh(void);
+
 /* Route guest addresses [lo, hi) to a device model for code lifted with
  * tools.recomp --mmio-sections (its MMIO_RD/MMIO_WR accessors call
  * xbox_mmio_read/xbox_mmio_write). `offset` is relative to lo. Returns 0, or

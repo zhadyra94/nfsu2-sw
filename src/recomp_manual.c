@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <time.h>
+#include "platform/cpu_report.h"
 
 /* The generated register model (g_eax/g_esp are thread-local there) and the
  * XBOX_PTR/MEM32 accessors; the register names below are its macros. */
@@ -405,6 +406,16 @@ static void force_interval(uint32_t slot)
     }
 }
 
+/* Undo force_interval where the game still holds what we wrote. A value the
+ * game rewrote itself is left alone. */
+static void unforce_interval(uint32_t slot)
+{
+    if (s_forced && MEM32(slot) == s_forced_to) {
+        MEM32(slot) = s_forced_from;
+        s_forced = 0;
+    }
+}
+
 /* RECOMP_DT_FLOOR, only with RECOMP_PRESENT_INTERVAL=1:
  *   auto  (default) hand the floor's excess back, see dt_step_wrap
  *   game  leave the game's step alone (kill switch, the v24-like behaviour)
@@ -509,7 +520,11 @@ static void swap_pre(uint32_t slot)
             last_slot = cur;
         }
     }
-    force_interval(slot);
+    /* Hot or in Low Power Mode: leave the game's own interval (30 fps). */
+    if (xbox_power_hot_cap())
+        unforce_interval(slot);
+    else
+        force_interval(slot);
 
     /* Test knob, not a feature: the step clamps dt at cap/60 s, cap =
      * float[0x25314C] = 3.0 (read only by sub_001410D0). Below 20 fps the

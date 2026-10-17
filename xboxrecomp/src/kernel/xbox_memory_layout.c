@@ -14,6 +14,7 @@
 
 #include "xbox_memory_layout.h"
 #include "kernel.h"
+#include "platform/cpu_report.h"
 #include <stdio.h>
 #if !defined(_WIN32)
 #include <sched.h>
@@ -46,6 +47,7 @@
 static void *g_memory_base = NULL;
 static size_t g_memory_size = 0;
 static ptrdiff_t g_memory_offset = 0;  /* actual_base - XBOX_BASE_ADDRESS */
+static volatile int s_tick_ready;      /* g_memory_offset is set: KeTickCount can be stored */
 
 /* Actual mapped RAM for this run; see the header. Default retail 64 MB. */
 size_t g_xbox_total_ram = XBOX_TOTAL_RAM;
@@ -1071,10 +1073,13 @@ static int vblank_held(void)
     return 1;
 }
 
-static void nv2a_ack_flags(volatile uint32_t *regs)
+/* Returns how many registers it stored to (the flag thread counts the passes
+ * that cleared a bit, see nv2a_flag_thread). */
+static int nv2a_ack_flags(volatile uint32_t *regs)
 {
     int held = InterlockedCompareExchange(&g_nv2a_intr_hold, 0, 0) != 0;
     int vblank = vblank_held();
+    int stores = 0;
 
     for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
         volatile uint32_t *r =
@@ -1096,6 +1101,7 @@ static void nv2a_ack_flags(volatile uint32_t *regs)
             mask &= ~0x00000001u;
         if (*r & mask) {
             *r &= ~mask;
+            stores++;
         }
     }
     for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
@@ -1103,8 +1109,10 @@ static void nv2a_ack_flags(volatile uint32_t *regs)
             (volatile uint32_t *)((char *)regs + NV2A_IDLE[i].offset);
         if ((*r & NV2A_IDLE[i].idle_mask) != NV2A_IDLE[i].idle_mask) {
             *r |= NV2A_IDLE[i].idle_mask;
+            stores++;
         }
     }
+    return stores;
 }
 
 /* Busy/idle flags, on a thread of their own.
@@ -1176,10 +1184,13 @@ void recomp_spin_wake(void)
 }
 #endif
 
-static void nv2a_thread_pause(int busy)
+/* `us` is the longest sleep. Returns 1 if the sleep ended on that timeout,
+ * 0 if it was woken (recomp_spin_wake) or only yielded. */
+static int nv2a_thread_pause(int busy, long us)
 {
+    int timed_out = 0;
 #if defined(_WIN32)
-    (void)busy;
+    (void)busy; (void)us;
     Sleep(0);
 #else
     if (busy) {
@@ -1188,42 +1199,136 @@ static void nv2a_thread_pause(int busy)
         struct timespec ts;
         unsigned seen;
         clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_nsec += 1000000L;
-        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        ts.tv_nsec += us * 1000L;
+        while (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
         pthread_mutex_lock(&s_hw_lock);
         seen = s_hw_wakes;
         __atomic_add_fetch(&s_hw_sleepers, 1, __ATOMIC_RELAXED);
         while (seen == s_hw_wakes)
-            if (pthread_cond_timedwait(&s_hw_cond, &s_hw_lock, &ts) != 0)
+            if (pthread_cond_timedwait(&s_hw_cond, &s_hw_lock, &ts) != 0) {
+                timed_out = 1;
                 break;
+            }
         __atomic_sub_fetch(&s_hw_sleepers, 1, __ATOMIC_RELAXED);
         pthread_mutex_unlock(&s_hw_lock);
     }
 #endif
+    return timed_out;
+}
+
+/* How long the flag thread sleeps when nothing wakes it, in microseconds.
+ *
+ * The executor's 1 ms is the doorbell for new pushbuffer data. The flag
+ * thread's is only the fallback for a guest loop that waits on a busy bit
+ * without RECOMP_SPIN_HINT: the hinted loops wake it at once. 4 ms would cut
+ * its 1400 wakeups a second to 250. It stays 1 ms: the counter in the flag
+ * thread (RECOMP_FPS_LOG=1) counts the passes that ended on the timeout and
+ * then cleared a bit, and that was 80 to 120 per 10 s in the movies and the
+ * menus and 550 in a race, not a few. All of them were PCRTC_INTR_0, the
+ * vblank status bit (measured), which the vblank handler already
+ * acknowledges itself (xbox_Nv2aVblankTaken), so it may be harmless. It is
+ * not proven. RECOMP_FLAG_WAIT_US=4000 tries 4 ms again; any value from 100
+ * to 100000 is taken. Read once. */
+#define FLAG_WAIT_US_DEFAULT 1000
+static long flag_wait_us(void)
+{
+    static long us = -1;
+    if (us < 0) {
+        const char *e = getenv("RECOMP_FLAG_WAIT_US");
+        long v = e ? atol(e) : 0;
+        us = v >= 100 && v <= 100000 ? v : FLAG_WAIT_US_DEFAULT;
+        if (us != FLAG_WAIT_US_DEFAULT)
+            fprintf(stderr, "[nv2a] flag thread waits %ld us (RECOMP_FLAG_WAIT_US)\n", us);
+    }
+    return us;
 }
 
 static DWORD WINAPI nv2a_flag_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
+    const char *fl = getenv("RECOMP_FPS_LOG");
+    int log = fl && *fl == '1';
+    long wait_us = flag_wait_us();
+    /* RECOMP_FPS_LOG=1: passes, passes that ended on the timeout (M), and
+     * those after which the next ack pass cleared a bit (K), every 10 s. */
+    unsigned passes = 0, timeouts = 0, cleared = 0;
+    int after_timeout = 0;
+    DWORD last_ms = GetTickCount();
+    xbox_thread_name("nv2a-flag");
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
-        nv2a_ack_flags(regs);
-        nv2a_thread_pause(0);
+        int stores = nv2a_ack_flags(regs);
+        passes++;
+        if (after_timeout && stores)
+            cleared++;
+        after_timeout = nv2a_thread_pause(0, wait_us);
+        timeouts += after_timeout;
+        if (log) {
+            DWORD now_ms = GetTickCount();
+            if (now_ms - last_ms >= 10000) {
+                fprintf(stderr, "[nv2a] flag thread: %u passes, %u timed out, "
+                                "%u of them cleared a bit\n", passes, timeouts, cleared);
+                passes = timeouts = cleared = 0;
+                last_ms = now_ms;
+            }
+        }
     }
     return 0;
 }
 
-#if defined(NFSU2_IOS) && defined(__APPLE__)
+/* iOS, as src/main.c derives it: the build defines no NFSU2_IOS for this file,
+ * and with the old `NFSU2_IOS && __APPLE__` test the executor never set its
+ * class. clang's iOS target predefines one of these two names. */
+#if defined(__APPLE__) && (defined(__ENVIRONMENT_IPHONE_OS_VERSION_MIN_REQUIRED__) || \
+                           defined(__IPHONE_OS_VERSION_MIN_REQUIRED__))
+#define XBOX_HAS_QOS 1
 #include <pthread/qos.h>
+
+/* Thread priority class of the game thread and the executor (iOS).
+ *
+ * User interactive keeps both on the performance cores. At 30 fps they wait
+ * most of the time and that class costs heat for nothing, so user initiated
+ * is enough there. One function decides for both threads, so they agree.
+ * RECOMP_QOS = auto (default: user interactive when RECOMP_PRESENT_INTERVAL=1,
+ * the 60 fps races; user initiated otherwise) | 1 (user interactive always,
+ * the old default) | 0 (leave the class alone). The display-link thread
+ * (ios_vblank.m) stays user interactive: it is the timing source. */
+static int xbox_qos_class(const char **why)
+{
+    const char *q = getenv("RECOMP_QOS");
+    const char *pi = getenv("RECOMP_PRESENT_INTERVAL");
+    int fast = pi && strcmp(pi, "1") == 0;
+
+    if (q && strcmp(q, "0") == 0) {
+        *why = "RECOMP_QOS=0";
+        return 0;
+    }
+    if (q && strcmp(q, "1") == 0) {
+        *why = "RECOMP_QOS=1";
+        return (int)QOS_CLASS_USER_INTERACTIVE;
+    }
+    *why = fast ? "RECOMP_QOS=auto, 60 fps" : "RECOMP_QOS=auto, 30 fps";
+    return (int)(fast ? QOS_CLASS_USER_INTERACTIVE : QOS_CLASS_USER_INITIATED);
+}
+
+/* Set the calling thread's class as above and log it. `who` names the thread. */
+void xbox_qos_apply(const char *who)
+{
+    const char *why;
+    int c = xbox_qos_class(&why);
+
+    if (!c)
+        return;
+    pthread_set_qos_class_self_np((qos_class_t)c, 0);
+    fprintf(stderr, "[QOS] %s -> %s (%s)\n", who,
+            c == (int)QOS_CLASS_USER_INTERACTIVE ? "user interactive" : "user initiated", why);
+}
 #endif
 
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
-#if defined(NFSU2_IOS) && defined(__APPLE__)
-    {
-        const char *q = getenv("RECOMP_QOS");
-        if (!q || strcmp(q, "0") != 0)   /* same gate as the game thread */
-            pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-    }
+    xbox_thread_name("nv2a-exec");
+#if defined(XBOX_HAS_QOS)
+    xbox_qos_apply("executor");
 #endif
     volatile uint32_t *regs = (volatile uint32_t *)param;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
@@ -1387,34 +1492,86 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          * waits on a tick deadline that never arrives and spins forever bringing
          * up XNet. A live clock is also just the truth -- KeTickCount ticks on
          * hardware whether or not anyone is asleep. GetTickCount() shares the
-         * millisecond unit, so the rate matches. */
-        *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
-                               + g_memory_offset) = GetTickCount();
+         * millisecond unit, so the rate matches. This is one of several
+         * writers: the store only moves forward (xbox_tick_refresh). */
+        xbox_tick_refresh();
 
         {
             /* Busy while the pushbuffer moves or has unread commands. */
             static uint32_t prev_put;
             uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
             uint32_t get = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET);
-            nv2a_thread_pause(put != prev_put || get != put);
+            nv2a_thread_pause(put != prev_put || get != put, 1000);
             prev_put = put;
         }
     }
     return 0;
 }
 
+/* Store the host clock into KeTickCount. Forward only.
+ *
+ * Three kinds of thread write the slot: the tick thread below, the executor
+ * above, and every guest thread that takes the guest lock (kernel_bridge.c
+ * gil_lock). A thread that was pre-empted between its clock read and its store
+ * must not put an older value over a newer one: KeTickCount would go back, and
+ * the title's unsigned "now - start" sums would jump by 4 billion
+ * milliseconds. So the store is a compare-and-swap that only accepts a value
+ * ahead of the one in the slot (signed difference, as the counter wraps). */
+void xbox_tick_refresh(void)
+{
+    volatile uint32_t *slot;
+    uint32_t now, old;
+
+    if (!s_tick_ready)
+        return;
+    slot = (volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
+                                 + g_memory_offset);
+    now = (uint32_t)GetTickCount();
+#if defined(_WIN32)
+    old = *slot;
+    while ((int32_t)(now - old) > 0) {
+        uint32_t seen = (uint32_t)InterlockedCompareExchange((volatile LONG *)slot,
+                                                             (LONG)now, (LONG)old);
+        if (seen == old)
+            break;
+        old = seen;
+    }
+#else
+    old = __atomic_load_n(slot, __ATOMIC_RELAXED);
+    while ((int32_t)(now - old) > 0)
+        if (__atomic_compare_exchange_n(slot, &old, now, 0,
+                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+            break;
+#endif
+}
+
 /* KeTickCount on its own thread. The ack thread's write above stalls
  * whenever that thread does: it runs the pushbuffer executor, which waits on
  * GPU traps and retired flips. NFSU2's EA audio scheduler sleeps until
  * "deadline - KeTickCount" with the deadline 10 ms further each turn, so a
- * frozen tick ran it at 2 Hz and the game never mixed a sound. */
+ * frozen tick ran it at 2 Hz and the game never mixed a sound.
+ *
+ * It slept 1 ms between stores: 800 to 1000 wakeups a second that keep the
+ * CPU out of deep idle. Guest code now finds a fresh value anyway: every
+ * thread that takes the guest lock stores one (xbox_tick_refresh). This
+ * thread covers the rest -- a long stretch of compute under the lock, and
+ * the lock being off. RECOMP_TICK_MS=<1..16> sets the period (default 4; 1 is
+ * the old one). With RECOMP_GIL=0 there is no refresh on entry: 1 ms. */
 static DWORD WINAPI tick_count_thread(LPVOID unused)
 {
+    const char *t = getenv("RECOMP_TICK_MS");
+    const char *g = getenv("RECOMP_GIL");
+    int ms = t && *t ? atoi(t) : 4;
     (void)unused;
+    if (ms < 1) ms = 1;
+    if (ms > 16) ms = 16;
+    if (g && *g == '0')
+        ms = 1;
+    fprintf(stderr, "[THREAD] KeTickCount tick thread every %d ms (RECOMP_TICK_MS)\n", ms);
+    xbox_thread_name("tick");
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
-        *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
-                               + g_memory_offset) = GetTickCount();
-        Sleep(1);
+        xbox_tick_refresh();
+        Sleep(ms);
     }
     return 0;
 }
@@ -1829,6 +1986,7 @@ static DWORD WINAPI watch_resolver(LPVOID unused)
     unsigned tries;
 
     (void)unused;
+    xbox_thread_name("watch");
     for (tries = 0; tries < 15000u && !g_watch_page; tries++) {
         uint32_t va;
         if (watch_resolve(&va) && watch_arm(va))
@@ -2038,6 +2196,7 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
     char why[64];
 
     (void)unused;
+    xbox_thread_name("watchdog");
     Sleep(s_watchdog_secs * 1000u);
     snprintf(why, sizeof why, "no exit after %us", s_watchdog_secs);
     watchdog_dump(why);
@@ -2242,6 +2401,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     }
 
     g_memory_offset = (uintptr_t)g_memory_base - XBOX_MAP_START;
+    __sync_synchronize();
+    s_tick_ready = 1;       /* 0 is a valid offset: it needs its own flag */
 
     /* Guest page zero: no access.
      *
@@ -3157,6 +3318,7 @@ void xbox_ProtectMirrorsForDebug(void)
 
 void xbox_MemoryLayoutShutdown(void)
 {
+    s_tick_ready = 0;
     if (g_kernel_memory) {
         VirtualFree(g_kernel_memory, 0, MEM_RELEASE);
         g_kernel_memory = NULL;
