@@ -434,6 +434,7 @@ static float reg_f(uint32_t method) { float f; memcpy(&f, &s_reg[method / 4], 4)
 static uint32_t s_sem_va;
 static uint32_t s_vtx_epoch;            /* Nv2aRawBatch.vtx_epoch */
 void nv2a_pb_set_semaphore_target(uint32_t guest_va) { s_sem_va = guest_va; }
+extern void recomp_fence_signal(void);   /* kernel_bridge.c */
 
 /* Slot + 1 of each method in s_unhandled: this runs millions of times a
  * second, so no search. The report sorts s_unhandled and rebuilds it. */
@@ -4068,6 +4069,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     if (method == 0x1D70 && s_sem_va) {
         uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
         *(volatile uint32_t *)(mem + s_sem_va) = param;
+        recomp_fence_signal();      /* wakes a game thread asleep in its fence wait */
         return;
     }
     /* The pattern object's SET_MONOCHROME_COLOR0 (0x0310) latches into

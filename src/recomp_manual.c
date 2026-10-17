@@ -307,6 +307,8 @@ void sub_002F0D10(void)
 #define NFSU2_D3D_DEVICE_PTR 0x002F7798u
 extern void nv2a_pb_set_semaphore_target(uint32_t guest_va);
 extern void sub_002E8F20_gen(void);
+extern void recomp_fence_wait_begin(uint32_t sem_va, uint32_t wseq_va, uint32_t fence);
+extern void recomp_fence_wait_end(void);
 
 void sub_002E8F20(void)
 {
@@ -347,7 +349,12 @@ void sub_002E8F20(void)
                 prev = mine;
             }
         }
+        /* The wait's poll loop sleeps on the executor's semaphore writes
+         * instead of spinning (kernel_bridge.c, RECOMP_FENCE_SLEEP=0 spins).
+         * +0x2C is the write sequence the loop's test is relative to. */
+        recomp_fence_wait_begin(sem, dev + 0x2C, MEM32(esp + 4));
         sub_002E8F20_gen();
+        recomp_fence_wait_end();
         return;
     }
     if (sem)

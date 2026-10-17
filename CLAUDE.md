@@ -513,6 +513,31 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   each. Now they sleep (≤1 ms) when the pushbuffer is idle and are woken by
   `recomp_spin_wake()`, which `RECOMP_SPIN_HINT` calls. A fixed sleep instead
   of the wake slowed the game (every kickoff waited) — don't go back to that.
+- **D3D fence wait sleeps (v31, `RECOMP_FENCE_SLEEP=0` = old spin).** The
+  poll at 0x2E9057 (NFSU1 0x1D0470) used to spin; its yield now sleeps on a
+  condvar (<= 1 ms) while this thread's wrapped BlockOnTime is short of its
+  fence, and `nv2a_pb_exec.c` broadcasts after the 0x1D70 semaphore store
+  (`recomp_fence_*` in kernel_bridge.c; waiters counted, no lock otherwise).
+  Linux/lavapipe: the spin only exists while the game boots (first 14 s,
+  game thread 647 -> 558 ticks, n=20, same progress: kernel calls +3%,
+  frames +2%; first build 609 -> 495, n=30). After that fence waits are
+  <1% of the game thread in the movies (64-90 ms per 10 s, equal with the
+  sleep on or off) and a race's long GPU backlog goes through the
+  kernel-wait path (0.12 cpu-s/s both ways, fps 16-18 both). Intro fps:
+  first build 19.4/19.1 off vs 19.8/19.5 on; final build 17.7/16.3 off vs
+  14.9/15.8 on with the machine loaded by other runs and equal wait times.
+  The 62% spin seen elsewhere needs a GPU faster than lavapipe: measure on
+  the device. `RECOMP_FPS_LOG=1` adds a per-10 s "fence waits N, M ms;
+  sleeps, timed out" line.
+  Idle intro A/B (same boot, no input): game-thread CPU 46-47 s with the
+  sleep off vs 37-38 s on (-18%).
+  Boot hang, not caused by the sleep: 4 of ~230 sleep-on boots hung, and the
+  v29 binary (no fence code) hung 2 of 150 with the same signature
+  (DMA_PUT == DMA_GET, no `[fps]` line). Guest threads 1006 and 1011 cross
+  on CRT/guest locks 0x00428770 and 0x80482DB8 (each holds one, waits for
+  the other; "outstanding 4"). Cause undetermined: a title lock order or a
+  release this runtime dropped (see `crt_lock_trace` in kernel_rtl.c); next
+  step `RECOMP_CS_TRACE_CRT=1` on a hung run.
 - `tools/recomp/spin_hint.py` marks the title's poll loops (45 in NFSU2: D3D
   fence 0x2E9057, PGRAPH polls, DirectSound's APU-clock polls on 0xFE820010)
   with `RECOMP_SPIN_HINT()`: pause, wake hardware threads every 16, yield

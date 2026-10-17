@@ -1138,6 +1138,8 @@ static volatile unsigned s_hw_wakes;
  * yield, give up the guest lock and wait to get it back: ~12% of NFSU2's
  * main thread in a race on the console. Only the title sets the bit, so
  * clearing it here cannot lose a request. */
+static RECOMP_TLS unsigned t_flush_acks;
+
 static void spin_ack_flush(void)
 {
     volatile uint32_t *pfb = (volatile uint32_t *)
@@ -1145,8 +1147,14 @@ static void spin_ack_flush(void)
     if (*pfb & 0x00010000u) {
         __atomic_thread_fence(__ATOMIC_SEQ_CST);  /* its pushbuffer writes first */
         *pfb &= ~0x00010000u;
+        t_flush_acks++;
     }
 }
+
+/* How many flush requests this thread has answered. A poll loop that was
+ * waiting for one is done once it grew, so the fence wait (kernel_bridge.c)
+ * does not sleep after it. */
+unsigned recomp_spin_flush_acks(void) { return t_flush_acks; }
 
 void recomp_spin_wake(void)
 {
